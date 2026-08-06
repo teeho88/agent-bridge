@@ -39,7 +39,7 @@ agent-bridge --help
 Without PATH setup, use the generated wrapper directly:
 
 ```powershell
-& "D:\TAILIEU\MyProject\AI_Tool\Optimize_token_and_memory_pool\bin\agent-bridge.ps1" --help
+& "\path\to\root\bin\agent-bridge.ps1" --help
 ```
 
 ## Local UI
@@ -66,7 +66,7 @@ The UI can start tasks, add/search memories, compile context for Claude/Codex, a
 Claude Code does not expose its live task state to external tools unless you connect through Claude Code hooks. Install local hooks in the project Claude Code is working on:
 
 ```powershell
-cd "D:\path\to\your-project"
+cd "\path\to\your-project"
 agent-bridge init
 ```
 
