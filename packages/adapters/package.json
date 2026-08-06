@@ -1,0 +1,15 @@
+{
+  "name": "@agent-bridge/adapters",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@agent-bridge/core": "workspace:*",
+    "@agent-bridge/memory": "workspace:*"
+  }
+}
