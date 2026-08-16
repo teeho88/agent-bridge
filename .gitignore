@@ -11,9 +11,9 @@ coverage/
 .claude/
 .codex/
 /AGENTS.md
-/AGENTS.md.bak
 /CLAUDE.md
 /AGENT_MEMORY_BRIDGE_IMPLEMENTATION_SPEC.md
+/*.md.bak
 
 # Local configuration and credentials
 .env
