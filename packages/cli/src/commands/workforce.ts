@@ -200,6 +200,23 @@ export function registerOrchestration(program: Command): void {
     });
 
   workforce
+    .command("autonomy")
+    .description("Change how much the orchestration decides on its own, while it is running")
+    .requiredOption("--task <taskId>", "task id")
+    .requiredOption("--mode <autonomy>", "manual | approve-each | auto")
+    .action((options: { task: string; mode: string }) => {
+      const store = openStore();
+      try {
+        const orchestration = mustGetOrchestrationByTask(store, options.task);
+        const autonomy = parseAutonomy(options.mode);
+        const updated = store.updateOrchestration(orchestration.id, { autonomy }) ?? orchestration;
+        console.log(JSON.stringify({ orchestration: updated, previousAutonomy: orchestration.autonomy }, null, 2));
+      } finally {
+        store.close();
+      }
+    });
+
+  workforce
     .command("watch")
     .description('Repeatedly step an "auto" orchestration until it is done, failed, or paused')
     .requiredOption("--task <taskId>", "task id")
@@ -217,6 +234,15 @@ export function registerOrchestration(program: Command): void {
         }
         const terminal = new Set(["done", "failed", "paused"]);
         for (let i = 0; i < Number(options.maxSteps); i += 1) {
+          // Autonomy is re-read every lap: the user can switch this
+          // orchestration to manual or approve-each from the dashboard while
+          // the loop is running, and unattended stepping has to stop when they
+          // do — otherwise the switch is honoured only by new watchers.
+          const current = store.getOrchestration(orchestration.id);
+          if (current && current.autonomy !== "auto") {
+            console.log(`Autonomy changed to "${current.autonomy}"; stopping unattended stepping.`);
+            break;
+          }
           reapAgentRuns(store, { taskId: options.task });
           const stepResult = stepOrchestration(store, orchestration.id, makeOrchestratorDeps(store));
           console.log(stepResult.summary);
@@ -272,6 +298,7 @@ export function makeOrchestratorDeps(store: Store, cwd: string = paths().cwd): O
         provider: catalog.provider,
         models: catalog.models.map((model) => model.value),
       })),
+    defaultCommandFor: (provider) => defaultCommandForProvider(provider),
     readLog: (run) => (run.logPath && existsSync(run.logPath) ? readFileSync(run.logPath, "utf8") : ""),
     writePlanFile: (markdown) => {
       const plansDir = join(projectPaths.memoryDir, "plans");

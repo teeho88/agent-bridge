@@ -20,7 +20,7 @@ describe("agent startup prompts", () => {
     expect(prompt).toContain("\"acquired\": true");
   });
 
-  it("tells Antigravity to start and compile task context", () => {
+  it("tells Antigravity to use its own agent name and leave the lifecycle to the hooks", () => {
     const artifact = antigravityArtifact({
       agent: "antigravity",
       task: { id: "task-1", title: "Fix auth", status: "in_progress" },
@@ -31,19 +31,30 @@ describe("agent startup prompts", () => {
       constraints: [],
       nextActions: ["Inspect auth"],
       risks: [],
+      omitted: {
+        currentState: 0,
+        sharedMemory: 0,
+        relevantFiles: 0,
+        repoMap: 0,
+        handoff: 0,
+        constraints: 0,
+        knownDecisions: 0,
+      },
       tokenEstimate: 10,
       renderedMarkdown: "# Brief",
     });
 
-    expect(JSON.stringify(artifact)).toContain("--agent antigravity");
-    expect(JSON.stringify(artifact)).toContain(
-      "context compile --agent antigravity",
-    );
-    expect(JSON.stringify(artifact)).toContain(
-      "session start --agent antigravity",
-    );
-    expect(JSON.stringify(artifact)).toContain("agent-bridge file lease");
-    expect(JSON.stringify(artifact)).toContain("acquired=true");
+    const json = JSON.stringify(artifact);
+    expect(json).toContain("--agent antigravity");
+    expect(json).toContain("context compile --agent antigravity");
+    // AGENTS.md is codex-facing; without this reminder agy copies its
+    // `--agent codex` examples and its work lands on the board as codex.
+    expect(json).toContain("wherever it says --agent codex, use --agent antigravity");
+    // .agents/hooks.json opens the task and the session, so agy starting its
+    // own would duplicate both.
+    expect(json).toContain("do not run task start, session start, or session end");
+    expect(json).toContain("agent-bridge file lease");
+    expect(json).toContain("acquired=true");
   });
 });
 

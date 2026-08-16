@@ -312,6 +312,7 @@ function toRegisteredAgent(row: Row): RegisteredAgent {
   return {
     id: String(row.id),
     name: String(row.name),
+    description: row.description ? String(row.description) : undefined,
     provider: String(row.provider) as RegisteredAgent["provider"],
     mode: String(row.mode) as RegisteredAgent["mode"],
     command: row.command ? String(row.command) : undefined,
@@ -320,6 +321,9 @@ function toRegisteredAgent(row: Row): RegisteredAgent {
     reasoningEffort: row.reasoning_effort ? String(row.reasoning_effort) : undefined,
     credentialRef: row.credential_ref ? String(row.credential_ref) : undefined,
     capabilities: parseList(row.capabilities),
+    presetKey: row.preset_key ? String(row.preset_key) : undefined,
+    presetSelected: Number(row.preset_selected ?? 1) === 1,
+    presetHidden: Number(row.preset_hidden ?? 0) === 1,
     enabled: Number(row.enabled) === 1,
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
@@ -1357,6 +1361,7 @@ export class SQLiteMemoryStore implements MemoryStore {
     const agent: RegisteredAgent = {
       id: `agent-${randomUUID()}`,
       name: input.name,
+      description: input.description,
       provider: input.provider,
       mode: input.mode,
       command: input.command,
@@ -1365,6 +1370,9 @@ export class SQLiteMemoryStore implements MemoryStore {
       reasoningEffort: input.reasoningEffort,
       credentialRef: input.credentialRef,
       capabilities: input.capabilities ?? [],
+      presetKey: input.presetKey,
+      presetSelected: input.presetSelected ?? true,
+      presetHidden: input.presetHidden ?? false,
       enabled: input.enabled ?? true,
       createdAt: timestamp,
       updatedAt: timestamp,
@@ -1372,17 +1380,21 @@ export class SQLiteMemoryStore implements MemoryStore {
     this.db
       .prepare(
         `INSERT INTO agents
-         (id, name, provider, mode, command, base_url, model, reasoning_effort, credential_ref, capabilities, enabled, created_at, updated_at)
-         VALUES (@id, @name, @provider, @mode, @command, @baseUrl, @model, @reasoningEffort, @credentialRef, @capabilities, @enabled, @createdAt, @updatedAt)`,
+         (id, name, description, provider, mode, command, base_url, model, reasoning_effort, credential_ref, capabilities, preset_key, preset_selected, preset_hidden, enabled, created_at, updated_at)
+         VALUES (@id, @name, @description, @provider, @mode, @command, @baseUrl, @model, @reasoningEffort, @credentialRef, @capabilities, @presetKey, @presetSelected, @presetHidden, @enabled, @createdAt, @updatedAt)`,
       )
       .run({
         ...agent,
+        description: agent.description ?? null,
         command: agent.command ?? null,
         baseUrl: agent.baseUrl ?? null,
         model: agent.model ?? null,
         reasoningEffort: agent.reasoningEffort ?? null,
         credentialRef: agent.credentialRef ?? null,
         capabilities: JSON.stringify(agent.capabilities),
+        presetKey: agent.presetKey ?? null,
+        presetSelected: agent.presetSelected ? 1 : 0,
+        presetHidden: agent.presetHidden ? 1 : 0,
         enabled: agent.enabled ? 1 : 0,
       });
     return agent;
@@ -1396,7 +1408,13 @@ export class SQLiteMemoryStore implements MemoryStore {
   }
 
   listRegisteredAgents(
-    options: { enabled?: boolean; provider?: string; limit?: number } = {},
+    options: {
+      enabled?: boolean;
+      provider?: string;
+      includeUnselectedPresets?: boolean;
+      includeHiddenPresets?: boolean;
+      limit?: number;
+    } = {},
   ): RegisteredAgent[] {
     const filters: string[] = ["deleted_at IS NULL"];
     const params: Record<string, unknown> = { limit: options.limit ?? 100 };
@@ -1408,6 +1426,10 @@ export class SQLiteMemoryStore implements MemoryStore {
       filters.push("provider = @provider");
       params.provider = options.provider;
     }
+    if (!options.includeUnselectedPresets) filters.push("preset_selected = 1");
+    // A hidden preset was deleted from the default-agent table; its row only
+    // survives so the built-in seeding does not resurrect it.
+    if (!options.includeHiddenPresets) filters.push("preset_hidden = 0");
     return (
       this.db
         .prepare(
@@ -1429,6 +1451,7 @@ export class SQLiteMemoryStore implements MemoryStore {
     const next: RegisteredAgent = {
       ...current,
       name: input.name ?? current.name,
+      description: input.description ?? current.description,
       provider: input.provider ?? current.provider,
       mode: input.mode ?? current.mode,
       command: input.command ?? current.command,
@@ -1437,25 +1460,33 @@ export class SQLiteMemoryStore implements MemoryStore {
       reasoningEffort: input.reasoningEffort ?? current.reasoningEffort,
       credentialRef: input.credentialRef ?? current.credentialRef,
       capabilities: input.capabilities ?? current.capabilities,
+      presetKey: input.presetKey ?? current.presetKey,
+      presetSelected: input.presetSelected ?? current.presetSelected,
+      presetHidden: input.presetHidden ?? current.presetHidden,
       enabled: input.enabled ?? current.enabled,
       updatedAt: now(),
     };
     this.db
       .prepare(
         `UPDATE agents
-         SET name = @name, provider = @provider, mode = @mode, command = @command,
+         SET name = @name, description = @description, provider = @provider, mode = @mode, command = @command,
              base_url = @baseUrl, model = @model, reasoning_effort = @reasoningEffort, credential_ref = @credentialRef,
-             capabilities = @capabilities, enabled = @enabled, updated_at = @updatedAt
+             capabilities = @capabilities, preset_key = @presetKey, preset_selected = @presetSelected,
+             preset_hidden = @presetHidden, enabled = @enabled, updated_at = @updatedAt
          WHERE id = @id`,
       )
       .run({
         ...next,
+        description: next.description ?? null,
         command: next.command ?? null,
         baseUrl: next.baseUrl ?? null,
         model: next.model ?? null,
         reasoningEffort: next.reasoningEffort ?? null,
         credentialRef: next.credentialRef ?? null,
         capabilities: JSON.stringify(next.capabilities),
+        presetKey: next.presetKey ?? null,
+        presetSelected: next.presetSelected ? 1 : 0,
+        presetHidden: next.presetHidden ? 1 : 0,
         enabled: next.enabled ? 1 : 0,
       });
     return this.getRegisteredAgent(id);
@@ -2873,6 +2904,14 @@ export class SQLiteMemoryStore implements MemoryStore {
       .prepare("DELETE FROM handoffs WHERE task_id = ? AND auto = 1")
       .run(input.taskId);
     return this.createHandoff({ ...input, auto: true });
+  }
+
+  // A task has exactly one current handoff: the agent taking the task over
+  // rewrites it in place. Keeping a stack of rows made "the handoff of this
+  // task" ambiguous for the next agent, which is the only reader that matters.
+  upsertTaskHandoff(input: CreateHandoffInput): Handoff {
+    this.db.prepare("DELETE FROM handoffs WHERE task_id = ?").run(input.taskId);
+    return this.createHandoff(input);
   }
 
   getLatestHandoff(taskId: string): Handoff | undefined {

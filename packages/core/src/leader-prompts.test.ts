@@ -99,7 +99,7 @@ describe("renderPlanPrompt", () => {
       availableProviders: ["codex", "claude"],
       providerModels: { codex: ["gpt-5.6-sol"], claude: ["claude-opus-5", "claude-sonnet-5"] },
       agentRoster: [
-        { name: "builder", provider: "codex", model: "gpt-5.6-sol", capabilities: ["implement"] },
+        { name: "builder", description: "Strong at TypeScript architecture and repository-scale refactors", provider: "codex", model: "gpt-5.6-sol", capabilities: ["implement"] },
         { name: "reviewer", provider: "claude", model: "claude-opus-5", capabilities: ["review"] },
       ],
     });
@@ -108,10 +108,14 @@ describe("renderPlanPrompt", () => {
     expect(prompt).toContain("- codex — models: gpt-5.6-sol");
     expect(prompt).toContain("- claude — models: claude-opus-5, claude-sonnet-5");
     expect(prompt).toContain("builder: codex/gpt-5.6-sol — capabilities: implement");
+    expect(prompt).toContain("expertise: Strong at TypeScript architecture and repository-scale refactors");
     expect(prompt).toContain("reviewer: claude/claude-opus-5 — capabilities: review");
     expect(prompt).toContain("subtask agentPreference MUST resolve to an agent whose capabilities include `implement`");
     expect(prompt).toContain("reviewer agentPreference MUST resolve to an agent whose capabilities include `review`");
     expect(prompt).toContain("You are NOT limited to your own provider.");
+    expect(prompt).toContain("Your own provider has no staffing preference or tie-break advantage.");
+    expect(prompt).toContain("Choose the best eligible agent for each job from its capabilities and expertise description");
+    expect(prompt).toContain("If its expertise is not specified, do not invent strengths or default to your own provider.");
     expect(prompt).toContain("Have a reviewer come from a different provider");
   });
 
@@ -119,9 +123,20 @@ describe("renderPlanPrompt", () => {
     const prompt = renderPlanPrompt({ ...base, availableProviders: ["codex"] });
 
     expect(prompt).toContain("Available agent providers for this team: codex.");
-    // The roster is a permission list, so its rule holds even when there is
+    // The roster is the allowlist, so its rule holds even when there is
     // nothing to mix; only the spread-the-load advice is pointless here.
-    expect(prompt).toContain("Staff ONLY from the roster above.");
+    expect(prompt).toContain("Staff from the roster above.");
     expect(prompt).not.toContain("You are NOT limited to your own provider.");
+  });
+
+  it("tells the leader it may staff unregistered providers when auto-staffing is on", () => {
+    const prompt = renderPlanPrompt({ ...base, agentRoster: [], autoStaff: true });
+
+    expect(prompt).toContain("no registered agent yet");
+    expect(prompt).toContain("registers one automatically the first time you staff them");
+    // The roster rule would leave it with nothing to staff at all here.
+    expect(prompt).not.toContain("Staff from the roster above.");
+    // The provider list is still a boundary, even when the roster is empty.
+    expect(prompt).toContain("Stay within that provider list.");
   });
 });

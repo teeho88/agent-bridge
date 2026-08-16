@@ -58,13 +58,20 @@ import {
   buildSpawnPreview,
   defaultCommandForProvider,
   listInstalledProviderCatalogs,
-  listProviderCatalogs,
   listStaffableProviderCatalogs,
   providerDefaultCommands,
   reapAgentRuns,
   spawnAgentRun,
   stopAgentRun,
 } from "@agent-bridge/adapters";
+import { loadRuntimeProviderCatalogs } from "../provider-catalog.js";
+import {
+  addCustomDefaultAgentPreset,
+  ensureDefaultAgentPresetStates,
+  removeDefaultAgentPreset,
+  restoreBuiltInDefaultAgentPresets,
+  setDefaultAgentPresetSelection,
+} from "../default-agent-presets.js";
 import {
   CHANGE_REQUEST_EVENT_PREFIX,
   ensureAgentsForProviders,
@@ -73,8 +80,10 @@ import {
   stepOrchestration,
   type ChangeRequestPayload,
   type QuestionAnswersPayload,
+  type SpawnApprovalResponse,
 } from "@agent-bridge/core";
 import { getClaudeHookStatus, installClaudeHooks } from "./claude.js";
+import { getAntigravityHookStatus, installAntigravityHooks } from "./antigravity.js";
 import { executeSpawnRequest } from "./request.js";
 import { listAdoptableSessions, respawnRun } from "./run.js";
 import { makeOrchestratorDeps } from "./workforce.js";
@@ -85,9 +94,11 @@ import {
   openStore,
   parseList,
   paths,
+  policyBudgets,
   readConfig,
   resolveCurrentTaskId,
   resolveActiveTaskId,
+  resolveTokenBudget,
   setCurrentTask,
   startAgentSession,
   endAgentSession,
@@ -142,6 +153,18 @@ export function filterWorkBoardSessionEvents(
 ): SessionEvent[] {
   return events.filter((event) => !event.taskId || !orchestratedTaskIds.has(event.taskId));
 }
+
+export function inferContextAgent(
+  task: Pick<Task, "id" | "ownerAgent"> | undefined,
+  activeSessions: SessionEvent[],
+  defaultAgent: AgentKind,
+): AgentKind {
+  return (
+    activeSessions.find((event) => event.taskId === task?.id && event.agent)?.agent ??
+    task?.ownerAgent ??
+    defaultAgent
+  );
+}
 const installableTools = new Map([
   ["repomix", "repomix"],
   ["ccusage", "ccusage"],
@@ -188,9 +211,54 @@ function stopWatcher(): void {
 }
 
 /**
+ * Rebuilds the CLI package in place. Returns false when this is not a real
+ * checkout (no package.json with a build script) so the caller can fall back
+ * to telling the user what to run.
+ */
+function rebuildCliPackage(packageRoot: string): boolean {
+  const manifestPath = join(packageRoot, "package.json");
+  if (!existsSync(manifestPath)) return false;
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+      scripts?: Record<string, string>;
+    };
+    if (!manifest.scripts?.build) return false;
+  } catch {
+    return false;
+  }
+
+  console.log("Dashboard build is stale; rebuilding @agent-bridge/cli…");
+  // Not every machine has a standalone `pnpm` on PATH — a Corepack-managed
+  // Node install exposes only `corepack` and `npm`. Try each runner rather
+  // than failing the rebuild on the first one that is missing.
+  const runners: [string, string[]][] = [
+    ["pnpm", ["run", "build"]],
+    ["corepack", ["pnpm", "run", "build"]],
+    ["npm", ["run", "build"]],
+  ];
+  for (const [command, args] of runners) {
+    try {
+      execFileSync(command, args, {
+        cwd: packageRoot,
+        stdio: "inherit",
+        // These are shell shims (.cmd/.ps1) on Windows; without a shell,
+        // spawning them fails outright with EINVAL.
+        shell: process.platform === "win32",
+      });
+      return true;
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}
+
+/**
  * The published CLI serves the statically imported `dist/ui-page.js`. In a
- * checkout, refuse to launch when its TypeScript source has been edited more
- * recently so users do not unknowingly inspect an outdated dashboard.
+ * checkout, editing `ui-page.ts` leaves that bundle stale, so the dashboard
+ * would silently serve an outdated page. Rebuild it automatically instead of
+ * making every UI edit cost a manual build step, and only refuse to launch
+ * when the rebuild is impossible or did not take.
  */
 export function assertUiPageFreshness(
   packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..", ".."),
@@ -199,14 +267,16 @@ export function assertUiPageFreshness(
   if (!existsSync(sourcePath)) return;
 
   const builtPath = join(packageRoot, "dist", "ui-page.js");
-  if (
+  const isStale = (): boolean =>
     !existsSync(builtPath) ||
-    statSync(sourcePath).mtimeMs > statSync(builtPath).mtimeMs
-  ) {
-    throw new Error(
-      "UI source is newer than the compiled dashboard. Run `pnpm --filter @agent-bridge/cli build` and start `agent-bridge ui` again.",
-    );
-  }
+    statSync(sourcePath).mtimeMs > statSync(builtPath).mtimeMs;
+  if (!isStale()) return;
+
+  if (rebuildCliPackage(packageRoot) && !isStale()) return;
+
+  throw new Error(
+    "UI source is newer than the compiled dashboard and the automatic rebuild failed. Run `pnpm --filter @agent-bridge/cli build` and start `agent-bridge ui` again.",
+  );
 }
 
 export function registerUi(program: Command): void {
@@ -383,9 +453,15 @@ async function handleRequest(
             return {
               task,
               hasActiveSession: liveTaskIds.has(task.id),
-              sessions: workBoardSessionEvents.filter(
-                (event) => event.taskId === task.id,
-              ),
+              sessions: workBoardSessionEvents
+                .filter((event) => event.taskId === task.id)
+                .map((event) => ({
+                  ...event,
+                  hasWindow: Boolean(
+                    config.sessionWindows?.[event.sessionId]?.windowId ||
+                    config.sessionWindows?.[event.sessionId]?.hwnd,
+                  ),
+                })),
               events: store.listSessionEvents({ taskId: task.id, limit: 12 }),
               sessionState: taskSessionState,
               memories: taskVisibleMemories,
@@ -431,12 +507,14 @@ async function handleRequest(
         }));
         const claudeHookStatus = getClaudeHookStatus(cwd);
         const claudeHookInstalled = claudeHookStatus.installed;
+        const antigravityHookStatus = getAntigravityHookStatus(cwd);
         const tokenStats = estimateTokenSavings({
           task: currentTask,
           memories: sessionState ? [sessionState, ...memories] : memories,
           compiledContext,
           handoff,
         });
+        const defaultAgentPresets = ensureDefaultAgentPresetStates(store);
         sendJson(res, 200, {
           workspace: cwd,
           config,
@@ -450,6 +528,7 @@ async function handleRequest(
           taskChanges,
           agentRequests,
           registeredAgents: store.listRegisteredAgents({ limit: 500 }),
+          defaultAgentPresets,
           credentialRefs: store.listCredentialRefs(),
           subtasks: activeTaskId
             ? store.listSubtasks({ parentTaskId: activeTaskId, limit: 500 })
@@ -467,6 +546,7 @@ async function handleRequest(
           handoff,
           claudeHookInstalled,
           claudeHookStatus,
+          antigravityHookStatus,
           watcherRunning: isWatcherRunning(),
           optionalTools: optionalToolsStatus(),
           tokenStack: tokenStackStatus(),
@@ -495,6 +575,7 @@ async function handleRequest(
         taskChanges: [],
         agentRequests: [],
         registeredAgents: [],
+        defaultAgentPresets: [],
         credentialRefs: [],
         subtasks: [],
         assignments: [],
@@ -503,6 +584,7 @@ async function handleRequest(
         handoff: undefined,
         claudeHookInstalled: getClaudeHookStatus(cwd).installed,
         claudeHookStatus: getClaudeHookStatus(cwd),
+        antigravityHookStatus: getAntigravityHookStatus(cwd),
         watcherRunning: isWatcherRunning(),
         optionalTools: optionalToolsStatus(),
         tokenStack: tokenStackStatus(),
@@ -560,6 +642,7 @@ async function handleRequest(
     try {
       const agent = store.createRegisteredAgent({
         name: requiredString(body.name, "name"),
+        description: optionalString(body.description),
         provider: parseAgentProvider(requiredString(body.provider, "provider")),
         mode: parseAgentRunMode(requiredString(body.mode, "mode")),
         command: optionalString(body.command),
@@ -595,6 +678,67 @@ async function handleRequest(
     return;
   }
 
+  if (method === "POST" && url.pathname === "/api/workforce/default-agent/toggle") {
+    const body = await readJson(req);
+    const store = openStore(cwd);
+    try {
+      const selectedValue = optionalString(body.selected);
+      const selected = selectedValue === "true" || body.selected === true;
+      const agent = setDefaultAgentPresetSelection(
+        store,
+        requiredString(body.presetKey, "presetKey"),
+        selected,
+      );
+      sendJson(res, 200, { agent, selected });
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/api/workforce/default-agent/create") {
+    const body = await readJson(req);
+    const store = openStore(cwd);
+    try {
+      const agent = addCustomDefaultAgentPreset(store, {
+        label: requiredString(body.label ?? body.name, "label"),
+        description: optionalString(body.description),
+        provider: parseAgentProvider(requiredString(body.provider, "provider")),
+        mode: parseAgentRunMode(optionalString(body.mode) ?? "cli"),
+        command: optionalString(body.command),
+        model: optionalString(body.model),
+        reasoningEffort: optionalString(body.reasoningEffort),
+        capabilities: parseItems(body.capabilities),
+      });
+      sendJson(res, 200, { agent, presets: ensureDefaultAgentPresetStates(store) });
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/api/workforce/default-agent/delete") {
+    const body = await readJson(req);
+    const store = openStore(cwd);
+    try {
+      const removed = removeDefaultAgentPreset(store, requiredString(body.presetKey, "presetKey"));
+      sendJson(res, 200, { removed });
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/api/workforce/default-agent/restore") {
+    const store = openStore(cwd);
+    try {
+      sendJson(res, 200, { presets: restoreBuiltInDefaultAgentPresets(store) });
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
   if (method === "POST" && url.pathname === "/api/workforce/agent/update") {
     const body = await readJson(req);
     const store = openStore(cwd);
@@ -606,12 +750,19 @@ async function handleRequest(
       if (!agent) throw new Error("Agent not found.");
       const updated = store.updateRegisteredAgent(agent.id, {
         name: optionalString(body.name),
+        description: optionalString(body.description),
         provider: body.provider ? parseAgentProvider(requiredString(body.provider, "provider")) : undefined,
         mode: body.mode ? parseAgentRunMode(requiredString(body.mode, "mode")) : undefined,
         command: optionalString(body.command),
         baseUrl: optionalString(body.baseUrl),
         model: optionalString(body.model),
-        reasoningEffort: optionalString(body.reasoningEffort),
+        // The dashboard always sends this field, so an empty value is the user
+        // picking "default" — store it as such instead of letting the update's
+        // keep-current fallback pin the agent to its old effort level forever.
+        reasoningEffort:
+          body.reasoningEffort === undefined
+            ? undefined
+            : (optionalString(body.reasoningEffort) ?? ""),
         credentialRef: optionalString(body.credentialRef),
         capabilities: body.capabilities !== undefined ? parseItems(body.capabilities) : undefined,
       });
@@ -631,8 +782,13 @@ async function handleRequest(
         requiredString(body.agentId, "agentId"),
       );
       if (!agent) throw new Error("Agent not found.");
-      const deleted = store.deleteRegisteredAgent(agent.id);
-      sendJson(res, 200, { deleted });
+      if (agent.presetKey) {
+        setDefaultAgentPresetSelection(store, agent.presetKey, false);
+        sendJson(res, 200, { deleted: false, presetDeselected: true });
+      } else {
+        const deleted = store.deleteRegisteredAgent(agent.id);
+        sendJson(res, 200, { deleted });
+      }
     } finally {
       store.close();
     }
@@ -664,6 +820,87 @@ async function handleRequest(
     } finally {
       store.close();
     }
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/api/session/terminal") {
+    const body = await readJson(req);
+    const agent = parseAgentKind(requiredString(body.agent, "agent"));
+    if (!(["claude", "codex", "antigravity"] as AgentKind[]).includes(agent)) {
+      throw new Error("Terminal launcher supports Claude, Codex, and Antigravity.");
+    }
+    if (process.platform !== "win32") {
+      throw new Error("Agent terminal launch is currently implemented for Windows.");
+    }
+    const command = agent === "antigravity" ? "agy" : agent;
+    if (!commandExists(command)) throw new Error(`${command} is not installed or not on PATH.`);
+    const store = openStore(cwd);
+    try {
+      const task = store.createTask({
+        title: `${agentLabel(agent)} terminal`,
+        goal: `Interactive ${agentLabel(agent)} CLI opened from Work Board.`,
+        ownerAgent: agent,
+      });
+      const sessionId = `${agent}-terminal-${randomUUID()}`;
+      startAgentSession(sessionId, task.id, cwd, agent);
+      store.recordSessionEvent({
+        sessionId,
+        taskId: task.id,
+        agent,
+        kind: "session_started",
+        summary: `${agentLabel(agent)} terminal opened from Work Board.`,
+      });
+      writeCurrentTaskArtifact(task, cwd);
+      try {
+        const terminal = launchAgentTerminal(
+          cwd,
+          task,
+          agent,
+          sessionId,
+          command,
+          req.socket.localPort ?? defaultUiPort,
+        );
+        sendJson(res, 200, { task, sessionId, terminal });
+      } catch (error) {
+        endAgentSession(sessionId, cwd);
+        throw error;
+      }
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/api/session/window") {
+    const body = await readJson(req);
+    const sessionId = requiredString(body.sessionId, "sessionId");
+    const windowId = requiredString(body.windowId, "windowId");
+    const pid = Number(body.pid);
+    const hwnd = optionalString(body.hwnd);
+    if (!Number.isInteger(pid) || pid <= 0) throw new Error("pid must be a positive integer.");
+    if (hwnd && (!Number.isFinite(Number(hwnd)) || Number(hwnd) <= 0)) {
+      throw new Error("hwnd must be a positive integer string.");
+    }
+    const config = readConfig(cwd);
+    const agent = config.activeSessions?.[sessionId];
+    const taskId = config.sessionTasks?.[sessionId];
+    if (!agent || !taskId) throw new Error("The terminal session is no longer active.");
+    writeConfig({
+      ...config,
+      sessionWindows: {
+        ...(config.sessionWindows ?? {}),
+        [sessionId]: {
+          ...config.sessionWindows?.[sessionId],
+          windowId,
+          pid,
+          hwnd,
+          taskId,
+          agent,
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    }, cwd);
+    sendJson(res, 200, { sessionId, windowId, pid });
     return;
   }
 
@@ -705,12 +942,7 @@ async function handleRequest(
       if (!sessionId)
         throw new Error("No active agent session found for this task.");
       const config = readConfig(cwd);
-      const focus = focusAgentTerminal(
-        task,
-        agent,
-        sessionId,
-        config.sessionWindows?.[sessionId]?.hwnd,
-      );
+      const focus = focusAgentTerminal(task, agent, sessionId, config.sessionWindows?.[sessionId]);
       sendJson(res, 200, { task, sessionId, focus });
     } finally {
       store.close();
@@ -1226,6 +1458,22 @@ async function handleRequest(
     return;
   }
 
+  if (method === "POST" && url.pathname === "/api/antigravity/install-hooks") {
+    try {
+      const output = installAntigravityHooks(cwd);
+      const antigravityHookStatus = getAntigravityHookStatus(cwd);
+      sendJson(res, 200, {
+        installed: antigravityHookStatus.installed,
+        antigravityHookStatus,
+        output,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendJson(res, 500, { error: message });
+    }
+    return;
+  }
+
   if (method === "POST" && url.pathname === "/api/claude/install-hooks") {
     try {
       const output = installClaudeHooks(cwd);
@@ -1247,13 +1495,19 @@ async function handleRequest(
     const store = openStore(cwd);
     try {
       const config = readConfig(cwd);
-      const agent = (optionalString(body.agent) ??
-        config.defaultAgent) as AgentKind;
       const taskId =
         optionalString(body.taskId) ??
-        getActiveTaskId(store, cwd, undefined, agent);
+        getActiveTaskId(store, cwd);
+      const agent = inferContextAgent(
+        store.getTask(taskId),
+        store.listActiveSessionEvents(200),
+        config.defaultAgent,
+      );
       syncCurrentTaskArtifact(store, taskId, cwd);
-      const tokenBudget = Number(body.budget ?? config.tokenBudget);
+      const tokenBudget = resolveTokenBudget(
+        cwd,
+        body.budget === undefined ? undefined : Number(body.budget),
+      );
       let repoMap: string | undefined;
       if (
         config.graph?.injectRepoMap !== false &&
@@ -1276,6 +1530,7 @@ async function handleRequest(
         agent,
         tokenBudget,
         repoMap,
+        ...policyBudgets(cwd),
       });
       writeTaskContext(taskId, pack.renderedMarkdown);
       if (resolveActiveTaskId(store, cwd) === taskId) {
@@ -1340,7 +1595,7 @@ async function handleRequest(
     try {
       const taskId = optionalString(body.taskId) ?? getActiveTaskId(store, cwd);
       syncCurrentTaskArtifact(store, taskId, cwd);
-      const handoff = store.createHandoff({
+      const handoff = store.upsertTaskHandoff({
         taskId,
         fromAgent: optionalString(body.from) as AgentKind | undefined,
         toAgent: optionalString(body.to) as AgentKind | undefined,
@@ -1560,8 +1815,10 @@ async function handleRequest(
     // headless ones as team providers — anything else would either fail at
     // spawn time or (Antigravity) open a GUI and return an empty log.
     const staffable = new Set(listStaffableProviderCatalogs().map((catalog) => catalog.provider));
+    const provider = String(url.query.provider ?? "").trim();
+    const runtimeCatalog = await loadRuntimeProviderCatalogs({ provider: provider || undefined });
     sendJson(res, 200, {
-      catalogs: listProviderCatalogs(),
+      catalogs: runtimeCatalog.catalogs,
       installed: listInstalledProviderCatalogs().map((catalog) => ({
         provider: catalog.provider,
         staffable: staffable.has(catalog.provider),
@@ -1570,6 +1827,7 @@ async function handleRequest(
       // moment a provider is picked (antigravity -> agy, and so on). Covers
       // providers with no model catalog too, which `catalogs` does not.
       defaultCommands: providerDefaultCommands(),
+      catalogWarnings: runtimeCatalog.errors,
     });
     return;
   }
@@ -1695,9 +1953,8 @@ async function handleRequest(
     const store = openStore(cwd);
     try {
       const prompt = requiredString(body.prompt, "prompt");
-      // "approve-each" is still accepted for rows/clients that predate the
-      // two-way switch, but it behaves exactly like "manual" — nothing in the
-      // step loop has ever branched on it.
+      // Only the starting position: the Orchestration panel can move this at
+      // any point during the run via /api/workforce/orchestration/autonomy.
       const autonomy = optionalString(body.autonomy) ?? "manual";
       if (!["manual", "approve-each", "auto"].includes(autonomy)) {
         throw new Error(`Invalid autonomy "${autonomy}". Use one of: manual, approve-each, auto.`);
@@ -1866,7 +2123,26 @@ async function handleRequest(
       if (!request) throw new Error(`Approval not found: ${requestId}`);
       if (request.status !== "pending") throw new Error(`This approval was already ${request.status}.`);
       const approve = body.approve !== false;
-      store.resolveAgentRequest(requestId, approve ? "accepted" : "rejected", optionalString(body.note));
+      // Approving with a different agent is a third answer, not a variant of
+      // yes: the work is authorised but somebody else does it. It is validated
+      // here rather than at spawn time so a bad pick is a 400 the user can fix,
+      // not a step that throws minutes later.
+      const agentId = approve ? optionalString(body.agentId) : undefined;
+      if (agentId) {
+        const agent = store.getRegisteredAgent(agentId);
+        if (!agent) throw new Error(`Registered agent not found: ${agentId}`);
+        if (!agent.enabled) throw new Error(`Agent "${agent.name}" is disabled; enable it in the Agents tab first.`);
+        if (orchestration.teamProviders?.length && !orchestration.teamProviders.includes(agent.provider)) {
+          throw new Error(
+            `Agent "${agent.name}" uses provider "${agent.provider}", which is not in this orchestration's team providers (${orchestration.teamProviders.join(", ")}).`,
+          );
+        }
+      }
+      const note = optionalString(body.note);
+      const response = agentId
+        ? JSON.stringify({ type: "spawn-approval-response", agentId, note } satisfies SpawnApprovalResponse)
+        : note;
+      store.resolveAgentRequest(requestId, approve ? "accepted" : "rejected", response);
 
       // A rejection is handled by the step itself (it pauses and records why),
       // so both paths just step once and report what happened.
@@ -1874,8 +2150,19 @@ async function handleRequest(
         store.updateOrchestration(orchestration.id, { status: resumeStatusFor(store, orchestration.id), lastError: null });
       }
       const stepResult = stepOrchestration(store, orchestration.id, makeOrchestratorDeps(store, cwd));
+      // Auto-run stops itself when an approval has gone unanswered for a while
+      // (see the tick below). Answering one is exactly the signal to pick the
+      // loop back up, otherwise the run would sit there approved but stopped.
+      if (
+        approve &&
+        stepResult.orchestration.autonomy !== "manual" &&
+        !AUTO_RUN_HALTED.has(stepResult.orchestration.status)
+      ) {
+        startAutoRun(cwd, orchestration.id);
+      }
       sendJson(res, 200, {
         approved: approve,
+        reassignedTo: agentId,
         orchestration: stepResult.orchestration,
         summary: stepResult.summary,
         spawnedRunIds: stepResult.spawnedRunIds,
@@ -1903,11 +2190,57 @@ async function handleRequest(
       // Keep the stored autonomy in step with the switch, so a restarted
       // server (and the CLI's `workforce watch`) agree with what the UI shows.
       const autoRun = isAutoRunning(orchestration.id);
-      // Turning auto-run off must not silently downgrade an approve-each
-      // orchestration to manual — that would drop the per-spawn gate.
-      const nextAutonomy = autoRun ? "auto" : orchestration.autonomy === "auto" ? "manual" : orchestration.autonomy;
+      // Auto-run and the approval gate are two separate switches. An
+      // approve-each orchestration is allowed to keep stepping on the server —
+      // it simply stops at every gate until you approve — so arming the timer
+      // must not erase the gate, and disarming it must not drop it either.
+      const nextAutonomy = autoRun
+        ? orchestration.autonomy === "approve-each"
+          ? "approve-each"
+          : "auto"
+        : orchestration.autonomy === "auto"
+          ? "manual"
+          : orchestration.autonomy;
       const updated = store.updateOrchestration(orchestration.id, { autonomy: nextAutonomy }) ?? orchestration;
       sendJson(res, 200, { autoRun, orchestration: updated });
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  // Autonomy is a live setting, not a launch-time one: every step re-reads it
+  // from the row, so switching here takes effect on the very next transition.
+  // That is the whole point — a run you started unattended can be pulled back
+  // under per-agent approval the moment it starts staffing something you did
+  // not expect, and handed back to itself afterwards.
+  if (method === "POST" && url.pathname === "/api/workforce/orchestration/autonomy") {
+    const body = await readJson(req);
+    const store = openStore(cwd);
+    try {
+      const taskId = requiredString(body.taskId, "taskId");
+      const autonomy = requiredString(body.autonomy, "autonomy");
+      if (!["manual", "approve-each", "auto"].includes(autonomy)) {
+        throw new Error(`Invalid autonomy "${autonomy}". Use one of: manual, approve-each, auto.`);
+      }
+      const orchestration = mustGetOrchestrationForUi(store, taskId);
+      const updated =
+        store.updateOrchestration(orchestration.id, { autonomy: autonomy as OrchestrationAutonomy }) ?? orchestration;
+      // Autonomy is now the only switch: "manual" means the user drives, so the
+      // stepping timer is off; everything else means the server advances the
+      // run. "approve-each" still steps — it just parks at each gate until the
+      // user answers, and answering restarts it immediately, which is far less
+      // work than approving and then having to press Step as well.
+      if (autonomy === "manual") {
+        stopAutoRun(orchestration.id);
+      } else if (!AUTO_RUN_HALTED.has(updated.status)) {
+        startAutoRun(cwd, orchestration.id);
+      }
+      sendJson(res, 200, {
+        orchestration: updated,
+        autoRun: isAutoRunning(orchestration.id),
+        previousAutonomy: orchestration.autonomy,
+      });
     } finally {
       store.close();
     }
@@ -2252,6 +2585,10 @@ async function handleRequest(
 const autoRunTimers = new Map<string, NodeJS.Timeout>();
 const AUTO_RUN_INTERVAL_MS = 5000;
 const AUTO_RUN_HALTED = new Set(["done", "failed", "paused"]);
+// How long the loop keeps re-asking an unanswered approval before it stops on
+// its own. Long enough to cover stepping away from the desk, short enough that
+// an overnight run does not tick 7000 times against a question nobody saw.
+const APPROVAL_IDLE_STOP_MS = 15 * 60 * 1000;
 // A run that is still going; the only kind whose log tail is worth re-sending.
 const ACTIVE_RUN_STATUSES = new Set(["starting", "running", "waiting"]);
 
@@ -2269,14 +2606,16 @@ export function stopAutoRun(orchestrationId: string): void {
 // Auto-run only ever lived in this process's timer map, so closing the tool
 // mid-run left the orchestration frozen: the rows still said "executing", the
 // UI still offered Step, but nothing advanced again until the user noticed and
-// re-armed the toggle by hand. `autonomy: "auto"` is the durable record of the
-// user having asked for an unattended run, so honour it at startup.
+// re-armed the toggle by hand. Autonomy is the durable record of who advances
+// the run — anything but "manual" means the server does — so honour it at
+// startup. An approve-each run resumes too: it steps up to its next gate and
+// waits there, which is exactly where the user left it.
 export function resumeAutoRuns(cwd: string): string[] {
   const store = openStore(cwd);
   try {
     const resumable = store
       .listOrchestrations({ limit: 100 })
-      .filter((orchestration) => orchestration.autonomy === "auto" && !AUTO_RUN_HALTED.has(orchestration.status));
+      .filter((orchestration) => orchestration.autonomy !== "manual" && !AUTO_RUN_HALTED.has(orchestration.status));
     for (const orchestration of resumable) startAutoRun(cwd, orchestration.id);
     if (resumable.length) {
       console.log(`Resumed auto-run for ${resumable.length} orchestration(s) left running.`);
@@ -2307,6 +2646,22 @@ export function startAutoRun(cwd: string, orchestrationId: string): void {
         } else {
           const stepped = stepOrchestration(store, orchestrationId, makeOrchestratorDeps(store, cwd));
           keepGoing = !AUTO_RUN_HALTED.has(stepped.orchestration.status);
+          // Nobody is coming. An approval that has gone unanswered this long is
+          // not a transient wait, and re-stepping it every few seconds until
+          // morning only burns a store handle per tick to produce the same
+          // noop. Stop the loop and leave the reason on the board; approving
+          // (or rejecting) restarts it from the approve-spawn handler.
+          if (keepGoing && stepped.awaitingApprovalSince) {
+            const waitedMs = Date.now() - Date.parse(stepped.awaitingApprovalSince);
+            if (Number.isFinite(waitedMs) && waitedMs >= APPROVAL_IDLE_STOP_MS) {
+              keepGoing = false;
+              store.updateOrchestration(orchestrationId, {
+                lastError:
+                  `Auto-run paused after waiting ${Math.round(waitedMs / 60000)} min for your approval. ` +
+                  "Approve or reject the pending agent assignment to continue.",
+              });
+            }
+          }
         }
       }
     } catch (error) {
@@ -2877,24 +3232,47 @@ function focusAgentTerminal(
   task: Task,
   agent: AgentKind,
   sessionId: string,
-  hwnd?: string,
-): { focused: boolean; patterns: string[]; hwnd?: string; reason?: string } {
+  sessionWindow?: { hwnd?: string; windowId?: string; pid?: number },
+): { focused: boolean; patterns: string[]; hwnd?: string; windowId?: string; reason?: string } {
   const patterns = [
     terminalTitle(agent, task.id, sessionId),
     sessionId,
-    task.id,
   ];
+  const hwnd = sessionWindow?.hwnd;
+  const windowId = sessionWindow?.windowId;
   if (process.platform !== "win32") {
     return {
       focused: false,
       patterns,
       hwnd,
+      windowId,
       reason: "Window focus is currently implemented for Windows terminals.",
     };
   }
   if (hwnd) {
     const byHandle = focusWindowByHandle(hwnd);
-    if (byHandle.focused) return { ...byHandle, patterns };
+    if (byHandle.focused) return { ...byHandle, patterns, windowId };
+  }
+  if (windowId) {
+    if (sessionWindow?.pid && !isProcessAlive(sessionWindow.pid)) {
+      return { focused: false, patterns, hwnd, windowId, reason: "The terminal process has closed." };
+    }
+    try {
+      execFileSync("wt.exe", ["-w", windowId, "focus-tab", "-t", "0"], {
+        stdio: "ignore",
+        windowsHide: true,
+        timeout: 2000,
+      });
+      return { focused: true, patterns, hwnd, windowId };
+    } catch (error) {
+      return {
+        focused: false,
+        patterns,
+        hwnd,
+        windowId,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
   const script = `
 $patterns = @(${patterns.map((pattern) => psString(pattern)).join(", ")})
@@ -2999,6 +3377,90 @@ if (-not [AgentBridgeWindowHandleFocus]::IsWindow($hwnd)) { exit 2 }
 
 function terminalTitle(agent: AgentKind, taskId: string, sessionId: string): string {
   return `AgentBridge ${agent} ${taskId} ${sessionId}`;
+}
+
+function launchAgentTerminal(
+  cwd: string,
+  task: Task,
+  agent: AgentKind,
+  sessionId: string,
+  command: string,
+  uiPort: number,
+): { launcherPid?: number; title: string; windowId: string } {
+  const title = terminalTitle(agent, task.id, sessionId);
+  const script = `
+$ErrorActionPreference = 'Stop'
+try {
+  Add-Type @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public class AgentBridgeTerminalWindow {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+}
+"@
+  $script:terminalHwnd = [IntPtr]::Zero
+  $deadline = [DateTime]::UtcNow.AddSeconds(1)
+  do {
+    [AgentBridgeTerminalWindow]::EnumWindows({
+      param($hWnd, $lParam)
+      if (-not [AgentBridgeTerminalWindow]::IsWindowVisible($hWnd)) { return $true }
+      $text = New-Object System.Text.StringBuilder 512
+      [void][AgentBridgeTerminalWindow]::GetWindowText($hWnd, $text, $text.Capacity)
+      if ($text.ToString() -eq ${psString(title)}) { $script:terminalHwnd = $hWnd; return $false }
+      return $true
+    }, [IntPtr]::Zero) | Out-Null
+    if ($script:terminalHwnd -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 50 }
+  } while ($script:terminalHwnd -eq [IntPtr]::Zero -and [DateTime]::UtcNow -lt $deadline)
+  $registration = @{ sessionId = ${psString(sessionId)}; windowId = ${psString(sessionId)}; pid = $PID }
+  if ($script:terminalHwnd -ne [IntPtr]::Zero) { $registration.hwnd = $script:terminalHwnd.ToInt64().ToString() }
+  $payload = $registration | ConvertTo-Json -Compress
+  Invoke-RestMethod -Uri ${psString(`http://127.0.0.1:${uiPort}/api/session/window`)} -Method Post -ContentType 'application/json' -Body $payload | Out-Null
+} catch {
+  Write-Warning 'Agent Bridge could not register this terminal window.'
+}
+$env:AGENT_BRIDGE_TERMINAL_SESSION_ID = ${psString(sessionId)}
+& ${psString(command)}
+`;
+  if (!commandExists("wt.exe")) {
+    throw new Error("Windows Terminal (wt.exe) is required to open a visible agent terminal.");
+  }
+  const child = spawn(
+    "wt.exe",
+    [
+      "-w",
+      sessionId,
+      "new-tab",
+      "--title",
+      title,
+      "--suppressApplicationTitle",
+      "-d",
+      cwd,
+      "powershell.exe",
+      "-NoLogo",
+      "-NoExit",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-EncodedCommand",
+      Buffer.from(script, "utf16le").toString("base64"),
+    ],
+    { cwd, detached: true, stdio: "ignore", windowsHide: false },
+  );
+  child.on("error", () => undefined);
+  child.unref();
+  return { launcherPid: child.pid, title, windowId: sessionId };
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function psString(value: string): string {

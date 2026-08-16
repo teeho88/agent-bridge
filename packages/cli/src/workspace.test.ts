@@ -16,6 +16,7 @@ import {
   rememberSessionWindowHandle,
   rememberSessionTask,
   resolveCurrentTaskId,
+  resolveTokenBudget,
   setCurrentTask,
   startAgentSession,
   syncAgentSession,
@@ -614,7 +615,13 @@ describe("readTokenPolicy", () => {
       expect(policyBudgets(dir)).toEqual({
         memoryTokenBudget: 800,
         fileTokenBudget: 1200,
+        handoffTokenBudget: 600,
+        repoMapTokenBudget: 1000,
+        constraintTokenBudget: 400,
+        decisionTokenBudget: 400,
       });
+      expect(resolveTokenBudget(dir)).toBe(4000);
+      expect(resolveTokenBudget(dir, 1500)).toBe(1500);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -815,6 +822,50 @@ describe("per-agent current task", () => {
       } finally {
         store.close();
       }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a terminal session while its registered process is alive and ends it when the process closes", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-bridge-terminal-process-"));
+    try {
+      ensureWorkspace(dir);
+      const store = openStore(dir);
+      const task = store.createTask({ title: "Tracked terminal", ownerAgent: "antigravity" });
+      startAgentSession("agy-terminal", task.id, dir, "antigravity");
+      writeConfig({
+        ...readConfig(dir),
+        sessionWindows: {
+          "agy-terminal": {
+            windowId: "agy-terminal",
+            pid: 1234,
+            taskId: task.id,
+            agent: "antigravity",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      }, dir);
+      store.recordSessionEvent({
+        sessionId: "agy-terminal",
+        taskId: task.id,
+        agent: "antigravity",
+        kind: "session_started",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+
+      expect(cleanupStaleAgentSessions(store, dir, {
+        now: new Date("2026-01-01T01:00:00.000Z"),
+        staleAfterMs: 1,
+        isSessionProcessAlive: () => true,
+      })).toBe(0);
+      expect(cleanupStaleAgentSessions(store, dir, {
+        now: new Date("2026-01-01T01:00:01.000Z"),
+        staleAfterMs: 1,
+        isSessionProcessAlive: () => false,
+      })).toBe(1);
+      expect(store.listActiveSessionEvents()).toHaveLength(0);
+      store.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

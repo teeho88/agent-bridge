@@ -25,6 +25,9 @@ const provisionalTitles = new Set([
   "Claude session",
   "Antigravity session",
   "Generic session",
+  "Codex terminal",
+  "Claude terminal",
+  "Antigravity terminal",
 ]);
 
 export function placeholderTaskTitle(agent?: AgentKind): string {

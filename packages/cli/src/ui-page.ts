@@ -69,6 +69,7 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     .panel-body { padding: 13px; }
     .action-grid .panel-body { padding-top: 11px; }
     .panel-section { display: grid; gap: 9px; padding-top: 12px; border-top: 1px solid var(--line); }
+    .panel-section[hidden] { display: none; }
     .panel-section:first-child { padding-top: 0; border-top: 0; }
     .stack { display: grid; gap: 11px; }
     .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
@@ -247,6 +248,25 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     .modal-backdrop[hidden] { display: none; }
     .modal-card { width: min(560px, 100%); max-height: min(720px, 92vh); overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 18px 48px rgba(15, 23, 42, 0.22); padding: 14px; }
     .modal-card.wide { width: min(920px, 100%); }
+    .default-agent-list { max-height: min(620px, 72vh); }
+    .default-agent-option {
+      display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: start;
+      gap: 10px; margin: 0; cursor: pointer; color: var(--text);
+    }
+    .default-agent-option .default-agent-delete { align-self: center; }
+    .default-agent-option input[type="checkbox"] {
+      width: 16px; height: 16px; min-height: 0; margin: 2px 0 0; padding: 0;
+      flex: 0 0 auto; accent-color: var(--blue);
+    }
+    .default-agent-option-copy { min-width: 0; display: grid; gap: 3px; }
+    .default-agent-select-all {
+      display: grid; grid-template-columns: 16px minmax(0, 1fr); align-items: center;
+      gap: 10px; margin: 0; padding: 9px 10px; border: 1px solid var(--line);
+      border-radius: 8px; background: var(--soft); color: var(--text); cursor: pointer;
+    }
+    .default-agent-select-all input[type="checkbox"] {
+      width: 16px; height: 16px; min-height: 0; margin: 0; padding: 0; accent-color: var(--blue);
+    }
     pre {
       margin: 0; min-height: 420px; max-height: 680px; overflow: auto; white-space: pre-wrap; word-break: break-word;
       background: #111827; color: #f9fafb; border-radius: 8px; padding: 13px; font-size: 12px; line-height: 1.5;
@@ -281,11 +301,13 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       <div class="topline">
         <span class="pill" id="workspacePill">${workspaceLabel}</span>
         <span class="pill warn" id="hookPill">Claude hook unknown</span>
+        <span class="pill warn" id="antigravityHookPill">Antigravity hook unknown</span>
         <span class="pill ok" id="refreshPill">Live refresh: on</span>
       </div>
     </div>
     <div class="toolbar">
       <button class="secondary" id="installClaudeHookButton" type="button">Install Claude Hook</button>
+      <button class="secondary" id="installAntigravityHookButton" type="button">Install Antigravity Hook</button>
       <button class="secondary" id="refreshButton" type="button">Refresh</button>
       <button class="ghost" id="toggleLiveButton" type="button">Pause Live</button>
     </div>
@@ -299,6 +321,56 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
         <button class="ghost" id="taskDetailClose" type="button">Close</button>
       </div>
       <div id="taskDetailBody"></div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="defaultAgentPresetsModal" hidden>
+    <div class="modal-card wide stack" role="dialog" aria-modal="true" aria-labelledby="defaultAgentPresetsTitle">
+      <div class="toolbar" style="justify-content:space-between">
+        <h2 id="defaultAgentPresetsTitle">Default agents</h2>
+        <button class="ghost" id="defaultAgentPresetsClose" type="button">Close</button>
+      </div>
+      <div class="muted">Select reusable built-in profiles. Unselecting removes an agent from the roster but preserves your edits for the next selection. Delete removes the row from this table; added agents live here alongside the built-ins.</div>
+      <label class="default-agent-select-all">
+        <input id="defaultAgentSelectAll" type="checkbox">
+        <span>Select all <span class="meta">— add or remove every default agent</span></span>
+      </label>
+      <div id="defaultAgentPresets" class="list default-agent-list"></div>
+      <form id="defaultAgentPresetForm" class="stack">
+        <strong>Add default agent</strong>
+        <div class="grid-2">
+          <label>Label <input name="label" required placeholder="Codex GPT-5.6 Terra"></label>
+          <label>Provider
+            <select name="provider" id="defaultAgentPresetProvider">
+              <option value="codex">codex</option>
+              <option value="claude">claude</option>
+              <option value="gemini">gemini</option>
+              <option value="antigravity">antigravity</option>
+              <option value="openai-compatible">openai-compatible</option>
+              <option value="deepseek">deepseek</option>
+              <option value="kimi">kimi</option>
+              <option value="glm">glm</option>
+              <option value="manual">manual</option>
+              <option value="generic">generic</option>
+            </select>
+          </label>
+          <label>Command <input name="command" placeholder="codex"></label>
+          <label>Model <input name="model" placeholder="gpt-5.6-terra"></label>
+          <label>Reasoning / effort
+            <select name="reasoningEffort">
+              <option value="">Provider default</option>
+              <option>low</option><option>medium</option><option>high</option>
+              <option>xhigh</option><option>max</option><option>ultra</option>
+            </select>
+          </label>
+          <label>Capabilities <input name="capabilities" placeholder="implement, review, report"></label>
+          <label>Expertise description <input name="description" placeholder="What this agent is best at"></label>
+        </div>
+        <div class="toolbar">
+          <button type="submit">Add to table</button>
+          <button class="ghost" id="defaultAgentPresetRestore" type="button">Restore built-ins</button>
+        </div>
+      </form>
     </div>
   </div>
 
@@ -319,6 +391,15 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     </nav>
 
     <section class="view active" id="view-overview">
+      <section class="panel">
+        <div class="panel-head"><h2>Agent Terminals</h2><span class="help" data-tip="Opens each agent CLI in its own Windows terminal and assigns a stable session/window ID so Open Task Window can focus it later.">?</span></div>
+        <div class="panel-body toolbar">
+          <button class="secondary open-agent-terminal" data-agent="claude" type="button">Open Claude</button>
+          <button class="secondary open-agent-terminal" data-agent="codex" type="button">Open Codex</button>
+          <button class="secondary open-agent-terminal" data-agent="antigravity" type="button">Open Antigravity</button>
+          <span class="meta" id="agentTerminalStatus">Each terminal gets its own live task card and window ID.</span>
+        </div>
+      </section>
       <section class="panel">
         <div class="panel-head"><h2>Live Task Board</h2><div class="toolbar"><span class="meta" id="liveTaskSummary">0 live tasks</span><span class="help" data-tip="Only direct agent sessions are shown. Orchestrator agents stay in Orchestrator → Runs. Hover either side to move between live task cards.">?</span></div></div>
         <div class="panel-body task-carousel-shell" id="liveTaskShell">
@@ -387,6 +468,10 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
             </form>
           </div>
           <div class="panel-body" data-orch-panel="agents" hidden>
+            <div class="toolbar" style="margin-bottom:12px">
+              <button class="secondary" id="defaultAgentPresetsOpen" type="button">Default agents…</button>
+              <span class="meta" id="defaultAgentPresetsSummary">No default agents selected.</span>
+            </div>
             <div class="list" id="workforceAgents" style="margin-bottom:12px"></div>
           <div id="workforceAgentFormWrap">
             <form id="workforceAgentForm" class="stack">
@@ -415,18 +500,18 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
                   </select>
                 </label>
                 <label data-mode-field="cli">Command <input name="command" placeholder="codex or claude"></label>
-                <label data-mode-field="cli">Model <input name="model" list="workforceCliModels" placeholder="Choose or enter a model"></label>
+                <label data-mode-field="cli">Model <select name="model" id="workforceAgentModel"></select></label>
+                <label data-mode-field="cli" id="workforceAgentModelCustomField" style="display:none">Custom model <input id="workforceAgentModelCustom" placeholder="model name"></label>
                 <label data-mode-field="cli">Reasoning / effort <select name="reasoningEffort" id="workforceAgentReasoning"><option value="">Provider default</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option><option>ultra</option></select></label>
                 <label data-mode-field="api">Base URL <input name="baseUrl" placeholder="https://api.example.com"></label>
-                <label data-mode-field="api">Model <input name="model" placeholder="model name"></label>
+                <label data-mode-field="api">Model <input name="model" id="workforceAgentApiModel" placeholder="model name"></label>
                 <label data-mode-field="api">Credential ref <input name="credentialRef" placeholder="DEEPSEEK_API_KEY"></label>
                 <label>Capabilities <input name="capabilities" placeholder="implement, review, adjudicate, report"></label>
+                <label>Expertise description <input name="description" placeholder="e.g. TypeScript architecture, UI debugging, security review"></label>
               </div>
               <button type="submit" id="workforceAgentSubmit">Add Agent</button>
               <button type="button" id="workforceAgentCancelEdit" class="ghost" style="display:none">Cancel Edit</button>
             </form>
-            <!-- Static fallback shown before the real catalog loads (see loadOrchestratorCatalog / syncAgentModelCatalog below); kept in sync with packages/adapters/src/catalog.ts's seed models. -->
-            <datalist id="workforceCliModels"><option value="gpt-5.6-sol"><option value="gpt-5.6-terra"><option value="gpt-5.6-luna"><option value="gpt-5.5"></datalist>
           </div>
           </div>
         </div>
@@ -435,8 +520,16 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
           <div class="panel-body">
             <label>Showing <select id="orchestratorPicker"></select></label>
             <div class="meta" id="orchestratorSummary" style="margin-top:8px">No orchestration for the current task.</div>
-            <div class="toolbar" style="margin-top:10px">
-              <button type="button" class="secondary" id="orchestratorAutoRunButton">Auto-run</button>
+            <div class="toolbar" style="margin-top:10px; align-items:center">
+              <label style="display:flex; align-items:center; gap:6px; margin:0">Autonomy
+                <select id="orchestratorAutonomy">
+                  <option value="auto">Auto — leader decides on its own</option>
+                  <option value="approve-each">Approve each — ask me before every agent</option>
+                  <option value="manual">Manual — I advance with Step</option>
+                </select>
+              </label>
+              <span class="help" data-tip="Live setting: change it at any point during the run. Auto and Approve each both keep the server stepping this orchestration; Approve each stops at every agent call until you answer, and you can hand the task to a different agent when you do. Manual leaves the stepping to you.">?</span>
+              <span class="meta" id="orchestratorAutoRunState"></span>
               <button type="button" class="secondary" id="orchestratorStepButton">Step</button>
               <button type="button" class="ghost" id="orchestratorPauseToggle">Pause</button>
               <button type="button" class="ghost" id="orchestratorStopButton">Stop</button>
@@ -446,7 +539,7 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
             </div>
             <div id="orchestratorApprovals" hidden style="margin-top:10px; border:1px solid var(--blue); border-radius:8px; padding:10px; background:var(--blue-bg)">
               <strong>Waiting for your approval</strong>
-              <div class="meta">Autonomy is set to approve-each, so nothing is launched until you say so.</div>
+              <div class="meta">Autonomy is set to approve-each, so nothing is launched until you say so. Pick a different agent before approving to hand the task to that one instead. Rejecting a subtask only drops that subtask — the rest of the run continues.</div>
               <div id="orchestratorApprovalList" style="margin-top:8px; display:grid; gap:8px"></div>
               <div class="meta" id="orchestratorApprovalStatus"></div>
             </div>
@@ -663,14 +756,6 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
             <label>Task
               <select name="taskId" id="compileTaskId"></select>
             </label>
-            <label>Target agent
-              <select name="agent">
-                <option value="claude">Claude</option>
-                <option value="codex">Codex</option>
-                <option value="antigravity">Antigravity</option>
-                <option value="generic">Generic</option>
-              </select>
-            </label>
             <label>Token budget <input name="budget" type="number" value="4000"></label>
             <label>&nbsp;<button type="submit">Compile Context</button></label>
           </form>
@@ -816,7 +901,7 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     <section class="view" id="view-handoff">
       <section class="grid-2">
         <div class="panel">
-          <div class="panel-head"><h2>Create Handoff</h2><span class="help" data-tip="Use this when one agent stops and another agent should continue with minimal context.">?</span></div>
+          <div class="panel-head"><h2>Create Handoff</h2><span class="help" data-tip="Use this when one agent stops and another agent should continue with minimal context. A task keeps one handoff: creating a new one replaces the task's previous handoff, and every agent that works the task reads it regardless of the To field.">?</span></div>
           <div class="panel-body">
             <form id="handoffForm" class="stack">
               <div class="grid-2">
@@ -837,8 +922,12 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
           <div class="panel-head"><h2>Latest Handoff</h2><span class="help" data-tip="Last saved handoff packet for the selected task. Edit and save to create a corrected latest handoff. Also written to .agent-memory/handoff.md and handoff.json.">?</span></div>
           <div class="panel-body stack">
             <div id="handoff">No handoff yet.</div>
-            <div class="panel-section">
-              <h3>Edit Latest Handoff</h3>
+            <div><button id="latestHandoffEditButton" class="secondary" type="button" hidden>Edit</button></div>
+            <div id="latestHandoffEditPanel" class="panel-section" hidden>
+              <div class="toolbar" style="justify-content:space-between">
+                <h3>Edit Latest Handoff</h3>
+                <button id="latestHandoffCancelButton" class="secondary" type="button">Cancel</button>
+              </div>
               <form id="latestHandoffEditForm" class="stack">
                 <input name="handoffId" id="latestHandoffId" type="hidden">
                 <input name="taskId" id="latestHandoffTaskId" type="hidden">
@@ -885,6 +974,8 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       workspacePill: document.getElementById('workspacePill'),
       hookPill: document.getElementById('hookPill'),
       installClaudeHookButton: document.getElementById('installClaudeHookButton'),
+      antigravityHookPill: document.getElementById('antigravityHookPill'),
+      installAntigravityHookButton: document.getElementById('installAntigravityHookButton'),
       refreshPill: document.getElementById('refreshPill'),
       liveTaskSummary: document.getElementById('liveTaskSummary'),
       liveTaskShell: document.getElementById('liveTaskShell'),
@@ -913,6 +1004,9 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       repoMemories: document.getElementById('repoMemories'),
       repoMemoryCandidates: document.getElementById('repoMemoryCandidates'),
       handoff: document.getElementById('handoff'),
+      latestHandoffEditButton: document.getElementById('latestHandoffEditButton'),
+      latestHandoffCancelButton: document.getElementById('latestHandoffCancelButton'),
+      latestHandoffEditPanel: document.getElementById('latestHandoffEditPanel'),
       latestHandoffForm: document.getElementById('latestHandoffEditForm'),
       latestHandoffId: document.getElementById('latestHandoffId'),
       latestHandoffTaskId: document.getElementById('latestHandoffTaskId'),
@@ -974,6 +1068,10 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       workforceAgentId: document.getElementById('workforceAgentId'),
       workforceAgentSubmit: document.getElementById('workforceAgentSubmit'),
       workforceAgentCancelEdit: document.getElementById('workforceAgentCancelEdit'),
+      defaultAgentPresets: document.getElementById('defaultAgentPresets'),
+      defaultAgentPresetsModal: document.getElementById('defaultAgentPresetsModal'),
+      defaultAgentPresetsSummary: document.getElementById('defaultAgentPresetsSummary'),
+      defaultAgentSelectAll: document.getElementById('defaultAgentSelectAll'),
       taskDetailModal: document.getElementById('taskDetailModal'),
       taskDetailTitle: document.getElementById('taskDetailTitle'),
       taskDetailBody: document.getElementById('taskDetailBody'),
@@ -1018,7 +1116,7 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
         const fingerprint = JSON.stringify({
           currentTaskId: state.config.currentTaskId,
           tasks: (state.tasks || []).map(t => [t.id, t.title, t.status, t.ownerAgent, t.updatedAt].join(':')).join('|'),
-          liveTasks: (state.liveTasks || []).map(item => [item.task.id, item.task.updatedAt, item.sessionState && item.sessionState.updatedAt, item.handoff && item.handoff.id, item.compiledContext].join(':')).join('|'),
+          liveTasks: (state.liveTasks || []).map(item => [item.task.id, item.task.updatedAt, item.sessionState && item.sessionState.updatedAt, item.handoff && item.handoff.id, item.compiledContext, (item.sessions || []).map(session => session.sessionId + ':' + session.hasWindow).join(',')].join(':')).join('|'),
           repoMemories: (state.repoMemories || []).map(m => m.id + m.updatedAt).join('|'),
           repoMemoryCandidates: (state.repoMemoryCandidates || []).map(c => c.id + c.status).join('|'),
           memories: state.memories.map(m => m.id + m.updatedAt).join('|'),
@@ -1033,7 +1131,8 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
             leases: state.fileLeases || [],
             changes: state.taskChanges || [],
             requests: state.agentRequests || [],
-            agents: state.registeredAgents || []
+            agents: state.registeredAgents || [],
+            defaultAgentPresets: state.defaultAgentPresets || []
           }),
           dbError: state.dbError || ''
         });
@@ -1077,6 +1176,24 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
         els.hookPill.textContent = 'Claude hook current ' + (hookStatus.expectedVersion || '');
         els.hookPill.className = 'pill ok';
         els.installClaudeHookButton.style.display = 'none';
+      }
+      // agy has no session hooks of its own until these are installed, so an
+      // agy run started by hand never reaches the Work Board without them.
+      const agyHook = state.antigravityHookStatus || { installed: false, current: false };
+      if (!agyHook.installed) {
+        els.antigravityHookPill.textContent = 'Antigravity hook missing';
+        els.antigravityHookPill.className = 'pill warn';
+        els.installAntigravityHookButton.textContent = 'Install Antigravity Hook';
+        els.installAntigravityHookButton.style.display = 'inline-flex';
+      } else if (!agyHook.current) {
+        els.antigravityHookPill.textContent = 'Antigravity hook outdated' + (agyHook.installedVersion ? ' (' + agyHook.installedVersion + ')' : '');
+        els.antigravityHookPill.className = 'pill warn';
+        els.installAntigravityHookButton.textContent = 'Update Antigravity Hook';
+        els.installAntigravityHookButton.style.display = 'inline-flex';
+      } else {
+        els.antigravityHookPill.textContent = 'Antigravity hook current ' + (agyHook.expectedVersion || '');
+        els.antigravityHookPill.className = 'pill ok';
+        els.installAntigravityHookButton.style.display = 'none';
       }
       els.watcherPill.textContent = state.watcherRunning ? 'Watcher running' : 'Watcher stopped';
       els.watcherPill.className = state.watcherRunning ? 'pill ok' : 'pill warn';
@@ -1130,6 +1247,8 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
         : '<div class="muted">Inbox is clear. Session discoveries that look repository-wide will appear here for review.</div>';
       const activeHandoff = selected?.handoff || state.handoff;
       els.handoff.innerHTML = activeHandoff ? renderHandoff(activeHandoff) : '<div class="muted">No handoff yet.</div>';
+      els.latestHandoffEditButton.hidden = !activeHandoff || !els.latestHandoffEditPanel.hidden;
+      if (!activeHandoff) els.latestHandoffEditPanel.hidden = true;
       populateLatestHandoffEditor(activeHandoff, current?.id || state.currentTask?.id || '');
       populateTaskSelects(state.tasks || [], current?.id);
       populateWorkTaskSelects(state.tasks || [], current?.id);
@@ -1257,7 +1376,10 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       const timelineHtml = events.length ? events.map(renderSessionEvent).join('') : '<div class="muted">No task events yet.</div>';
       const requestHtml = requests.length ? requests.map(request => renderAgentRequest(request, { compact: true })).join('') : '<div class="muted">No pending requests for this task.</div>';
       const stats = entry.tokenStats || { rawTokens: 0, cleanedTokens: 0, compiledTokens: 0, savedTokens: 0, savingsPercent: 0 };
-      const taskSession = (entry.sessions || []).find(session => session.agent === task.ownerAgent) || (entry.sessions || [])[0] || {};
+      const taskSession = (entry.sessions || []).find(session => session.hasWindow && session.agent === task.ownerAgent) ||
+        (entry.sessions || []).find(session => session.hasWindow) ||
+        (entry.sessions || []).find(session => session.agent === task.ownerAgent) ||
+        (entry.sessions || [])[0] || {};
       const taskAgent = taskSession.agent || task.ownerAgent || '';
       return '<div class="card live-task-card' + (active ? ' is-active' : ' is-idle') + (alert ? ' has-alert' : '') + depthClass + '" data-task-id="' + escapeHtml(task.id) + '" tabindex="0" role="button" aria-current="' + (selected ? 'true' : 'false') + '">' +
         '<div class="toolbar" style="justify-content:space-between;align-items:flex-start"><div><strong class="task-card-title">' + escapeHtml(task.title) + '</strong><div class="meta">' + escapeHtml(task.ownerAgent || 'unknown') + ' | ' + escapeHtml(laneText) + '</div></div>' +
@@ -1309,14 +1431,39 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
 
     function renderWorkforceState(state) {
       const agents = state.registeredAgents || [];
+      const presets = state.defaultAgentPresets || [];
+      const selectedPresetCount = presets.filter(preset => preset.selected).length;
+      if (els.defaultAgentSelectAll) {
+        els.defaultAgentSelectAll.checked = presets.length > 0 && selectedPresetCount === presets.length;
+        els.defaultAgentSelectAll.indeterminate = selectedPresetCount > 0 && selectedPresetCount < presets.length;
+        els.defaultAgentSelectAll.disabled = presets.length === 0;
+      }
+      if (els.defaultAgentPresetsSummary) {
+        els.defaultAgentPresetsSummary.textContent = selectedPresetCount
+          ? selectedPresetCount + ' of ' + presets.length + ' selected'
+          : 'No default agents selected.';
+      }
+      if (els.defaultAgentPresets) {
+        els.defaultAgentPresets.innerHTML = presets.length ? presets.map(preset =>
+          '<label class="card default-agent-option">' +
+            '<input class="default-agent-preset" type="checkbox" data-preset-key="' + escapeHtml(preset.key) + '"' + (preset.selected ? ' checked' : '') + '>' +
+            '<span class="default-agent-option-copy"><strong>' + escapeHtml(preset.label) + '</strong>' +
+            '<span class="meta" style="display:block">' + escapeHtml(preset.provider) + ' | ' + escapeHtml(preset.model) + ' | effort: ' + escapeHtml(preset.reasoningEffort || 'default') + '</span>' +
+            '<span class="muted" style="display:block">' + escapeHtml(preset.description) + '</span></span>' +
+            '<button class="ghost default-agent-delete" data-preset-key="' + escapeHtml(preset.key) + '" data-preset-label="' + escapeHtml(preset.label) + '" data-preset-custom="' + (preset.custom ? 'true' : 'false') + '" type="button">Delete</button>' +
+          '</label>'
+        ).join('') : '<div class="muted">No default agent presets available.</div>';
+      }
       els.workforceAgents.innerHTML = agents.length ? agents.map(agent => {
         const caps = (agent.capabilities || []).slice(0, 4).map(item => '<span class="tag">' + escapeHtml(item) + '</span>').join('');
         return '<div class="card"><div class="toolbar" style="justify-content:space-between"><strong>' + escapeHtml(agent.name) + '</strong><span class="pill ' + (agent.enabled ? 'ok' : 'warn') + '">' + (agent.enabled ? 'enabled' : 'disabled') + '</span></div>' +
-          '<div class="meta">' + escapeHtml(agent.provider) + ' | ' + escapeHtml(agent.mode) + (agent.model ? ' | ' + escapeHtml(agent.model) : '') + '</div>' +
+          '<div class="meta">' + escapeHtml(agent.provider) + ' | ' + escapeHtml(agent.mode) + (agent.model ? ' | ' + escapeHtml(agent.model) : '') +
+          ' | effort: ' + escapeHtml(agent.reasoningEffort || 'default') + '</div>' +
+          (agent.description ? '<div class="muted">' + escapeHtml(agent.description) + '</div>' : '') +
           '<div>' + caps + '</div><div class="toolbar" style="margin-top:8px">' +
           '<button class="ghost agent-toggle" data-agent-id="' + escapeHtml(agent.id) + '" data-enabled="' + (agent.enabled ? 'false' : 'true') + '" type="button">' + (agent.enabled ? 'Disable' : 'Enable') + '</button>' +
-          '<button class="ghost agent-edit" data-agent-id="' + escapeHtml(agent.id) + '" data-agent-name="' + escapeHtml(agent.name) + '" data-agent-provider="' + escapeHtml(agent.provider) + '" data-agent-mode="' + escapeHtml(agent.mode) + '" data-agent-command="' + escapeHtml(agent.command || '') + '" data-agent-base-url="' + escapeHtml(agent.baseUrl || '') + '" data-agent-model="' + escapeHtml(agent.model || '') + '" data-agent-reasoning="' + escapeHtml(agent.reasoningEffort || '') + '" data-agent-credential="' + escapeHtml(agent.credentialRef || '') + '" data-agent-capabilities="' + escapeHtml((agent.capabilities || []).join(',')) + '" type="button">Edit</button>' +
-          '<button class="ghost agent-delete" data-agent-id="' + escapeHtml(agent.id) + '" data-agent-name="' + escapeHtml(agent.name) + '" type="button">Delete</button>' +
+          '<button class="ghost agent-edit" data-agent-id="' + escapeHtml(agent.id) + '" data-agent-name="' + escapeHtml(agent.name) + '" data-agent-description="' + escapeHtml(agent.description || '') + '" data-agent-provider="' + escapeHtml(agent.provider) + '" data-agent-mode="' + escapeHtml(agent.mode) + '" data-agent-command="' + escapeHtml(agent.command || '') + '" data-agent-base-url="' + escapeHtml(agent.baseUrl || '') + '" data-agent-model="' + escapeHtml(agent.model || '') + '" data-agent-reasoning="' + escapeHtml(agent.reasoningEffort || '') + '" data-agent-credential="' + escapeHtml(agent.credentialRef || '') + '" data-agent-capabilities="' + escapeHtml((agent.capabilities || []).join(',')) + '" type="button">Edit</button>' +
+          '<button class="ghost agent-delete" data-agent-id="' + escapeHtml(agent.id) + '" data-agent-name="' + escapeHtml(agent.name) + '" data-agent-preset="' + escapeHtml(agent.presetKey || '') + '" type="button">' + (agent.presetKey ? 'Remove' : 'Delete') + '</button>' +
           '</div></div>';
       }).join('') : '<div class="muted">No registered agents.</div>';
     }
@@ -1598,9 +1745,28 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       }
     } });
     bindForm('handoffForm', '/api/handoff/create');
-    bindForm('latestHandoffEditForm', '/api/handoff/update', { reset: false, onSuccess: () => { handoffEditTouched = false; } });
+    bindForm('latestHandoffEditForm', '/api/handoff/update', { reset: false, onSuccess: () => {
+      handoffEditTouched = false;
+      els.latestHandoffEditPanel.hidden = true;
+      els.latestHandoffEditButton.hidden = false;
+    } });
+    onElement(els.latestHandoffEditButton, 'click', () => {
+      els.latestHandoffEditPanel.hidden = false;
+      els.latestHandoffEditButton.hidden = true;
+      els.latestHandoffSummary.focus();
+    });
+    onElement(els.latestHandoffCancelButton, 'click', () => {
+      handoffEditTouched = false;
+      els.latestHandoffEditPanel.hidden = true;
+      els.latestHandoffEditButton.hidden = false;
+      load(true);
+    });
     onElement(els.latestHandoffForm, 'input', () => { handoffEditTouched = true; });
     bindForm('laneForm', '/api/orchestration/lane', { reset: false });
+    // Declared up here with providerCommands: syncAgentSetupMode() runs during
+    // wiring below, well before the model helpers further down, and a const in
+    // their block would still be in its temporal dead zone at that point.
+    const AGENT_CUSTOM_MODEL = '__custom__';
     // Provider -> CLI command. Keep this initialized before syncAgentSetupMode()
     // is first called below. The catalog response later replaces these seeds.
     let providerCommands = { codex: 'codex', claude: 'claude', antigravity: 'agy', gemini: 'gemini' };
@@ -1620,6 +1786,7 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       // Switching back to cli leaves Command blank (cleared above while it was
       // hidden), so put the provider's binary back in it.
       if (mode === 'cli') syncAgentCommandDefault();
+      syncAgentModelCustomField();
     }
 
     function resetAgentForm() {
@@ -1635,9 +1802,112 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       const form = event.currentTarget;
       const agentId = els.workforceAgentId ? els.workforceAgentId.value : '';
       const path = agentId ? '/api/workforce/agent/update' : '/api/workforce/agent';
-      await api(path, { method: 'POST', body: JSON.stringify(formData(form)) });
+      const payload = formData(form);
+      if (payload.model === AGENT_CUSTOM_MODEL) {
+        payload.model = (document.getElementById('workforceAgentModelCustom')?.value || '').trim();
+      }
+      await api(path, { method: 'POST', body: JSON.stringify(payload) });
       resetAgentForm();
       await load(true);
+    });
+    on('defaultAgentPresets', 'change', async event => {
+      const checkbox = event.target.closest && event.target.closest('.default-agent-preset');
+      if (!checkbox) return;
+      checkbox.disabled = true;
+      try {
+        await api('/api/workforce/default-agent/toggle', {
+          method: 'POST',
+          body: JSON.stringify({ presetKey: checkbox.dataset.presetKey, selected: checkbox.checked })
+        });
+        await load(true);
+      } catch (error) {
+        checkbox.checked = !checkbox.checked;
+        alert(error.message);
+      } finally {
+        checkbox.disabled = false;
+      }
+    });
+    on('defaultAgentPresets', 'click', async event => {
+      const button = event.target.closest && event.target.closest('.default-agent-delete');
+      if (!button) return;
+      // The row is a <label>, so the click must not fall through to the checkbox.
+      event.preventDefault();
+      event.stopPropagation();
+      const custom = button.dataset.presetCustom === 'true';
+      const message = custom
+        ? 'Delete "' + button.dataset.presetLabel + '" from the default agents table?'
+        : 'Remove built-in "' + button.dataset.presetLabel + '" from the table? Restore built-ins brings it back.';
+      if (!confirm(message)) return;
+      button.disabled = true;
+      try {
+        await api('/api/workforce/default-agent/delete', {
+          method: 'POST',
+          body: JSON.stringify({ presetKey: button.dataset.presetKey })
+        });
+        await load(true);
+      } catch (error) {
+        button.disabled = false;
+        alert(error.message);
+      }
+    });
+    on('defaultAgentPresetForm', 'submit', async event => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const data = new FormData(form);
+      const payload = {
+        label: (data.get('label') || '').trim(),
+        provider: data.get('provider'),
+        mode: 'cli',
+        command: (data.get('command') || '').trim(),
+        model: (data.get('model') || '').trim(),
+        reasoningEffort: data.get('reasoningEffort') || '',
+        capabilities: (data.get('capabilities') || '').trim(),
+        description: (data.get('description') || '').trim()
+      };
+      try {
+        await api('/api/workforce/default-agent/create', { method: 'POST', body: JSON.stringify(payload) });
+        form.reset();
+        await load(true);
+      } catch (error) {
+        alert(error.message);
+      }
+    });
+    on('defaultAgentPresetRestore', 'click', async () => {
+      try {
+        await api('/api/workforce/default-agent/restore', { method: 'POST', body: '{}' });
+        await load(true);
+      } catch (error) {
+        alert(error.message);
+      }
+    });
+    onElement(els.defaultAgentSelectAll, 'change', async event => {
+      const selectAll = event.currentTarget;
+      const selected = selectAll.checked;
+      const checkboxes = Array.from(els.defaultAgentPresets.querySelectorAll('.default-agent-preset'));
+      selectAll.disabled = true;
+      checkboxes.forEach(checkbox => { checkbox.disabled = true; });
+      try {
+        for (const checkbox of checkboxes) {
+          if (checkbox.checked === selected) continue;
+          await api('/api/workforce/default-agent/toggle', {
+            method: 'POST',
+            body: JSON.stringify({ presetKey: checkbox.dataset.presetKey, selected })
+          });
+        }
+        await load(true);
+      } catch (error) {
+        await load(true);
+        alert(error.message);
+      } finally {
+        selectAll.disabled = false;
+        checkboxes.forEach(checkbox => { checkbox.disabled = false; });
+      }
+    });
+    const closeDefaultAgentPresets = () => { els.defaultAgentPresetsModal.hidden = true; };
+    on('defaultAgentPresetsOpen', 'click', () => { els.defaultAgentPresetsModal.hidden = false; });
+    on('defaultAgentPresetsClose', 'click', closeDefaultAgentPresets);
+    onElement(els.defaultAgentPresetsModal, 'click', event => {
+      if (event.target === els.defaultAgentPresetsModal) closeDefaultAgentPresets();
     });
     on('workforceAgentCancelEdit', 'click', resetAgentForm);
     onElement(els.workforceAgentMode, 'change', syncAgentSetupMode);
@@ -1645,6 +1915,8 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     // prefill still works if the catalog request fails — the seed map in
     // providerCommands covers the CLI providers either way.
     onElement(document.getElementById('workforceAgentProvider'), 'change', syncAgentCommandDefault);
+    onElement(document.getElementById('workforceAgentProvider'), 'change', refreshAgentModelCatalog);
+    onElement(document.getElementById('workforceAgentModel'), 'change', syncAgentModelCustomField);
     syncAgentSetupMode();
 
     function selectedLiveEntry(taskId) {
@@ -1737,6 +2009,26 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     });
 
     document.addEventListener('click', async event => {
+      const openAgentTerminal = event.target.closest && event.target.closest('.open-agent-terminal');
+      if (openAgentTerminal) {
+        const agent = openAgentTerminal.dataset.agent || '';
+        openAgentTerminal.disabled = true;
+        const status = document.getElementById('agentTerminalStatus');
+        if (status) status.textContent = 'Opening ' + agent + ' terminal...';
+        try {
+          const data = await api('/api/session/terminal', {
+            method: 'POST',
+            body: JSON.stringify({ agent })
+          });
+          if (status) status.textContent = 'Opened ' + agent + ' · window ID ' + (data.terminal.windowId || data.sessionId);
+          await load(true);
+        } catch (error) {
+          if (status) status.textContent = 'Open failed: ' + (error.message || String(error));
+        } finally {
+          openAgentTerminal.disabled = false;
+        }
+        return;
+      }
       const release = event.target.closest && event.target.closest('.release-lease');
       if (release) {
         const taskId = release.dataset.taskId || selectedLiveTaskId;
@@ -1820,12 +2112,11 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
         const form = document.getElementById('workforceAgentForm');
         if (form && els.workforceAgentId) {
           form.elements.name.value = agentEdit.dataset.agentName || '';
+          form.elements.description.value = agentEdit.dataset.agentDescription || '';
           form.elements.provider.value = agentEdit.dataset.agentProvider || 'codex';
           form.elements.mode.value = agentEdit.dataset.agentMode || 'cli';
           form.elements.command.value = agentEdit.dataset.agentCommand || '';
           form.elements.baseUrl.value = agentEdit.dataset.agentBaseUrl || '';
-          form.elements.model.value = agentEdit.dataset.agentModel || '';
-          form.elements.reasoningEffort.value = agentEdit.dataset.agentReasoning || '';
           form.elements.credentialRef.value = agentEdit.dataset.agentCredential || '';
           form.elements.capabilities.value = agentEdit.dataset.agentCapabilities || '';
           els.workforceAgentId.value = agentEdit.dataset.agentId || '';
@@ -1833,8 +2124,21 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
           if (els.workforceAgentCancelEdit) els.workforceAgentCancelEdit.style.display = '';
           syncAgentSetupMode();
           // Re-applied after the mode sync: what this agent is actually
-          // registered with wins over the provider's default command.
+          // registered with wins over the provider's default command, and the
+          // model and effort level have to be set after their pickers are
+          // rebuilt for this provider (the two Model fields share a name, so
+          // form.elements.model is a node list whose value assignment silently
+          // does nothing).
+          syncAgentModelCatalog();
           form.elements.command.value = agentEdit.dataset.agentCommand || '';
+          setAgentReasoningValue(agentEdit.dataset.agentReasoning || '');
+          const editedModel = agentEdit.dataset.agentModel || '';
+          if ((agentEdit.dataset.agentMode || 'cli') === 'api') {
+            const apiModel = document.getElementById('workforceAgentApiModel');
+            if (apiModel) apiModel.value = editedModel;
+          } else {
+            setAgentModelValue(editedModel);
+          }
           // The form lives in the Orchestrator tab's Agents pane now.
           selectOrchestratorFormTab('agents');
           form.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -1843,7 +2147,9 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       }
       const agentDelete = event.target.closest && event.target.closest('.agent-delete');
       if (agentDelete) {
-        const confirmed = confirm('Delete agent "' + agentDelete.dataset.agentName + '"? Historical assignments/runs keep referencing it by id.');
+        const confirmed = confirm(agentDelete.dataset.agentPreset
+          ? 'Remove default agent "' + agentDelete.dataset.agentName + '" from the roster? Your edits will be preserved and restored if you select its preset again.'
+          : 'Delete agent "' + agentDelete.dataset.agentName + '"? Historical assignments/runs keep referencing it by id.');
         if (!confirmed) return;
         agentDelete.disabled = true;
         try {
@@ -2100,15 +2406,26 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
 
     function wireProviderTriplet(providerSelect, modelSelect, reasoningSelect) {
       if (!providerSelect || !modelSelect || !reasoningSelect) return;
+      const previousProvider = providerSelect.value;
       providerSelect.innerHTML = orchestratorCatalogs.map(catalog =>
         '<option value="' + escapeHtml(catalog.provider) + '">' + escapeHtml(catalog.provider) + '</option>'
       ).join('');
+      if (orchestratorCatalogs.some(catalog => catalog.provider === previousProvider)) {
+        providerSelect.value = previousProvider;
+      }
       const sync = () => {
+        const previousModel = modelSelect.value;
+        const previousReasoning = reasoningSelect.value;
         const catalog = orchestratorCatalogs.find(item => item.provider === providerSelect.value);
         populateModelSelect(modelSelect, catalog);
         populateReasoningSelect(reasoningSelect, catalog);
+        if ([...modelSelect.options].some(option => option.value === previousModel)) modelSelect.value = previousModel;
+        if ([...reasoningSelect.options].some(option => option.value === previousReasoning)) reasoningSelect.value = previousReasoning;
       };
-      providerSelect.addEventListener('change', sync);
+      providerSelect.onchange = async () => {
+        await refreshProviderCatalog(providerSelect.value);
+        sync();
+      };
       sync();
     }
 
@@ -2117,16 +2434,93 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     // that includes non-catalog providers (deepseek, manual, generic, ...) —
     // this only keeps the CLI model datalist and reasoning options in sync
     // with whichever catalog-backed provider is currently selected.
+    // The Custom row only exists to keep models the catalog cannot know about
+    // reachable (a preview id, a provider with no catalog at all), so it stays
+    // out of the way until the picker asks for it.
+    function syncAgentModelCustomField() {
+      const select = document.getElementById('workforceAgentModel');
+      const field = document.getElementById('workforceAgentModelCustomField');
+      const input = document.getElementById('workforceAgentModelCustom');
+      if (!select || !field || !input) return;
+      const custom = (els.workforceAgentMode?.value || 'cli') === 'cli' && select.value === AGENT_CUSTOM_MODEL;
+      field.style.display = custom ? '' : 'none';
+      input.disabled = !custom;
+    }
+
+    // A registered agent may hold a model this catalog does not list; keep it
+    // as its own option so Edit shows what the agent actually runs instead of
+    // dropping back to the provider default.
+    function setAgentModelValue(value) {
+      const select = document.getElementById('workforceAgentModel');
+      if (!select) return;
+      const wanted = value || '';
+      const known = Array.prototype.some.call(select.options, option => option.value === wanted);
+      if (wanted && !known) {
+        const option = document.createElement('option');
+        option.value = wanted;
+        option.textContent = wanted;
+        select.insertBefore(option, select.options[select.options.length - 1]);
+      }
+      select.value = wanted;
+      syncAgentModelCustomField();
+    }
+
+    // Same rule as setAgentModelValue: an agent may hold an effort level this
+    // provider's catalog does not list, and Edit must show what the agent
+    // actually runs with instead of silently resetting it to the default.
+    function setAgentReasoningValue(value) {
+      const select = document.getElementById('workforceAgentReasoning');
+      if (!select) return;
+      const wanted = value || '';
+      const known = Array.prototype.some.call(select.options, option => option.value === wanted);
+      if (wanted && !known) {
+        const option = document.createElement('option');
+        option.value = wanted;
+        option.textContent = wanted;
+        select.appendChild(option);
+      }
+      select.value = wanted;
+    }
+
     function syncAgentModelCatalog() {
       const providerSelect = document.getElementById('workforceAgentProvider');
-      const datalist = document.getElementById('workforceCliModels');
-      if (!providerSelect || !datalist) return;
+      const select = document.getElementById('workforceAgentModel');
+      if (!providerSelect || !select) return;
       const catalog = orchestratorCatalogs.find(item => item.provider === providerSelect.value);
-      datalist.innerHTML = (catalog ? catalog.models : []).map(model =>
-        '<option value="' + escapeHtml(model.value) + '" label="' + escapeHtml(model.label) + '">'
-      ).join('');
-      populateReasoningSelect(document.getElementById('workforceAgentReasoning'), catalog);
+      const previous = select.value;
+      select.innerHTML = '<option value="">Provider default</option>' +
+        (catalog ? catalog.models : []).map(model =>
+          '<option value="' + escapeHtml(model.value) + '">' + escapeHtml(model.label) + '</option>'
+        ).join('') +
+        '<option value="' + AGENT_CUSTOM_MODEL + '">Custom — type a model name</option>';
+      setAgentModelValue(previous);
+      // Rebuilding the level list drops the selection, so put it back — a
+      // provider/mode sync must not silently downgrade the agent to default.
+      const reasoningSelect = document.getElementById('workforceAgentReasoning');
+      const previousReasoning = reasoningSelect ? reasoningSelect.value : '';
+      populateReasoningSelect(reasoningSelect, catalog);
+      setAgentReasoningValue(previousReasoning);
       syncAgentCommandDefault();
+    }
+
+    async function refreshAgentModelCatalog() {
+      const provider = document.getElementById('workforceAgentProvider')?.value;
+      if (provider) await refreshProviderCatalog(provider);
+      syncAgentModelCatalog();
+    }
+
+    async function refreshProviderCatalog(provider) {
+      if (!orchestratorCatalogs.some(catalog => catalog.provider === provider)) return;
+      try {
+        const data = await api('/api/workforce/catalog?provider=' + encodeURIComponent(provider));
+        const refreshed = data.catalogs && data.catalogs[0];
+        if (!refreshed) return;
+        orchestratorCatalogs = orchestratorCatalogs.map(catalog =>
+          catalog.provider === provider ? refreshed : catalog
+        );
+      } catch (error) {
+        // Keep the last successful catalog when the selected CLI cannot be probed.
+      }
     }
 
     // Prefills Command with the CLI binary the selected provider actually
@@ -2217,7 +2611,6 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
           document.getElementById('orchestratorSubtaskModel'),
           document.getElementById('orchestratorSubtaskReasoning')
         );
-        onElement(document.getElementById('workforceAgentProvider'), 'change', syncAgentModelCatalog);
         syncAgentModelCatalog();
       } catch (error) {
         // Catalog is a convenience for the dropdowns; leave them empty on failure.
@@ -2264,6 +2657,10 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       const agent = agentsById[run.agentId];
       const agentName = agent ? agent.name : run.agentId;
       const modelLabel = [run.provider || (agent && agent.provider), run.model || (agent && agent.model)].filter(Boolean).join(' · ');
+      // Effort is spelled out even when unset, so "provider default" is a
+      // visible choice instead of a blank the reader has to interpret.
+      const effort = run.reasoningEffort || (agent && agent.reasoningEffort) || '';
+      const effortLabel = 'effort: ' + (effort || 'default');
       const progress = run.progressPercent != null ? run.progressPercent + '%' : '';
       const originTag = run.origin === 'adopted' ? '<span class="tag">adopted</span>' : '';
       const statusClass = run.status === 'failed' ? 'warn' : (run.status === 'done' ? 'ok' : '');
@@ -2274,7 +2671,8 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
         '<div class="toolbar" style="justify-content:space-between"><strong>' +
         (isActive ? '<span class="run-live-dot"></span>' : '') + escapeHtml(agentName) +
         '</strong><span class="pill ' + statusClass + '">' + escapeHtml(run.status) + '</span></div>' +
-        '<div class="meta">' + escapeHtml(run.phase || '') + (modelLabel ? ' · ' + escapeHtml(modelLabel) : '') + (progress ? ' · ' + escapeHtml(progress) : '') +
+        '<div class="meta">' + escapeHtml(run.phase || '') + (modelLabel ? ' · ' + escapeHtml(modelLabel) : '') +
+        ' · <span class="tag' + (effort ? ' ok' : '') + '">' + escapeHtml(effortLabel) + '</span>' + (progress ? ' · ' + escapeHtml(progress) : '') +
         (originTag ? ' ' + originTag : '') + '</div>' +
         // A finished run's tail is not sent with the board any more (it never
         // changes, and re-sending every one of them dominated the payload).
@@ -2388,10 +2786,11 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
           'orchestratorChangeTeamProviders',
           savedChangeProviders ?? currentOrchestrationTeamProviders
         );
-        renderAutoRunButton(Boolean(data.autoRun));
+        renderAutoRunState(Boolean(data.autoRun));
+        renderAutonomySelect(orchestration.autonomy);
         renderPauseToggle(orchestration.status);
         renderLeaderQuestions(data.questions || []);
-        renderSpawnApprovals(data.approvals || []);
+        renderSpawnApprovals(data.approvals || [], data.registeredAgents || []);
         const heading = data.taskTitle
           ? '<div><strong>' + escapeHtml(String(data.taskTitle).split('\\n')[0].slice(0, 90)) + '</strong></div>'
           : '';
@@ -2481,6 +2880,11 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
         };
         const data = await api('/api/workforce/orchestration/start', { method: 'POST', body: JSON.stringify(body) });
         statusEl.textContent = data.summary || 'Started.';
+        // The board follows an explicit pick until the user changes it, so a
+        // freshly started orchestration has to claim that pick — otherwise the
+        // panel keeps showing whichever one was on screen before.
+        selectedOrchestrationTaskId =
+          (data.orchestration && data.orchestration.taskId) || (data.task && data.task.id) || null;
         await load(true);
         await refreshOrchestratorBoard();
       } catch (error) {
@@ -2532,23 +2936,70 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       return value.length > max ? value.slice(0, max - 1).trimEnd() + '…' : value;
     }
 
-    function renderSpawnApprovals(approvals) {
+    function approvalPayload(approval) {
+      // The agent the orchestrator picked and what it is for ride in the
+      // payload. A malformed one just degrades to no preselection.
+      try {
+        return (approval.payload ? JSON.parse(approval.payload) : null) || {};
+      } catch (error) {
+        return {};
+      }
+    }
+
+    // Rejecting a subtask assignment only blocks that subtask; rejecting a
+    // plan/adjudicate/review turn leaves nothing to continue with, so it pauses
+    // the whole orchestration. The button has to say which one this is.
+    function rejectEffect(approval) {
+      return String(approvalPayload(approval).key || '').indexOf('implement:') === 0 ? 'skip' : 'pause';
+    }
+
+    function renderSpawnApprovals(approvals, agents) {
       const panel = document.getElementById('orchestratorApprovals');
       const list = document.getElementById('orchestratorApprovalList');
       if (!panel || !list) return;
       panel.hidden = !approvals.length;
       if (!approvals.length) {
         list.innerHTML = '';
+        delete list.dataset.signature;
         return;
       }
-      list.innerHTML = approvals.map(approval =>
-        '<div class="card" style="display:flex; gap:10px; align-items:center; justify-content:space-between">' +
-        '<span style="min-width:0">' + escapeHtml(approval.title) + '</span>' +
-        '<span class="toolbar" style="flex:0 0 auto">' +
-        '<button type="button" class="secondary approve-spawn" data-request-id="' + escapeHtml(approval.id) + '">Approve</button>' +
-        '<button type="button" class="ghost reject-spawn" data-request-id="' + escapeHtml(approval.id) + '" style="color:var(--red)">Reject</button>' +
-        '</span></div>'
-      ).join('');
+      // The board polls every few seconds. Re-rendering unconditionally would
+      // reset a dropdown the user is in the middle of changing, so only redraw
+      // when the set of pending approvals actually changes.
+      const signature = approvals.map(approval => approval.id).join('|');
+      if (list.dataset.signature === signature) return;
+      list.dataset.signature = signature;
+      const usable = (agents || []).filter(agent => agent.enabled !== false);
+      list.innerHTML = approvals.map(approval => {
+        const intended = approvalPayload(approval).agentId || '';
+        const effect = rejectEffect(approval);
+        const options = usable.map(agent =>
+          '<option value="' + escapeHtml(agent.id) + '"' + (agent.id === intended ? ' selected' : '') + '>' +
+          escapeHtml(agent.name + ' · ' + agent.provider + (agent.model ? '/' + agent.model : '')) +
+          '</option>'
+        ).join('');
+        const waited = approval.createdAt
+          ? '<div class="muted">asked at ' + escapeHtml(new Date(approval.createdAt).toLocaleTimeString()) + '</div>'
+          : '';
+        // Approving is not only yes/no: the dropdown is the third answer —
+        // "yes, but this agent does it" — and it is what actually gets spawned.
+        const picker = options
+          ? '<label style="display:flex; align-items:center; gap:6px; margin:0">Agent ' +
+            '<select class="approve-agent" data-request-id="' + escapeHtml(approval.id) + '" ' +
+            'data-intended="' + escapeHtml(intended) + '">' + options + '</select></label>'
+          : '';
+        return '<div class="card" style="display:flex; gap:10px; align-items:center; justify-content:space-between; flex-wrap:wrap">' +
+          '<span style="min-width:0">' + escapeHtml(approval.title) + waited + '</span>' +
+          '<span class="toolbar" style="flex:0 0 auto">' + picker +
+          '<button type="button" class="secondary approve-spawn" data-request-id="' + escapeHtml(approval.id) + '">Approve</button>' +
+          '<button type="button" class="ghost reject-spawn" data-request-id="' + escapeHtml(approval.id) + '" ' +
+          'data-reject-effect="' + effect + '" title="' +
+          (effect === 'skip'
+            ? 'Blocks just this subtask; the rest of the run continues.'
+            : 'Nothing can continue past this turn, so the orchestration pauses.') +
+          '" style="color:var(--red)">Reject</button>' +
+          '</span></div>';
+      }).join('');
     }
 
     on('orchestratorApprovalList', 'click', async event => {
@@ -2558,12 +3009,22 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       const statusEl = document.getElementById('orchestratorApprovalStatus');
       if (!taskId) return;
       const approve = button.classList.contains('approve-spawn');
+      if (!approve && !confirm('Reject this agent call?\\n\\n' + (button.dataset.rejectEffect === 'skip'
+        ? 'Only this subtask is dropped (marked blocked); the rest of the run keeps going, and the leader can re-plan around it.'
+        : 'Nothing can continue past this turn, so the orchestration pauses until you resume it.'))) return;
+      const requestId = button.dataset.requestId;
+      const picker = document.querySelector('.approve-agent[data-request-id="' + requestId + '"]');
+      // Only sent when the user actually changed it: an unchanged dropdown is a
+      // plain "yes", and recording it as a reassignment would be misleading.
+      const agentId = approve && picker && picker.value && picker.value !== picker.dataset.intended
+        ? picker.value
+        : undefined;
       button.disabled = true;
-      statusEl.textContent = approve ? 'Approving…' : 'Rejecting…';
+      statusEl.textContent = approve ? (agentId ? 'Approving with a different agent…' : 'Approving…') : 'Rejecting…';
       try {
         const result = await api('/api/workforce/orchestration/approve-spawn', {
           method: 'POST',
-          body: JSON.stringify({ taskId, requestId: button.dataset.requestId, approve })
+          body: JSON.stringify({ taskId, requestId, approve, agentId })
         });
         statusEl.textContent = result.summary || '';
       } catch (error) {
@@ -2685,38 +3146,43 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       submitLeaderAnswers(true);
     });
 
-    // Auto-run lives in the server process, so the button only reflects state
-    // the board reports back — never a local flag that a reload would lose.
-    function renderAutoRunButton(active) {
-      const button = document.getElementById('orchestratorAutoRunButton');
-      if (!button) return;
-      // Say what a click does now, not just what the state is: while it is on,
-      // the only thing this button can do is stop the loop.
-      button.textContent = active ? 'Stop auto-run' : 'Auto-run';
-      button.title = active
-        ? 'Auto-run is on — the server keeps stepping this orchestration. Click to stop it.'
-        : 'Keep stepping this orchestration on the server until it finishes.';
-      button.classList.toggle('secondary', !active);
-      // No colour override while active: the non-secondary button is already a
-      // filled accent green, and painting the text accent too left a green
-      // button with invisible green text.
-      button.style.color = '';
-      button.dataset.active = active ? '1' : '';
+    // Auto-run used to be its own button, which meant two controls for one
+    // decision: Autonomy already says whether the server should keep stepping
+    // (auto and approve-each) or the user drives (manual). This is now a
+    // read-out of what the server is actually doing, so a loop that stopped
+    // itself — an approval nobody answered — is visible instead of silent.
+    function renderAutoRunState(active) {
+      const label = document.getElementById('orchestratorAutoRunState');
+      if (!label) return;
+      label.textContent = active ? 'auto-run: on' : 'auto-run: off';
+      label.title = active
+        ? 'The server is stepping this orchestration on its own.'
+        : 'Nothing is stepping this orchestration; use Step, or set Autonomy to auto/approve-each.';
+      label.style.color = active ? 'var(--accent)' : '';
     }
 
-    on('orchestratorAutoRunButton', 'click', async () => {
+    // The board polls every few seconds; writing the value back while the user
+    // has the select open would yank their choice away mid-pick.
+    function renderAutonomySelect(autonomy) {
+      const select = document.getElementById('orchestratorAutonomy');
+      if (!select || document.activeElement === select) return;
+      select.value = autonomy || 'manual';
+    }
+
+    on('orchestratorAutonomy', 'change', async event => {
       const taskId = currentOrchestratorTaskId();
       if (!taskId) return;
-      const button = document.getElementById('orchestratorAutoRunButton');
-      const enabled = button.dataset.active !== '1';
+      const select = event.target;
+      select.disabled = true;
       try {
-        const result = await api('/api/workforce/orchestration/auto-run', {
+        await api('/api/workforce/orchestration/autonomy', {
           method: 'POST',
-          body: JSON.stringify({ taskId, enabled })
+          body: JSON.stringify({ taskId, autonomy: select.value })
         });
-        renderAutoRunButton(result.autoRun);
       } catch (error) {
         alert(error.message);
+      } finally {
+        select.disabled = false;
       }
       await refreshOrchestratorBoard();
     });
@@ -2958,6 +3424,23 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       } finally {
         event.currentTarget.disabled = false;
         event.currentTarget.textContent = 'Install Claude Hook';
+      }
+    });
+    on('installAntigravityHookButton', 'click', async event => {
+      const confirmed = confirm('Install Antigravity (agy) hooks for this project? Start a new agy session after installing.');
+      if (!confirmed) return;
+      const label = event.currentTarget.textContent;
+      event.currentTarget.disabled = true;
+      event.currentTarget.textContent = 'Installing...';
+      try {
+        await api('/api/antigravity/install-hooks', { method: 'POST', body: '{}' });
+        await load(true);
+      } catch (error) {
+        els.refreshPill.textContent = 'Antigravity hook install failed: ' + error.message;
+        els.refreshPill.className = 'pill warn';
+      } finally {
+        event.currentTarget.disabled = false;
+        event.currentTarget.textContent = label;
       }
     });
     onElement(els.watcherToggleButton, 'click', async event => {

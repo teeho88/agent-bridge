@@ -77,7 +77,7 @@ export interface MemoryStore {
   listFileSummaries(): FileSummary[];
   createRegisteredAgent(input: CreateRegisteredAgentInput): RegisteredAgent;
   getRegisteredAgent(id: string): RegisteredAgent | undefined;
-  listRegisteredAgents(options?: { enabled?: boolean; provider?: string; limit?: number }): RegisteredAgent[];
+  listRegisteredAgents(options?: { enabled?: boolean; provider?: string; includeUnselectedPresets?: boolean; includeHiddenPresets?: boolean; limit?: number }): RegisteredAgent[];
   updateRegisteredAgent(id: string, input: UpdateRegisteredAgentInput): RegisteredAgent | undefined;
   deleteRegisteredAgent(id: string): boolean;
   createCredentialRef(input: CreateCredentialRefInput): CredentialRef;
@@ -134,6 +134,7 @@ export interface MemoryStore {
   createHandoff(input: CreateHandoffInput): Handoff;
   updateHandoff(input: UpdateHandoffInput): Handoff;
   upsertAutoHandoff(input: CreateHandoffInput): Handoff;
+  upsertTaskHandoff(input: CreateHandoffInput): Handoff;
   getLatestHandoff(taskId: string): Handoff | undefined;
   addRun(record: Omit<RunRecord, "id" | "createdAt">): RunRecord;
   createAgentRun(input: CreateAgentRunInput): AgentRun;
@@ -157,7 +158,6 @@ export interface MemoryStore {
   listReviews(options?: { taskId?: string; subtaskId?: string; consumed?: boolean; limit?: number }): Review[];
   markReviewConsumed(id: string): Review | undefined;
 }
-
 
 
 

@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import {
   assertUiPageFreshness,
   filterWorkBoardSessionEvents,
+  inferContextAgent,
   isAutoRunning,
   parseUiPort,
   prepareUiWorkspace,
@@ -49,7 +50,36 @@ describe("assertUiPageFreshness", () => {
     }
   });
 
-  it("blocks the UI when ui-page.ts is newer than its compiled module", () => {
+  it("rebuilds the dashboard when ui-page.ts is newer than its compiled module", () => {
+    const root = createUiPackage();
+    try {
+      // A build script that just touches dist/ui-page.js: enough to prove the
+      // stale bundle is rebuilt instead of the launch being refused.
+      writeFileSync(
+        join(root, "package.json"),
+        JSON.stringify({
+          name: "ui-freshness-fixture",
+          scripts: { build: "node -e \"require('fs').writeFileSync('dist/ui-page.js','export {};\\n')\"" },
+        }),
+      );
+      utimesSync(
+        join(root, "dist", "ui-page.js"),
+        new Date("2025-01-01T00:00:00.000Z"),
+        new Date("2025-01-01T00:00:00.000Z"),
+      );
+      utimesSync(
+        join(root, "src", "ui-page.ts"),
+        new Date("2025-01-01T00:00:01.000Z"),
+        new Date("2025-01-01T00:00:01.000Z"),
+      );
+
+      expect(() => assertUiPageFreshness(root)).not.toThrow();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks the UI when the stale dashboard cannot be rebuilt", () => {
     const root = createUiPackage();
     try {
       utimesSync(
@@ -177,6 +207,10 @@ describe("auto-run loop", () => {
         const leader = store.createRegisteredAgent({ name: "leader", provider: "codex", mode: "manual" });
         for (const [name, autonomy, status] of [
           ["running", "auto", "executing"],
+          // approve-each also has the server stepping it — it just parks at
+          // each gate — so it has to come back after a restart too, otherwise
+          // approving a request would advance nothing.
+          ["gated", "approve-each", "executing"],
           ["manual", "manual", "executing"],
           ["finished", "auto", "done"],
         ] as const) {
@@ -191,8 +225,9 @@ describe("auto-run loop", () => {
 
       // Closing the tool used to lose the loop entirely: the rows still said
       // "executing" but nothing ever stepped them again.
-      expect(resumeAutoRuns(root)).toEqual([ids.running]);
+      expect(resumeAutoRuns(root).sort()).toEqual([ids.running, ids.gated].sort());
       expect(isAutoRunning(ids.running!)).toBe(true);
+      expect(isAutoRunning(ids.gated!)).toBe(true);
       expect(isAutoRunning(ids.manual!)).toBe(false);
       expect(isAutoRunning(ids.finished!)).toBe(false);
       for (const id of Object.values(ids)) stopAutoRun(id);
@@ -333,6 +368,20 @@ describe("filterWorkBoardSessionEvents", () => {
   });
 });
 
+describe("inferContextAgent", () => {
+  it("prefers the active task session, then owner, then the configured default", () => {
+    const task = { id: "task-1", ownerAgent: "codex" } as const;
+    const sessions = [
+      { id: "e1", sessionId: "claude-live", taskId: "task-1", agent: "claude", kind: "session_started", createdAt: "2026-01-01T00:00:00.000Z" },
+      { id: "e2", sessionId: "other", taskId: "task-2", agent: "antigravity", kind: "session_started", createdAt: "2026-01-01T00:00:01.000Z" },
+    ] as const;
+
+    expect(inferContextAgent(task, [...sessions], "generic")).toBe("claude");
+    expect(inferContextAgent(task, [], "generic")).toBe("codex");
+    expect(inferContextAgent({ id: "task-1" }, [], "generic")).toBe("generic");
+  });
+});
+
 describe("dashboard overview", () => {
   it("renders a compact live-task dashboard with active-task styling", () => {
     const html = renderDashboardHtml();
@@ -341,6 +390,16 @@ describe("dashboard overview", () => {
     expect(html).toContain("join('\\n')");
     expect(html).not.toContain("join('\n')");
     expect(html).toContain("Live Task Board");
+    expect(html).not.toContain("Target agent");
+    expect(html).toContain("Agent Terminals");
+    expect(html).toContain('class="secondary open-agent-terminal" data-agent="claude"');
+    expect(html).toContain('class="secondary open-agent-terminal" data-agent="codex"');
+    expect(html).toContain('class="secondary open-agent-terminal" data-agent="antigravity"');
+    expect(html).toContain("/api/session/terminal");
+    expect(html).toContain("window ID ");
+    expect(html).toContain("Each terminal gets its own live task card and window ID.");
+    expect(html).toContain("session.hasWindow && session.agent === task.ownerAgent");
+    expect(html).toContain("session.sessionId + ':' + session.hasWindow");
     expect(html).toContain("liveTaskSummary");
     expect(html).not.toContain("select-live-task");
     expect(html).not.toContain(">Inspect</button>");
@@ -374,6 +433,20 @@ describe("dashboard overview", () => {
     expect(html).not.toContain('/api/workforce/team-task');
     expect(html).toContain('data-orch-tab="agents"');
     expect(html).toContain('id="workforceAgentForm"');
+    expect(html).toContain('id="defaultAgentPresets"');
+    expect(html).toContain('id="defaultAgentPresetsModal" hidden');
+    expect(html).toContain('id="defaultAgentPresetsOpen"');
+    expect(html).toContain('id="defaultAgentPresetsClose"');
+    expect(html).toContain('id="defaultAgentSelectAll"');
+    expect(html).toContain('class="default-agent-select-all"');
+    expect(html).toContain('els.defaultAgentSelectAll.indeterminate = selectedPresetCount > 0');
+    expect(html).toContain("querySelectorAll('.default-agent-preset')");
+    expect(html).toContain('class="default-agent-preset"');
+    expect(html).toContain('class="card default-agent-option"');
+    expect(html).toContain('.default-agent-option input[type="checkbox"]');
+    expect(html).toContain('width: 16px; height: 16px; min-height: 0; margin: 2px 0 0; padding: 0;');
+    expect(html).toContain('/api/workforce/default-agent/toggle');
+    expect(html).toContain('Your edits will be preserved and restored');
     expect(html).toContain('/api/workforce/agent');
     expect(html).toContain('No pending agent requests.');
     expect(html).toContain('Open Task Window');
@@ -401,6 +474,10 @@ describe("dashboard overview", () => {
     expect(html).toContain("git-diff");
     expect(html).toContain("latestHandoffEditForm");
     expect(html).toContain("latestHandoffId");
+    expect(html).toContain('id="latestHandoffEditButton"');
+    expect(html).toContain('id="latestHandoffEditPanel" class="panel-section" hidden');
+    expect(html).toContain(".panel-section[hidden] { display: none; }");
+    expect(html).toContain("els.latestHandoffEditPanel.hidden = false");
     expect(html).toContain("/api/handoff/update");
     expect(html).toContain("populateTaskSelects(state.tasks || [], current?.id)");
     expect(html).toContain("bindForm('compileForm', '/api/context/compile', { reset: false");
@@ -472,13 +549,13 @@ describe("dashboard overview", () => {
     expect(html).toContain('id="orchestratorChangeTeamProviders"');
     expect(html).toContain("teamProviders: checkedTeamProviders(form)");
     expect(html).toContain("/api/workforce/orchestration/request-changes");
-    // Auto-run: without it the dashboard can only advance one Step per click
-    // and every multi-step orchestration looks stuck. While it is on the button
-    // must still read as a button: the active state used to paint accent text
-    // on the accent-filled background, leaving a green button with no visible
-    // label at all.
-    expect(html).toContain("button.textContent = active ? 'Stop auto-run' : 'Auto-run';");
-    expect(html).not.toContain("button.style.color = active ?");
+    // Auto-run is no longer its own button: Autonomy decides whether the server
+    // steps (auto/approve-each) or the user does (manual), so the old toggle was
+    // a second control for the same decision. What is left is a read-out, which
+    // also makes a loop that stopped itself on an unanswered approval visible.
+    expect(html).toContain("function renderAutoRunState(active)");
+    expect(html).toContain("label.textContent = active ? 'auto-run: on' : 'auto-run: off';");
+    expect(html).not.toContain('id="orchestratorAutoRunButton"');
     // Leader questions are answered inline; the answers become settled
     // requirements in the next plan turn.
     expect(html).toContain('id="orchestratorQuestions"');
@@ -508,23 +585,38 @@ describe("dashboard overview", () => {
     expect(html).toContain('class="question-options"');
     expect(html).toContain('class="question-option"');
     expect(html).toContain(".question-option:has(input:checked)");
-    expect(html).toContain('id="orchestratorAutoRunButton"');
-    // Autonomy is the Auto-run switch's starting position, not a dead field.
-    // "approve-each" is gone from the UI: nothing ever branched on it, so it
-    // was indistinguishable from manual.
+    // Autonomy is a live control on the running orchestration, not a field you
+    // can only set at launch — and it is the only switch now.
+    expect(html).toContain('id="orchestratorAutonomy"');
+    expect(html).toContain("/api/workforce/orchestration/autonomy");
     expect(html).toContain('<option value="auto">Auto');
     expect(html).toContain('<option value="manual">Manual');
-    // approve-each is back as a real mode: it now gates every agent spawn.
+    // approve-each is a real mode: it gates every agent spawn.
     expect(html).toContain('<option value="approve-each">Approve each');
     expect(html).toContain('id="orchestratorApprovals"');
     expect(html).toContain("/api/workforce/orchestration/approve-spawn");
     expect(html).toContain("approve-spawn");
     expect(html).toContain("reject-spawn");
-    expect(html).toContain("renderSpawnApprovals(data.approvals || [])");
-    expect(html).toContain("/api/workforce/orchestration/auto-run");
-    expect(html).toContain("renderAutoRunButton(Boolean(data.autoRun))");
+    // Approving is a three-way answer: yes, no, or "yes but this agent does it".
+    expect(html).toContain("class=\"approve-agent\"");
+    expect(html).toContain("picker.value !== picker.dataset.intended");
+    // Rejecting one subtask assignment must not read as "stop the project":
+    // the confirm says which of the two it is before anything is sent.
+    expect(html).toContain("function rejectEffect(approval)");
+    expect(html).toContain("button.dataset.rejectEffect === 'skip'");
+    expect(html).toContain("renderSpawnApprovals(data.approvals || [], data.registeredAgents || [])");
+    expect(html).toContain("renderAutoRunState(Boolean(data.autoRun))");
     expect(html).toContain("/api/task/delete");
     expect(html).toContain("/api/workforce/catalog");
+    expect(html).toContain("/api/workforce/catalog?provider=");
+    expect(html).toContain("refreshProviderCatalog(providerSelect.value)");
+    expect(html).not.toContain("loadOrchestratorCatalog(true)");
+    expect(html).not.toContain("60 * 60 * 1000");
+    // The agent form's CLI model field is a picker filled from the catalog at
+    // runtime, so the served HTML ships it empty — no baked-in model list.
+    expect(html).toContain('<select name="model" id="workforceAgentModel"></select>');
+    expect(html).toContain("setAgentModelValue(editedModel)");
+    expect(html).not.toContain('<option value="gpt-5.6-sol">');
     expect(html).toContain("/api/workforce/board?task=");
     expect(html).toContain("/api/workforce/orchestration/start");
     expect(html).toContain("/api/workforce/orchestration/step");

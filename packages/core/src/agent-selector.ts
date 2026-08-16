@@ -123,7 +123,7 @@ function agentNameFor(provider: string, model: string | undefined, reasoningEffo
 // match, but the naive name would collide with the existing row and throw a
 // raw SQLite UNIQUE constraint error that crashes the entire orchestration
 // step instead of just creating a second, differently-tuned agent.
-function uniqueAgentName(store: MemoryStore, base: string): string {
+export function uniqueAgentName(store: MemoryStore, base: string): string {
   const existingNames = new Set(store.listRegisteredAgents({ limit: 5000 }).map((agent) => agent.name));
   if (!existingNames.has(base)) return base;
   for (let suffix = 2; suffix < 1000; suffix += 1) {

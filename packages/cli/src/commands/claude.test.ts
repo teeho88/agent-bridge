@@ -2,10 +2,46 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { cleanupStaleAgentSessions, openStore, readConfig } from "../workspace.js";
+import { cleanupStaleAgentSessions, openStore, readConfig, startAgentSession } from "../workspace.js";
 import { CLAUDE_HOOK_VERSION, getClaudeHookStatus, handleClaudeHook, installClaudeHooks } from "./claude.js";
 
 describe("Claude session lifecycle", () => {
+  it("updates the task pre-created by the Work Board terminal", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-claude-terminal-"));
+    const previous = process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID;
+    try {
+      const store = openStore(cwd);
+      let taskId = "";
+      try {
+        const task = store.createTask({ title: "Claude terminal", ownerAgent: "claude" });
+        taskId = task.id;
+        startAgentSession("claude-terminal-1", taskId, cwd, "claude");
+        store.recordSessionEvent({
+          sessionId: "claude-terminal-1",
+          taskId,
+          agent: "claude",
+          kind: "session_started",
+          summary: "Claude terminal opened from Work Board.",
+        });
+      } finally { store.close(); }
+
+      process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID = "claude-terminal-1";
+      handleClaudeHook({ cwd, session_id: "native-session", hook_event_name: "SessionStart" });
+      handleClaudeHook({ cwd, session_id: "native-session", hook_event_name: "UserPromptSubmit", prompt: "Fix the work board card" });
+
+      const result = openStore(cwd);
+      try {
+        expect(result.listTasks(10)).toHaveLength(1);
+        expect(readConfig(cwd).sessionTasks?.["claude-terminal-1"]).toBe(taskId);
+        expect(result.listActiveSessionEvents()).toHaveLength(1);
+      } finally { result.close(); }
+    } finally {
+      if (previous === undefined) delete process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID;
+      else process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID = previous;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("stays read-only for an orchestrator-spawned run instead of hijacking the active task", () => {
     const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-claude-"));
     const previous = process.env.AGENT_BRIDGE_SPAWNED_RUN;

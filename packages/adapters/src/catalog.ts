@@ -92,6 +92,7 @@ export const PROVIDER_CATALOGS: Record<string, ProviderCatalog> = {
     mode: "cli",
     defaultCommand: "agy",
     models: [
+      { value: "gemini-3.7-flash-high", label: "Gemini 3.7 Flash (high)" },
       { value: "gemini-3.6-flash-high", label: "Gemini 3.6 Flash (high)" },
       { value: "gemini-3.6-flash-medium", label: "Gemini 3.6 Flash (medium)" },
       { value: "gemini-3.6-flash-low", label: "Gemini 3.6 Flash (low)" },

@@ -1,5 +1,5 @@
 import type { Command } from "commander";
-import { extractGraph, renderRepoMap } from "@agent-bridge/memory";
+import { extractGraph, renderRepoMap, type AgentKind } from "@agent-bridge/memory";
 import { contentHash, refreshBriefs } from "../graph-brief.js";
 import {
   getActiveTaskId,
@@ -53,12 +53,13 @@ export function registerGraph(program: Command): void {
     .option("--priority <n>", "manual priority 1-5 (optional)")
     .option("--ranges <ranges>", "comma/newline/semicolon-separated important ranges, e.g. 10-30")
     .option("--task <taskId>", "task id for --task-edited marker")
+    .option("--agent <agent>", "resolve the active task for this agent (defaults to the configured default agent)")
     .option("--task-edited", "mark this file as recently edited by the current task")
     .action(
       async (
         filePath: string,
         summary: string | undefined,
-        options: { stdin?: boolean; priority?: string; ranges?: string; task?: string; taskEdited?: boolean }
+        options: { stdin?: boolean; priority?: string; ranges?: string; task?: string; agent?: AgentKind; taskEdited?: boolean }
       ) => {
         const root = paths().cwd;
         const normalizedPath = filePath.replace(/\\/g, "/");
@@ -66,7 +67,9 @@ export function registerGraph(program: Command): void {
         if (!text) throw new Error("No brief. Provide [summary] or pipe text with --stdin.");
         const store = openStore();
         try {
-          const taskId = options.taskEdited ? getActiveTaskId(store, undefined, options.task) : options.task;
+          const taskId = options.taskEdited
+            ? getActiveTaskId(store, undefined, options.task, options.agent)
+            : options.task;
           if (options.taskEdited) assertWriteLeases(store, taskId, [normalizedPath]);
           const file = store.upsertFileSummary({
             path: normalizedPath,
@@ -91,8 +94,9 @@ export function registerGraph(program: Command): void {
     .option("--all", "refresh briefs for every file indexed in the graph")
     .option("--priority <n>", "manual priority 1-5; omitted values are preserved")
     .option("--task <taskId>", "task id for task association")
+    .option("--agent <agent>", "resolve the active task for this agent (defaults to the configured default agent)")
     .option("--task-edited", "mark these files as recently edited by the current task")
-    .action((filePaths: string[], options: { all?: boolean; priority?: string; task?: string; taskEdited?: boolean }) => {
+    .action((filePaths: string[], options: { all?: boolean; priority?: string; task?: string; agent?: AgentKind; taskEdited?: boolean }) => {
       const root = paths().cwd;
       const store = openStore();
       try {
@@ -105,7 +109,11 @@ export function registerGraph(program: Command): void {
           throw new Error("Provide <paths...> or use --all.");
         }
 
-        const taskId = options.task ?? resolveActiveTaskId(store, undefined, undefined, undefined) ?? undefined;
+        // Resolve against the calling agent's own current task. Without the
+        // agent this falls back to the default agent's task, so a lease taken
+        // as `--agent claude` looked like another task's lease and blocked the
+        // very edit it was meant to authorise.
+        const taskId = options.task ?? resolveActiveTaskId(store, undefined, undefined, options.agent) ?? undefined;
         const targetPaths = options.all ? store.listGraphFiles(5000).map((file) => file.path) : filePaths.map((filePath) => filePath.replace(/\\/g, "/"));
         if (options.taskEdited) assertWriteLeases(store, taskId, targetPaths);
         const results = refreshBriefs(store, root, {
@@ -247,10 +255,14 @@ export function assertWriteLeases(store: ReturnType<typeof openStore>, taskId: s
   if (!missing.length && !blocked.length) return;
 
   const details = [
+    `Resolved current task: ${taskId}`,
     blocked.length ? `Conflicting active lease(s): ${blocked.join(", ")}` : undefined,
     missing.length ? `Missing write lease(s): ${missing.join(", ")}` : undefined,
     'Acquire a write lease before editing: agent-bridge file lease "<repo-relative-path>" --mode write --agent <agent>',
-    "Do not mark a file task-edited until the lease response has acquired=true."
+    "Do not mark a file task-edited until the lease response has acquired=true.",
+    blocked.length
+      ? "If a blocking lease is your own, you resolved a different task than the lease: pass the same --agent <agent> (or --task <taskId>) you used to take it."
+      : undefined
   ].filter(Boolean);
   throw new Error(details.join("\n"));
 }

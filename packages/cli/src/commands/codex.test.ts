@@ -3,9 +3,98 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { handleCodexHook, installCodexHooks } from "./codex.js";
-import { openStore } from "../workspace.js";
+import { openStore, rememberSessionWindowHandle, startAgentSession } from "../workspace.js";
 
 describe("Codex hooks", () => {
+  it("updates the task pre-created by the Work Board terminal", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-codex-terminal-"));
+    const previous = process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID;
+    try {
+      const store = openStore(cwd);
+      let taskId = "";
+      try {
+        const task = store.createTask({ title: "Codex terminal", ownerAgent: "codex" });
+        taskId = task.id;
+        startAgentSession("codex-terminal-1", taskId, cwd, "codex");
+        store.recordSessionEvent({
+          sessionId: "codex-terminal-1",
+          taskId,
+          agent: "codex",
+          kind: "session_started",
+          summary: "Codex terminal opened from Work Board.",
+        });
+      } finally { store.close(); }
+
+      process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID = "codex-terminal-1";
+      await handleCodexHook({ cwd, thread_id: "native-thread" }, "SessionStart");
+      await handleCodexHook({ cwd, thread_id: "native-thread", prompt: "Fix the work board card" }, "UserPromptSubmit");
+      await handleCodexHook({ cwd, thread_id: "native-thread" }, "Stop");
+
+      const result = openStore(cwd);
+      try {
+        expect(result.listTasks(10)).toHaveLength(1);
+        expect(result.getTask(taskId)?.title).toBe("Fix the work board card");
+        expect(result.listSessionEvents({ taskId, limit: 10 }).some(
+          (event) => event.kind === "prompt_submitted" && event.sessionId === "codex-terminal-1",
+        )).toBe(true);
+        expect(result.listActiveSessionEvents()).toHaveLength(1);
+      } finally { result.close(); }
+    } finally {
+      if (previous === undefined) delete process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID;
+      else process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID = previous;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the Work Board terminal id but opens a new task after /clear", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-codex-clear-"));
+    const previous = process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID;
+    try {
+      const terminalSessionId = "codex-terminal-1";
+      const seed = openStore(cwd);
+      let firstTaskId = "";
+      try {
+        const task = seed.createTask({ title: "Codex terminal", ownerAgent: "codex" });
+        firstTaskId = task.id;
+        startAgentSession(terminalSessionId, task.id, cwd, "codex");
+        rememberSessionWindowHandle(terminalSessionId, task.id, "codex", cwd, "12345");
+      } finally { seed.close(); }
+
+      process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID = terminalSessionId;
+      await handleCodexHook({ cwd, thread_id: "thread-before-clear" }, "SessionStart");
+      await handleCodexHook({ cwd, thread_id: "thread-before-clear", prompt: "Finish the first task" }, "UserPromptSubmit");
+      await handleCodexHook({ cwd, thread_id: "thread-before-clear" }, "Stop");
+      await handleCodexHook({ cwd, thread_id: "thread-after-clear" }, "SessionStart");
+      await handleCodexHook({ cwd, thread_id: "thread-after-clear", prompt: "Start the second task" }, "UserPromptSubmit");
+      await handleCodexHook({ cwd, thread_id: "thread-after-clear" }, "Stop");
+
+      const result = openStore(cwd);
+      try {
+        const tasks = result.listTasks(10);
+        expect(tasks).toHaveLength(2);
+        expect(result.getTask(firstTaskId)?.status).toBe("done");
+        const second = tasks.find((task) => task.id !== firstTaskId);
+        expect(second?.title).toBe("Start the second task");
+        expect(second?.status).toBe("in_progress");
+        const config = JSON.parse(readFileSync(join(cwd, ".agent-memory", "config.json"), "utf8")) as {
+          sessionTasks?: Record<string, string>;
+          sessionWindows?: Record<string, { hwnd?: string; taskId: string }>;
+          terminalNativeSessions?: Record<string, string>;
+        };
+        expect(config.sessionTasks?.[terminalSessionId]).toBe(second?.id);
+        expect(config.sessionWindows?.[terminalSessionId]).toEqual(expect.objectContaining({
+          hwnd: "12345",
+          taskId: second?.id,
+        }));
+        expect(config.terminalNativeSessions?.[terminalSessionId]).toBe("thread-after-clear");
+      } finally { result.close(); }
+    } finally {
+      if (previous === undefined) delete process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID;
+      else process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID = previous;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("installs project hooks and records a session lifecycle", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-codex-"));
     try {
@@ -26,6 +115,49 @@ describe("Codex hooks", () => {
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 
+
+  it("continues another agent's unfinished task and compiles its handoff", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-codex-"));
+    try {
+      const seed = openStore(cwd);
+      let taskId = "";
+      try {
+        const task = seed.createTask({
+          title: "Rewrite the invoice export pipeline",
+          goal: "Rewrite the invoice export pipeline so exports stream",
+          ownerAgent: "claude",
+        });
+        taskId = task.id;
+        seed.upsertTaskHandoff({
+          taskId: task.id,
+          fromAgent: "claude",
+          toAgent: "claude",
+          summary: "Invoice export streaming is half done.",
+          next: ["Stream the invoice rows instead of buffering them"],
+        });
+      } finally { seed.close(); }
+
+      await handleCodexHook({ cwd, thread_id: "thread-continue" }, "SessionStart");
+      await handleCodexHook(
+        { cwd, thread_id: "thread-continue", prompt: "Tiếp tục rewrite the invoice export pipeline" },
+        "UserPromptSubmit",
+      );
+
+      const store = openStore(cwd);
+      try {
+        // The placeholder the session opened is gone; the prompt landed on the
+        // existing task instead of forking a second one.
+        expect(store.listTasks(10)).toHaveLength(1);
+        expect(store.listTasks(10)[0]?.id).toBe(taskId);
+      } finally { store.close(); }
+
+      // A handoff addressed to Claude still reaches Codex, through the file
+      // Codex is told to read.
+      const compiled = readFileSync(join(cwd, ".agent-memory", "compiled-context.md"), "utf8");
+      expect(compiled).toContain("Invoice export streaming is half done.");
+      expect(compiled).toContain("Stream the invoice rows instead of buffering them");
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
 
   it("reuses the same task when SessionStart repeats for the same Codex thread", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-codex-"));

@@ -1,15 +1,26 @@
 import { CACHE_BREAKPOINT_MARKER } from "./prompt-cache.js";
+import { toSingleLine } from "./token-optimizer.js";
 import type { PromptPack } from "./types.js";
 
-function bullets(items: string[]): string {
-  return items.length
-    ? items.map((item) => `- ${item}`).join("\n")
+// Truncation has to be visible: without a marker an agent cannot tell a
+// budget-trimmed section from a genuinely empty one, and silently acts on a
+// partial picture. The note names the knob that widens the section.
+function omissionNote(omitted: number): string {
+  return `- ...[${omitted} more omitted by the token budget - raise it in .agent-memory/token-policy.yaml]`;
+}
+
+function bullets(items: string[], omitted = 0): string {
+  const flattened = items.map(toSingleLine).filter(Boolean);
+  const rendered = flattened.length
+    ? flattened.map((item) => `- ${item}`).join("\n")
     : "- None recorded.";
+  return omitted > 0 ? `${rendered}\n${omissionNote(omitted)}` : rendered;
 }
 
 function numbers(items: string[]): string {
-  return items.length
-    ? items.map((item, index) => `${index + 1}. ${item}`).join("\n")
+  const flattened = items.map(toSingleLine).filter(Boolean);
+  return flattened.length
+    ? flattened.map((item, index) => `${index + 1}. ${item}`).join("\n")
     : "1. Continue from current task state.";
 }
 
@@ -53,35 +64,38 @@ export function renderPromptPack(
     "- Updated handoff note.",
     "",
     "## Constraints",
-    bullets(pack.constraints),
+    bullets(pack.constraints, pack.omitted.constraints),
     "",
     "## Known Decisions",
-    bullets(pack.knownDecisions),
+    bullets(pack.knownDecisions, pack.omitted.knownDecisions),
   ];
 
   const suffix = [
     "## Task",
-    `- Title: ${pack.task.title}`,
+    `- Title: ${toSingleLine(pack.task.title)}`,
     `- Status: ${pack.task.status}`,
     "",
     "## Goal",
-    pack.task.goal || "No explicit goal recorded.",
+    toSingleLine(pack.task.goal ?? "") || "No explicit goal recorded.",
     "",
     "## Current Assignment",
     bullets(assignmentBullets(pack)),
     "",
     "## Shared Memory",
-    bullets(pack.sharedMemory),
+    bullets(pack.sharedMemory, pack.omitted.sharedMemory),
     "",
     "## Current State",
-    bullets(pack.currentState),
+    bullets(pack.currentState, pack.omitted.currentState),
     "",
     "## Relevant Files",
-    bullets(pack.relevantFiles),
+    bullets(pack.relevantFiles, pack.omitted.relevantFiles),
   ];
 
   if (pack.repoMap) {
     suffix.push("", "## Repo Map", pack.repoMap);
+    if (pack.omitted.repoMap > 0) {
+      suffix.push(omissionNote(pack.omitted.repoMap));
+    }
   }
 
   if (pack.handoff) {
@@ -90,7 +104,7 @@ export function renderPromptPack(
       "## Latest Handoff",
       `- From: ${pack.handoff.fromAgent ?? "unknown"}`,
       `- To: ${pack.handoff.toAgent ?? "unknown"}`,
-      `- Summary: ${pack.handoff.summary}`,
+      `- Summary: ${toSingleLine(pack.handoff.summary)}`,
       "",
       "### Done",
       bullets(pack.handoff.done),
@@ -104,6 +118,9 @@ export function renderPromptPack(
       "### Files Changed",
       bullets(pack.handoff.filesChanged),
     );
+    if (pack.omitted.handoff > 0) {
+      suffix.push(omissionNote(pack.omitted.handoff));
+    }
   }
 
   const risksOutsideHandoff = pack.handoff

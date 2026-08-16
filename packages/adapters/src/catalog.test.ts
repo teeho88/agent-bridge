@@ -29,6 +29,7 @@ describe("provider catalog", () => {
     expect(antigravity.defaultCommand).toBe("agy");
     expect(antigravity.headless).toBe(true);
     expect(antigravity.models.map((model) => model.value)).toContain("gemini-3.1-pro-high");
+    expect(antigravity.models.map((model) => model.value)).toContain("gemini-3.7-flash-high");
     expect(getProviderCatalog("codex")!.headless).toBe(true);
     expect(getProviderCatalog("claude")!.headless).toBe(true);
   });

@@ -198,16 +198,16 @@ describe("compileContext", () => {
     expect(pack.renderedMarkdown).toContain("## Shared Memory");
     expect(pack.renderedMarkdown).toContain("### Files Changed");
   });
-  it("ignores handoff packets targeted at another agent", () => {
+  it("keeps the task handoff even when it names another agent", () => {
     const store = baseStore([]);
     store.getLatestHandoff = () => ({
       id: "handoff-other-agent",
       taskId: "task-1",
       fromAgent: "codex",
       toAgent: "claude",
-      summary: "This packet is for Claude, not Codex.",
+      summary: "Claude was expected next, but any agent may continue.",
       done: [],
-      next: ["Claude-only next step"],
+      next: ["Finish the compiler wiring"],
       risks: [],
       filesChanged: [],
       createdAt: "2026-01-01T00:00:00.000Z",
@@ -220,9 +220,9 @@ describe("compileContext", () => {
       tokenBudget: 4000,
     });
 
-    expect(pack.handoff).toBeUndefined();
-    expect(pack.renderedMarkdown).not.toContain("This packet is for Claude");
-    expect(pack.nextActions).not.toContain("Claude-only next step");
+    expect(pack.handoff?.id).toBe("handoff-other-agent");
+    expect(pack.renderedMarkdown).toContain("but any agent may continue");
+    expect(pack.nextActions).toContain("Finish the compiler wiring");
   });
 
   it("does not repeat latest handoff risks in the final risks section", () => {
@@ -256,6 +256,133 @@ describe("compileContext", () => {
       "Risk: Do not expand raw memory too much",
     );
     expect(finalRisks).not.toContain("Do not expand raw memory too much");
+  });
+
+  it("caps the handoff lists and says how many entries were dropped", () => {
+    const store = baseStore([]);
+    store.getLatestHandoff = () => ({
+      id: "handoff-long",
+      taskId: "task-1",
+      fromAgent: "claude",
+      toAgent: "codex",
+      summary: "Continue compiler work.",
+      done: Array.from({ length: 40 }, (_, index) => `Done step ${index}`),
+      next: ["Wire the budget through"],
+      risks: [],
+      filesChanged: Array.from(
+        { length: 40 },
+        (_, index) => `packages/core/src/file-${index}.ts`,
+      ),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      auto: false,
+    });
+
+    const pack = compileContext(store, {
+      taskId: "task-1",
+      agent: "codex",
+      tokenBudget: 4000,
+      handoffTokenBudget: 40,
+    });
+
+    expect(pack.handoff?.summary).toBe("Continue compiler work.");
+    expect(pack.handoff?.next).toEqual(["Wire the budget through"]);
+    expect(pack.handoff?.done.length).toBeLessThan(40);
+    expect(pack.omitted.handoff).toBeGreaterThan(0);
+    expect(pack.renderedMarkdown).toContain("omitted by the token budget");
+  });
+
+  it("keeps a multi-line memory inside its own bullet", () => {
+    const store = baseStore([
+      {
+        id: "mem-multiline",
+        taskId: "task-1",
+        type: "note" as const,
+        content:
+          "Claude latest response: ## Ba vấn đề thật\n\n- Budget bị cắt im lặng\n- Repo map không giới hạn",
+        importance: 5,
+        tags: ["claude-code", "latest-response"],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+
+    const pack = compileContext(store, {
+      taskId: "task-1",
+      agent: "codex",
+      tokenBudget: 4000,
+    });
+
+    const currentState =
+      pack.renderedMarkdown.split("## Current State")[1]?.split("\n\n")[0] ?? "";
+    expect(currentState.split("\n").filter((line) => line.trim())).toHaveLength(
+      1,
+    );
+    expect(currentState).toContain("Budget bị cắt im lặng");
+    // The memory's own heading must not start a line, or it forges a section.
+    const forgedHeadings = pack.renderedMarkdown
+      .split("\n")
+      .filter((line) => /^#{1,6}\s/.test(line) && line.includes("Ba vấn đề"));
+    expect(forgedHeadings).toEqual([]);
+  });
+
+  it("caps constraints and decisions and marks the truncation", () => {
+    const store = baseStore(
+      Array.from({ length: 30 }, (_, index) => ({
+        id: `mem-constraint-${index}`,
+        taskId: "task-1",
+        type: "constraint" as const,
+        content: `Do not touch subsystem number ${index} without approval.`,
+        importance: 5,
+        tags: ["rule"],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      })),
+    );
+    store.listDecisions = () =>
+      Array.from({ length: 30 }, (_, index) => ({
+        id: `decision-${index}`,
+        taskId: "task-1",
+        decision: `Adopt approach number ${index}`,
+        reason: "Recorded during the design review",
+        relatedFiles: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }));
+
+    const pack = compileContext(store, {
+      taskId: "task-1",
+      agent: "codex",
+      tokenBudget: 4000,
+      constraintTokenBudget: 40,
+      decisionTokenBudget: 40,
+    });
+
+    expect(pack.constraints.length).toBeLessThan(30);
+    expect(pack.knownDecisions.length).toBeLessThan(30);
+    expect(pack.omitted.constraints).toBeGreaterThan(0);
+    expect(pack.omitted.knownDecisions).toBeGreaterThan(0);
+    const prefix = pack.renderedMarkdown.split("## Task")[0] ?? "";
+    expect(prefix).toContain("omitted by the token budget");
+  });
+
+  it("caps the repo map and marks the truncation", () => {
+    const store = baseStore([]);
+    const repoMap = Array.from(
+      { length: 200 },
+      (_, index) => `- packages/core/src/file-${index}.ts`,
+    ).join("\n");
+
+    const pack = compileContext(store, {
+      taskId: "task-1",
+      agent: "codex",
+      tokenBudget: 4000,
+      repoMap,
+      repoMapTokenBudget: 50,
+    });
+
+    expect(pack.repoMap?.split("\n").length).toBeLessThan(200);
+    expect(pack.omitted.repoMap).toBeGreaterThan(0);
+    expect(pack.renderedMarkdown).toContain("## Repo Map");
+    expect(pack.renderedMarkdown).toContain("omitted by the token budget");
   });
 
 
@@ -530,6 +657,9 @@ function baseStore(
       throw new Error("unused");
     },
     upsertAutoHandoff() {
+      throw new Error("unused");
+    },
+    upsertTaskHandoff() {
       throw new Error("unused");
     },
     getLatestHandoff() {

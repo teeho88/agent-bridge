@@ -434,6 +434,87 @@ describe("orchestrator", () => {
     });
   });
 
+  it("reviews the ready part of a scope when the rest of it is waiting on that very review", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id, maxParallel: 2 });
+
+      let step = stepOrchestration(store, orchestration.id, deps);
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [
+          { key: "s1", title: "Implement X", acceptanceCriteria: ["done"], dependsOn: [], files: [] },
+          { key: "s2", title: "Verify X", acceptanceCriteria: ["done"], dependsOn: ["s1"], files: [] },
+        ],
+        reviewers: [{ key: "r1", scope: ["s1", "s2"] }],
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // -> executing
+
+      step = stepOrchestration(store, orchestration.id, deps); // spawn implementer for s1 only (s2 depends on it)
+      expect(step.spawnedRunIds).toHaveLength(1);
+      finishRun(store, logs, step.spawnedRunIds[0]!, "implemented X");
+      step = stepOrchestration(store, orchestration.id, deps); // s1 -> review
+
+      // s2 cannot start until s1 is "done", and s1 only becomes done after this
+      // review is adjudicated: the reviewer has to run on s1 alone.
+      step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.spawnedRunIds).toHaveLength(1);
+      const reviewRun = store.getAgentRun(step.spawnedRunIds[0]!)!;
+      expect(reviewRun.phase).toBe("review");
+      expect(store.getOrchestration(orchestration.id)?.status).toBe("executing");
+    });
+  });
+
+  it("cancels unstarted subtasks the re-plan dropped instead of stranding them", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
+
+      let step = stepOrchestration(store, orchestration.id, deps);
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [
+          { key: "s1", title: "Old A", acceptanceCriteria: ["done"], dependsOn: [], files: [] },
+          { key: "s2", title: "Old B", acceptanceCriteria: ["done"], dependsOn: [], files: [] },
+        ],
+        reviewers: [{ key: "r1", scope: ["s1", "s2"] }],
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // -> executing
+
+      store.updateOrchestration(orchestration.id, { status: "planning" });
+      step = stepOrchestration(store, orchestration.id, deps); // fresh plan turn
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan v2",
+        subtasks: [{ key: "s1", title: "New A", acceptanceCriteria: ["done"], dependsOn: [], files: [] }],
+        reviewers: [{ key: "r1", scope: ["s1"] }],
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps);
+
+      const byTitle = new Map(store.listSubtasks({ parentTaskId: task.id }).map((item) => [item.title, item.status]));
+      expect(byTitle.get("New A")).toBe("todo");
+      expect(byTitle.get("Old A")).toBe("cancelled");
+      expect(byTitle.get("Old B")).toBe("cancelled");
+    });
+  });
+
   it("pauses instead of burning cycles when the leader has nothing to decide and will not finish", () => {
     withStore((store) => {
       const logs = new Map<string, string>();
@@ -729,12 +810,197 @@ describe("orchestrator", () => {
       expect(implementApproval).toBeDefined();
       expect(store.listSubtasks({ parentTaskId: task.id })[0]?.status).toBe("todo");
 
-      // Rejecting pauses the orchestration and explains why; no agent ran.
+      // Rejecting drops just this subtask: it is blocked, no agent ran, and the
+      // orchestration keeps going rather than ending over one "no".
       store.resolveAgentRequest(implementApproval.id, "rejected");
       step = stepOrchestration(store, orchestration.id, deps);
-      expect(step.orchestration.status).toBe("paused");
-      expect(step.orchestration.lastError).toContain("Implement X");
+      expect(step.orchestration.status).not.toBe("paused");
+      expect(store.listSubtasks({ parentTaskId: task.id })[0]?.status).toBe("blocked");
       expect(store.listAgentRuns({ taskId: task.id, limit: 50 }).filter((r) => r.phase === "implement")).toHaveLength(0);
+    });
+  });
+
+  it("pauses when a turn nothing can continue past is rejected", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({
+        taskId: task.id,
+        leaderAgentId: leader.id,
+        autonomy: "approve-each",
+      });
+
+      stepOrchestration(store, orchestration.id, deps);
+      const planApproval = store.listAgentRequests({ taskId: task.id, status: "pending" }).find((r) => r.type === "approval")!;
+      // There is no plan without a planning turn, so "no" here really does end
+      // the run until the user intervenes.
+      store.resolveAgentRequest(planApproval.id, "rejected");
+      const step = stepOrchestration(store, orchestration.id, deps);
+
+      expect(step.orchestration.status).toBe("paused");
+      expect(step.orchestration.lastError).toContain("planning turn");
+    });
+  });
+
+  it("keeps dispatching the subtasks you did approve after you reject one", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({
+        taskId: task.id,
+        leaderAgentId: leader.id,
+        autonomy: "approve-each",
+        maxParallel: 2,
+      });
+
+      stepOrchestration(store, orchestration.id, deps);
+      const planApproval = store.listAgentRequests({ taskId: task.id, status: "pending" }).find((r) => r.type === "approval")!;
+      store.resolveAgentRequest(planApproval.id, "accepted");
+      const planRun = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
+      finishRun(store, logs, planRun, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [
+          { key: "s1", title: "Keep this", acceptanceCriteria: ["done"], dependsOn: [], files: [] },
+          { key: "s2", title: "Drop this", acceptanceCriteria: ["done"], dependsOn: [], files: [] },
+        ],
+        reviewers: [],
+        questions: [],
+      }));
+      stepOrchestration(store, orchestration.id, deps); // -> executing
+      stepOrchestration(store, orchestration.id, deps); // asks about both
+
+      const approvals = store
+        .listAgentRequests({ taskId: task.id, status: "pending", limit: 50 })
+        .filter((request) => request.type === "approval");
+      store.resolveAgentRequest(approvals.find((r) => r.title.includes("Keep this"))!.id, "accepted");
+      store.resolveAgentRequest(approvals.find((r) => r.title.includes("Drop this"))!.id, "rejected");
+
+      const step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.orchestration.status).not.toBe("paused");
+      expect(step.spawnedRunIds).toHaveLength(1);
+      expect(step.summary).toContain("Blocked 1 you rejected");
+      const subtasks = store.listSubtasks({ parentTaskId: task.id, limit: 10 });
+      expect(subtasks.find((s) => s.title === "Keep this")?.status).toBe("assigned");
+      expect(subtasks.find((s) => s.title === "Drop this")?.status).toBe("blocked");
+    });
+  });
+
+  it("asks about every dispatchable subtask at once instead of stalling behind the first", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({
+        taskId: task.id,
+        leaderAgentId: leader.id,
+        autonomy: "approve-each",
+        maxParallel: 3,
+      });
+
+      const planStep = stepOrchestration(store, orchestration.id, deps);
+      const planApproval = store.listAgentRequests({ taskId: task.id, status: "pending" }).find((r) => r.type === "approval")!;
+      store.resolveAgentRequest(planApproval.id, "accepted");
+      void planStep;
+      const planRun = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
+      finishRun(store, logs, planRun, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [
+          { key: "s1", title: "Implement one", acceptanceCriteria: ["done"], dependsOn: [], files: [] },
+          { key: "s2", title: "Implement two", acceptanceCriteria: ["done"], dependsOn: [], files: [] },
+          { key: "s3", title: "Implement three", acceptanceCriteria: ["done"], dependsOn: [], files: [] },
+        ],
+        reviewers: [],
+        questions: [],
+      }));
+      stepOrchestration(store, orchestration.id, deps); // -> executing
+
+      // One pass, three questions: an unanswered approval must not hold up
+      // independent work queued behind it.
+      const step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.spawnedRunIds).toHaveLength(0);
+      expect(step.awaitingApprovalSince).toBeTruthy();
+      const approvals = store
+        .listAgentRequests({ taskId: task.id, status: "pending", limit: 50 })
+        .filter((request) => request.type === "approval");
+      expect(approvals).toHaveLength(3);
+
+      // Approving just one starts exactly that one; the other two keep waiting.
+      const second = approvals.find((request) => request.title.includes("Implement two"))!;
+      store.resolveAgentRequest(second.id, "accepted");
+      const spawnStep = stepOrchestration(store, orchestration.id, deps);
+      expect(spawnStep.spawnedRunIds).toHaveLength(1);
+      expect(spawnStep.summary).toContain("2 more await your approval");
+      const run = store.getAgentRun(spawnStep.spawnedRunIds[0]!)!;
+      expect(store.listSubtasks({ parentTaskId: task.id }).find((s) => s.id === run.subtaskId)?.title).toBe("Implement two");
+    });
+  });
+
+  it("spawns the agent the user picked when they approve with a different one", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const leader = createWorkerLeader(store);
+      const stand_in = store.createRegisteredAgent({
+        name: "claude-standin",
+        provider: "claude",
+        mode: "cli",
+        command: "claude",
+        capabilities: ["implement", "review"],
+      });
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({
+        taskId: task.id,
+        leaderAgentId: leader.id,
+        autonomy: "approve-each",
+        maxParallel: 1,
+      });
+
+      const planApprovalStep = stepOrchestration(store, orchestration.id, deps);
+      expect(planApprovalStep.spawnedRunIds).toHaveLength(0);
+      const planApproval = store.listAgentRequests({ taskId: task.id, status: "pending" }).find((r) => r.type === "approval")!;
+      store.resolveAgentRequest(planApproval.id, "accepted");
+      const planRun = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
+      finishRun(store, logs, planRun, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [{ key: "s1", title: "Implement X", acceptanceCriteria: ["done"], dependsOn: [], files: [] }],
+        reviewers: [],
+        questions: [],
+      }));
+      stepOrchestration(store, orchestration.id, deps); // -> executing
+      stepOrchestration(store, orchestration.id, deps); // asks for approval
+
+      const approval = store
+        .listAgentRequests({ taskId: task.id, status: "pending" })
+        .find((request) => request.type === "approval" && request.title.includes("Implement X"))!;
+      // The request carries who the orchestrator intended to use, so the user
+      // can see what they are overriding.
+      const intended = JSON.parse(approval.payload!).agentId as string;
+      expect([leader.id, stand_in.id]).toContain(intended);
+      const picked = intended === stand_in.id ? leader.id : stand_in.id;
+      store.resolveAgentRequest(
+        approval.id,
+        "accepted",
+        JSON.stringify({ type: "spawn-approval-response", agentId: picked }),
+      );
+
+      const step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.spawnedRunIds).toHaveLength(1);
+      expect(store.getAgentRun(step.spawnedRunIds[0]!)?.agentId).toBe(picked);
+      expect(store.listAssignments({ taskId: task.id, limit: 10 })[0]?.agentId).toBe(picked);
     });
   });
 
@@ -895,7 +1161,7 @@ describe("orchestrator", () => {
 
       expect(prompts[0]).toContain("claude — models: claude-opus-5");
       expect(prompts[0]).not.toContain("gemini");
-      expect(prompts[0]).toContain("Staff ONLY from the roster above.");
+      expect(prompts[0]).toContain("Staff from the roster above.");
       expect(prompts[0]).toContain("You are NOT limited to your own provider.");
     });
   });
@@ -1065,10 +1331,49 @@ describe("orchestrator", () => {
     });
   });
 
-  it("refuses to spawn an implementer for a provider with no enabled agent", () => {
+  it("offers installed CLIs to the leader when the roster is empty", () => {
     withStore((store) => {
       const logs = new Map<string, string>();
-      const deps = makeDeps(store, logs);
+      const prompts: string[] = [];
+      const deps: OrchestratorDeps = {
+        ...makeDeps(store, logs),
+        spawn: (input: SpawnAgentTurnInput) => {
+          prompts.push(input.prompt);
+          return makeDeps(store, logs).spawn(input);
+        },
+        listProviders: () => [
+          { provider: "codex", models: ["gpt-5.6-sol"] },
+          { provider: "gemini", models: ["gemini-2.5-pro"] },
+        ],
+      };
+      // The leader itself is registered, but it has neither implement nor
+      // review capability, so there is nothing in the roster to staff from.
+      const leader = store.createRegisteredAgent({
+        name: "leader-only",
+        provider: "codex",
+        mode: "cli",
+        command: "codex",
+        capabilities: ["plan"],
+      });
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
+
+      stepOrchestration(store, orchestration.id, deps);
+
+      expect(prompts[0]).toContain("codex — models: gpt-5.6-sol");
+      expect(prompts[0]).toContain("gemini — models: gemini-2.5-pro");
+      expect(prompts[0]).toContain("registers one automatically the first time you staff them");
+    });
+  });
+
+  it("auto-registers an agent when the leader staffs a provider the roster has none for", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps: OrchestratorDeps = {
+        ...makeDeps(store, logs),
+        listProviders: () => [{ provider: "kimi", models: [] }],
+        defaultCommandFor: (provider) => (provider === "kimi" ? "kimi" : undefined),
+      };
       const leader = createWorkerLeader(store);
       const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
       const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
@@ -1095,8 +1400,56 @@ describe("orchestrator", () => {
         questions: [],
       }));
       stepOrchestration(store, orchestration.id, deps);
+      const step = stepOrchestration(store, orchestration.id, deps);
 
-      expect(() => stepOrchestration(store, orchestration.id, deps)).toThrow(/No enabled registered agent for provider "kimi"/);
+      expect(step.spawnedRunIds).toHaveLength(1);
+      const staffed = store.listRegisteredAgents({ provider: "kimi", limit: 10 });
+      expect(staffed).toHaveLength(1);
+      expect(staffed[0]!.command).toBe("kimi");
+      expect(staffed[0]!.capabilities).toContain("implement");
+      expect(store.getAgentRun(step.spawnedRunIds[0]!)?.agentId).toBe(staffed[0]!.id);
+    });
+  });
+
+  it("refuses to staff a provider outside the team allowlist instead of registering it", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps: OrchestratorDeps = {
+        ...makeDeps(store, logs),
+        listProviders: () => [{ provider: "kimi", models: [] }],
+        defaultCommandFor: (provider) => provider,
+      };
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({
+        taskId: task.id,
+        leaderAgentId: leader.id,
+        teamProviders: ["codex"],
+      });
+
+      const planStep = stepOrchestration(store, orchestration.id, deps);
+      finishRun(store, logs, planStep.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [
+          {
+            key: "s1",
+            title: "Implement X",
+            acceptanceCriteria: ["done"],
+            dependsOn: [],
+            files: [],
+            agentPreference: { provider: "kimi", mode: "cli" },
+          },
+        ],
+        reviewers: [],
+        questions: [],
+      }));
+      stepOrchestration(store, orchestration.id, deps);
+
+      expect(() => stepOrchestration(store, orchestration.id, deps)).toThrow(/not allowed for implementer staffing/);
+      expect(store.listRegisteredAgents({ provider: "kimi", limit: 10 })).toHaveLength(0);
     });
   });
 

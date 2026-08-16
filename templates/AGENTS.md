@@ -51,9 +51,10 @@ See `.agent-memory/handoff.md` if present.
   ```
 - After editing any source/config/test/doc file, run:
   ```bash
-  agent-bridge graph brief-auto "<repo-relative-path>" --task-edited
+  agent-bridge graph brief-auto "<repo-relative-path>" --task-edited --agent <agent>
   ```
   The first `--task-edited` brief moves the task from `todo` to `in_progress`.
+  Always pass the same `--agent <agent>` you used for the lease; without it the lease check resolves the default agent's task and rejects your own lease.
 - You may pass multiple paths to one `brief-auto` call. Skip generated/vendor files and files outside the current task.
 
 ## Completion Rules

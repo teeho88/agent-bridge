@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { Command } from "commander";
 import type { AgentRequest, AgentRequestType } from "@agent-bridge/memory";
 import {
+  adoptContinuationTask,
   ensureWorkspace,
   openStore,
   readConfig,
@@ -15,6 +16,8 @@ import {
   setCurrentTask,
   startAgentSession,
   syncAgentSession,
+  syncTerminalNativeSession,
+  writeCompiledContextFor,
   writeCurrentTaskArtifact
 } from "../workspace.js";
 import {
@@ -88,13 +91,54 @@ export function installCodexHooks(projectPath: string): string[] {
 export async function handleCodexHook(input: CodexHookInput, forcedEvent?: string): Promise<Record<string, unknown> | undefined> {
   const cwd = input.cwd ? resolve(input.cwd) : process.cwd();
   const event = forcedEvent ?? codexHookEventName(input);
+  // A Work Board launcher has already created the task/card for this terminal.
+  // Keep that stable id instead of letting the CLI-native thread id fork a
+  // second task when the first prompt arrives.
+  const terminalSessionId = process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID?.trim();
   const nativeSessionId = input.session_id || input.thread_id;
-  const sessionId = nativeSessionId || readConfig(cwd).currentSessions?.codex || `codex-${randomUUID()}`;
+  const sessionId = terminalSessionId || nativeSessionId || readConfig(cwd).currentSessions?.codex || `codex-${randomUUID()}`;
   ensureWorkspace(cwd);
   const store = openStore(cwd);
   try {
     if (event === "SessionStart") {
-      if (!nativeSessionId) return undefined;
+      if (!terminalSessionId && !nativeSessionId) return undefined;
+      if (terminalSessionId && nativeSessionId) {
+        const transition = syncTerminalNativeSession(terminalSessionId, nativeSessionId, cwd);
+        if (transition === "changed") {
+          const previousTaskId = resolveCodexSessionTask(store, cwd, sessionId);
+          if (previousTaskId) {
+            const source = firstTaskLabelSource(store, previousTaskId);
+            if (source) {
+              applyTaskLabelSuggestion(store, previousTaskId, {
+                titleText: source,
+                goalText: source,
+                status: "done",
+              });
+            } else {
+              store.updateTask(previousTaskId, { status: "done" });
+            }
+            store.recordSessionEvent({
+              sessionId,
+              taskId: previousTaskId,
+              agent: "codex",
+              kind: "session_ended",
+              summary: "Codex task completed when the terminal started a new thread.",
+            });
+          }
+          const task = store.createTask({ title: placeholderTaskTitle("codex"), ownerAgent: "codex" });
+          startAgentSession(sessionId, task.id, cwd, "codex");
+          rememberSessionWindowHandle(sessionId, task.id, "codex", cwd);
+          store.recordSessionEvent({
+            sessionId,
+            taskId: task.id,
+            agent: "codex",
+            kind: "session_started",
+            summary: "Codex started a new task after /clear.",
+          });
+          writeCurrentTaskArtifact(task, cwd);
+          return undefined;
+        }
+      }
       const needsTask = syncAgentSession(sessionId, cwd, "codex", store);
       const existingTaskId = resolveCodexSessionTask(store, cwd, sessionId);
       if (!needsTask && existingTaskId) {
@@ -116,6 +160,16 @@ export async function handleCodexHook(input: CodexHookInput, forcedEvent?: strin
 
     if (event === "UserPromptSubmit") {
       const prompt = (input.prompt || input.user_prompt || "").trim();
+      // The prompt may be continuing a task another agent left a handoff on;
+      // adopting it here is what makes that handoff reachable from Codex.
+      if (prompt) {
+        taskId = adoptContinuationTask(store, cwd, {
+          prompt,
+          agent: "codex",
+          sessionId,
+          currentTaskId: taskId,
+        }).taskId;
+      }
       if (!taskId) {
         if (!prompt) return undefined;
         const task = store.createTask({ title: placeholderTaskTitle("codex"), ownerAgent: "codex" });
@@ -131,6 +185,10 @@ export async function handleCodexHook(input: CodexHookInput, forcedEvent?: strin
       setCurrentTask(taskId, cwd, "codex");
       store.recordSessionEvent({ sessionId, taskId, agent: "codex", kind: "prompt_submitted", summary: "Codex received a prompt." });
       if (task) writeCurrentTaskArtifact(task, cwd);
+      // Codex reads .agent-memory/compiled-context.md instead of receiving
+      // injected context, so refresh it on every prompt — otherwise it keeps
+      // the compile from session start, or whatever another agent wrote there.
+      writeCompiledContextFor(store, cwd, taskId, "codex");
       return undefined;
     }
 

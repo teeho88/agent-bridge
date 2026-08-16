@@ -216,6 +216,7 @@ describe("SQLiteMemoryStore", () => {
       });
       const agent = store.createRegisteredAgent({
         name: "deepseek-researcher",
+        description: "API research and evidence synthesis",
         provider: "deepseek",
         mode: "api",
         baseUrl: "https://api.deepseek.com",
@@ -224,8 +225,11 @@ describe("SQLiteMemoryStore", () => {
         capabilities: ["research", "implement"],
       });
       expect(agent.enabled).toBe(true);
+      expect(agent.description).toBe("API research and evidence synthesis");
       expect(store.listRegisteredAgents({ provider: "deepseek" })).toHaveLength(1);
-      expect(store.updateRegisteredAgent(agent.id, { enabled: false })?.enabled).toBe(false);
+      const updated = store.updateRegisteredAgent(agent.id, { enabled: false, description: "Security-focused API review" });
+      expect(updated?.enabled).toBe(false);
+      expect(updated?.description).toBe("Security-focused API review");
 
       const roles = store.ensureDefaultWorkforceRoles();
       const implementer = roles.find((role) => role.name === "implementer")!;
@@ -880,6 +884,42 @@ describe("SQLiteMemoryStore", () => {
       const latest = store.getLatestHandoff(task.id);
       expect(latest?.summary).toBe("MANUAL");
       expect(latest?.auto).toBe(false);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps exactly one handoff per task when the next agent takes it over", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-bridge-"));
+    const path = join(dir, "memories.db");
+    const store = new SQLiteMemoryStore(path);
+    try {
+      const task = store.createTask({ title: "Shared task", ownerAgent: "claude" });
+      store.upsertAutoHandoff({ taskId: task.id, summary: "auto state" });
+      store.upsertTaskHandoff({
+        taskId: task.id,
+        fromAgent: "claude",
+        summary: "Claude stopped here",
+      });
+      store.upsertTaskHandoff({
+        taskId: task.id,
+        fromAgent: "codex",
+        summary: "Codex carried it further",
+      });
+
+      const db = new Database(path, { readonly: true });
+      const count = (
+        db.prepare("SELECT COUNT(*) c FROM handoffs WHERE task_id = ?").get(task.id) as {
+          c: number;
+        }
+      ).c;
+      db.close();
+      expect(count).toBe(1);
+
+      const latest = store.getLatestHandoff(task.id);
+      expect(latest?.summary).toBe("Codex carried it further");
+      expect(latest?.fromAgent).toBe("codex");
     } finally {
       store.close();
       rmSync(dir, { recursive: true, force: true });

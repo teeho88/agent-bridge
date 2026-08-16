@@ -6,7 +6,7 @@ import type {
   RegisteredAgent,
   Subtask,
 } from "@agent-bridge/memory";
-import { agentSupportsCapabilities, resolveAgentForPreference } from "./agent-selector.js";
+import { agentSupportsCapabilities, resolveAgentForPreference, uniqueAgentName } from "./agent-selector.js";
 import {
   buildRetryPrompt,
   parseLeaderTurn,
@@ -49,6 +49,11 @@ export type OrchestratorDeps = {
   // registered, enabled agents are offered now — but still accepted so the CLI
   // and dashboard can keep reporting what is installed.
   listProviders?: () => ProviderOption[];
+  // Maps a provider to the executable that launches it. Needed for auto-staffing:
+  // an agent row whose command is just the provider name spawns nothing for
+  // providers whose CLI is named differently (antigravity's binary is `agy`),
+  // and "spawn antigravity ENOENT" is a worse failure than not staffing at all.
+  defaultCommandFor?: (provider: string) => string | undefined;
 };
 
 export type ProviderOption = { provider: string; models: string[] };
@@ -57,6 +62,11 @@ export type OrchestrationStepResult = {
   orchestration: Orchestration;
   summary: string;
   spawnedRunIds: string[];
+  // Set when this step could not proceed because an approval is still pending:
+  // the createdAt of the oldest one. Callers that keep stepping on a timer use
+  // it to stop spinning on a run that is waiting on a human (see the UI's
+  // auto-run loop), and to say how long it has been waiting.
+  awaitingApprovalSince?: string;
 };
 
 const ACTIVE_STATUSES = new Set(["starting", "running", "waiting"]);
@@ -144,9 +154,16 @@ function stepPlanning(
   };
 
   if (!finished) {
-    const gated = gateSpawn(store, orchestration, `plan:${planRuns.length}`, "Run the leader's planning turn");
+    const key = `plan:${planRuns.length}`;
+    const leaderAgent = agentForKey(store, orchestration, key) ?? mustGetAgent(store, orchestration.leaderAgentId);
+    const gated = gateSpawn(
+      store,
+      orchestration,
+      key,
+      `Run the planning turn with ${describeAgent(leaderAgent)}`,
+      leaderAgent.id,
+    );
     if (gated) return gated;
-    const leaderAgent = mustGetAgent(store, orchestration.leaderAgentId);
     const run = spawnTurn(deps, store, orchestration, leaderAgent, buildPrompt(), "plan");
     return result(orchestration, "Spawned the leader's plan turn.", [run.id]);
   }
@@ -201,21 +218,121 @@ export type SpawnApprovalPayload = {
   type: "spawn-approval";
   key: string;
   orchestrationId: string;
+  // The agent the orchestrator intended to use, so the dashboard can offer to
+  // swap it for another one instead of only accept/reject.
+  agentId?: string;
+};
+
+// What the user sent back when they resolved the approval. Approving with a
+// different agent is a third answer beyond yes/no: the work is authorised, but
+// somebody else does it.
+export type SpawnApprovalResponse = {
+  type: "spawn-approval-response";
+  agentId?: string;
+  note?: string;
 };
 
 function approvalFor(
   store: MemoryStore,
   orchestration: Orchestration,
   key: string,
-): { id: string; status: string } | undefined {
+): { id: string; status: string; createdAt: string; response?: string } | undefined {
   for (const request of store.listAgentRequests({ taskId: orchestration.taskId, limit: 500 })) {
     if (request.type !== "approval" || !request.payload) continue;
     const parsed = safeParse<SpawnApprovalPayload>(request.payload);
     if (parsed?.type === "spawn-approval" && parsed.key === key && parsed.orchestrationId === orchestration.id) {
-      return { id: request.id, status: request.status };
+      return { id: request.id, status: request.status, createdAt: request.createdAt, response: request.response };
     }
   }
   return undefined;
+}
+
+// The agent the user picked when they approved this key, if they overrode the
+// orchestrator's choice. Read at spawn time, so the swap survives a restart
+// and applies to the retry of a step just as much as to the first attempt.
+export function approvedAgentOverride(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  key: string,
+): string | undefined {
+  const existing = approvalFor(store, orchestration, key);
+  if (existing?.status !== "accepted" || !existing.response) return undefined;
+  const parsed = safeParse<SpawnApprovalResponse>(existing.response);
+  return parsed?.type === "spawn-approval-response" ? parsed.agentId : undefined;
+}
+
+// The agent the user named when approving this key, resolved to a row. Returns
+// undefined when they simply approved, when the row is gone, or when there is
+// no gate at all.
+function agentForKey(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  key: string,
+): RegisteredAgent | undefined {
+  const chosen = approvedAgentOverride(store, orchestration, key);
+  return chosen ? store.getRegisteredAgent(chosen) : undefined;
+}
+
+type SpawnGate =
+  // Approved, or no gate at all.
+  | { decision: "go" }
+  // Waiting on the user. The caller may still gate other work in the same step
+  // — one unanswered approval must not hold up subtasks that could run now.
+  | { decision: "wait"; result: OrchestrationStepResult; since: string }
+  // The user said no to a piece of work the run can survive without: only that
+  // piece is dropped, the caller decides how to record it.
+  | { decision: "rejected" }
+  // The user said no to something the run cannot continue past (the plan turn,
+  // adjudication, a review): the orchestration pauses.
+  | { decision: "halt"; result: OrchestrationStepResult };
+
+function gateSpawnDetailed(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  key: string,
+  description: string,
+  agentId?: string,
+  // What a "no" means here. "pause" is the safe default for turns nothing can
+  // proceed without; "skip" is for work that is one item among many.
+  onReject: "pause" | "skip" = "pause",
+): SpawnGate {
+  if (orchestration.autonomy !== "approve-each") return { decision: "go" };
+
+  const existing = approvalFor(store, orchestration, key);
+  if (existing?.status === "accepted") return { decision: "go" };
+  if (existing?.status === "pending") {
+    return {
+      decision: "wait",
+      since: existing.createdAt,
+      result: { ...noop(orchestration, `Waiting for your approval: ${description}`), awaitingApprovalSince: existing.createdAt },
+    };
+  }
+  if (existing?.status === "rejected") {
+    if (onReject === "skip") return { decision: "rejected" };
+    const updated = store.updateOrchestration(orchestration.id, {
+      status: "paused",
+      lastError: `You rejected: ${description}`,
+    }) ?? orchestration;
+    return { decision: "halt", result: result(updated, `Rejected: ${description}. Paused.`, []) };
+  }
+
+  const request = store.createAgentRequest({
+    taskId: orchestration.taskId,
+    type: "approval",
+    title: description,
+    payload: JSON.stringify({
+      type: "spawn-approval",
+      key,
+      orchestrationId: orchestration.id,
+      agentId,
+    } satisfies SpawnApprovalPayload),
+  });
+  recordEvent(store, orchestration, "plan", "user_action", `Approval requested: ${description}`);
+  return {
+    decision: "wait",
+    since: request.createdAt,
+    result: { ...noop(orchestration, `Approval requested: ${description}`), awaitingApprovalSince: request.createdAt },
+  };
 }
 
 // Returns a step result when the caller must NOT spawn (approval missing,
@@ -225,30 +342,12 @@ function gateSpawn(
   orchestration: Orchestration,
   key: string,
   description: string,
+  agentId?: string,
 ): OrchestrationStepResult | undefined {
-  if (orchestration.autonomy !== "approve-each") return undefined;
-
-  const existing = approvalFor(store, orchestration, key);
-  if (existing?.status === "accepted") return undefined;
-  if (existing?.status === "pending") {
-    return noop(orchestration, `Waiting for your approval: ${description}`);
-  }
-  if (existing?.status === "rejected") {
-    const updated = store.updateOrchestration(orchestration.id, {
-      status: "paused",
-      lastError: `You rejected: ${description}`,
-    }) ?? orchestration;
-    return result(updated, `Rejected: ${description}. Paused.`, []);
-  }
-
-  store.createAgentRequest({
-    taskId: orchestration.taskId,
-    type: "approval",
-    title: description,
-    payload: JSON.stringify({ type: "spawn-approval", key, orchestrationId: orchestration.id } satisfies SpawnApprovalPayload),
-  });
-  recordEvent(store, orchestration, "plan", "user_action", `Approval requested: ${description}`);
-  return noop(orchestration, `Approval requested: ${description}`);
+  const gate = gateSpawnDetailed(store, orchestration, key, description, agentId);
+  // "rejected" never comes back here: this wrapper is only used by the gates
+  // that pause on a no.
+  return gate.decision === "go" || gate.decision === "rejected" ? undefined : gate.result;
 }
 
 export type QuestionAnswersPayload = {
@@ -408,6 +507,26 @@ function applyPlanTurn(
     });
   }
 
+  // A re-plan supersedes the previous one — the leader is told to plan only
+  // the work that is still needed — so subtasks it did not carry over are
+  // stale. Leaving them "todo" strands them: reviewer keys are reused, so the
+  // new scope replaced the old one and nothing would ever review them, and
+  // anything depending on them could never start.
+  const planned = new Set(subtaskIdByKey.values());
+  const superseded = store
+    .listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 })
+    .filter((subtask) => subtask.status === "todo" && !planned.has(subtask.id));
+  for (const subtask of superseded) store.updateSubtask(subtask.id, { status: "cancelled" });
+  if (superseded.length) {
+    recordEvent(
+      store,
+      orchestration,
+      "plan",
+      "leader_turn",
+      `Cancelled ${superseded.length} unstarted subtask(s) left over from the superseded plan.`,
+    );
+  }
+
   const planPath = deps.writePlanFile(turn.planMarkdown);
   const updated = store.updateOrchestration(orchestration.id, {
     status: "executing",
@@ -457,16 +576,70 @@ function stepExecuting(
   const slots = Math.max(0, orchestration.maxParallel - runningImplementers);
   if (slots > 0 && dispatchable.length) {
     const spawnedRunIds: string[] = [];
+    let waitingSince: string | undefined;
+    let waitingCount = 0;
+    let rejectedCount = 0;
     for (const subtask of dispatchable.slice(0, slots)) {
       // Approved one subtask at a time: "approve each" would mean little if a
-      // single yes launched three agents at once.
-      const gated = gateSpawn(store, orchestration, `implement:${subtask.id}`, `Start an implementer for "${subtask.title}"`);
-      if (gated) return spawnedRunIds.length
-        ? result(orchestration, `Spawned ${spawnedRunIds.length} implementer run(s); ${gated.summary}`, spawnedRunIds)
-        : gated;
+      // single yes launched three agents at once. The agent is resolved before
+      // the gate so the question names who would get the work — "approve this
+      // assignment" is not a real choice without that.
+      const candidate = tryResolveAgent(() => resolveImplementerAgent(store, orchestration, subtask, deps));
+      const gate = gateSpawnDetailed(
+        store,
+        orchestration,
+        `implement:${subtask.id}`,
+        `Assign "${subtask.title}" to ${describeAgent(candidate)} and start it`,
+        candidate?.id,
+        "skip",
+      );
+      // Saying no to one assignment means "don't do this piece", not "stop the
+      // project": the subtask is blocked and everything else carries on. The
+      // leader sees the blocked subtask at adjudication and can re-plan around
+      // it. (Pausing the whole run here used to make a single "no" the end of
+      // the orchestration, which is a very expensive way to skip one subtask.)
+      if (gate.decision === "rejected") {
+        rejectedCount += 1;
+        store.updateSubtask(subtask.id, { status: "blocked" });
+        recordEvent(
+          store,
+          orchestration,
+          "implement",
+          "user_action",
+          `You rejected the assignment for "${subtask.title}"; it is blocked and the rest of the run continues.`,
+        );
+        continue;
+      }
+      if (gate.decision === "halt") return gate.result;
+      // But a still-unanswered approval is only about THIS subtask. Carrying on
+      // means every dispatchable subtask gets its own request in one pass, and
+      // whichever ones you approve start immediately — previously the first
+      // unanswered question stalled the entire queue behind it, including
+      // parallel work that had nothing to do with it.
+      if (gate.decision === "wait") {
+        waitingCount += 1;
+        if (!waitingSince || gate.since < waitingSince) waitingSince = gate.since;
+        continue;
+      }
       spawnedRunIds.push(spawnImplementer(store, orchestration, subtask, deps).id);
     }
-    return result(orchestration, `Spawned ${spawnedRunIds.length} implementer run(s).`, spawnedRunIds);
+    const blocked = rejectedCount ? ` Blocked ${rejectedCount} you rejected.` : "";
+    if (spawnedRunIds.length) {
+      const waiting = waitingCount ? ` ${waitingCount} more await your approval.` : "";
+      return {
+        ...result(orchestration, `Spawned ${spawnedRunIds.length} implementer run(s).${waiting}${blocked}`, spawnedRunIds),
+        awaitingApprovalSince: waitingSince,
+      };
+    }
+    if (waitingCount) {
+      return {
+        ...noop(orchestration, `Waiting for your approval on ${waitingCount} agent assignment(s).${blocked}`),
+        awaitingApprovalSince: waitingSince,
+      };
+    }
+    if (rejectedCount) {
+      return result(orchestration, `Blocked ${rejectedCount} subtask(s) you rejected; nothing else was dispatchable.`, []);
+    }
   }
 
   // 2) Reconcile implementer runs that finished since the last step.
@@ -560,15 +733,31 @@ function stepExecuting(
     const unreviewed = scopeSubtasks.filter(
       (pair) => store.listReviews({ subtaskId: pair.subtask.id, limit: 5 }).length === 0,
     );
-    if (!unreviewed.length || unreviewed.some((pair) => pair.subtask.status !== "review")) continue;
+    const ready = unreviewed.filter((pair) => pair.subtask.status === "review");
+    if (!ready.length) continue;
+    // Reviewing the whole group in one pass is the cheap path, so wait while a
+    // scope member can still reach "review" on its own. But a member that only
+    // depends on work sitting in this very group cannot: dependencies count as
+    // met only once a subtask is "done", and "done" is what adjudication grants
+    // after this review. Waiting for it deadlocks the orchestration — reviewer
+    // waits for the dependent, dependent waits for the review — and the leader
+    // then adjudicates with no pending reviews and nothing it can decide.
+    const canStillProgress = (pair: { subtask: Subtask }) =>
+      pair.subtask.status === "assigned" ||
+      pair.subtask.status === "in_progress" ||
+      (pair.subtask.status === "todo" && pair.subtask.dependsOn.every((depId) => doneIds.has(depId)));
+    if (unreviewed.some((pair) => pair.subtask.status !== "review" && canStillProgress(pair))) continue;
+    const reviewKey = `review:${reviewerMeta.reviewerKey}:${ready.map((pair) => pair.entry.key).join(",")}`;
+    const candidate = tryResolveAgent(() => resolveReviewerAgent(store, orchestration, reviewerMeta, deps, reviewKey));
     const gated = gateSpawn(
       store,
       orchestration,
-      `review:${reviewerMeta.reviewerKey}:${unreviewed.map((pair) => pair.entry.key).join(",")}`,
-      `Start reviewer ${reviewerMeta.reviewerKey} for ${unreviewed.map((pair) => pair.subtask.title).join(", ")}`,
+      reviewKey,
+      `Assign review of ${ready.map((pair) => pair.subtask.title).join(", ")} to ${describeAgent(candidate)}`,
+      candidate?.id,
     );
     if (gated) return gated;
-    const run = spawnReviewer(store, orchestration, reviewerMeta, unreviewed, deps);
+    const run = spawnReviewer(store, orchestration, reviewerMeta, ready, deps);
     return result(orchestration, `Spawned reviewer run for ${reviewerMeta.reviewerKey}.`, [run.id]);
   }
 
@@ -591,13 +780,7 @@ function spawnImplementer(
 ): AgentRun {
   const meta = getSubtaskMeta(store, orchestration.id, subtask.id);
   const role = mustGetRole(store, meta?.role ?? "implementer");
-  if (meta?.agentPreference) assertProviderAllowed(orchestration, meta.agentPreference.provider, "implementer");
-  const agent = meta?.agentPreference
-    ? resolveAgentForPreference(store, meta.agentPreference, {
-        allowCreate: false,
-        requiredCapabilities: ["implement"],
-      })
-    : mustDefaultAgent(store, "implementer", orchestration.teamProviders);
+  const agent = resolveImplementerAgent(store, orchestration, subtask, deps);
   const prompt = renderImplementerPrompt(subtask, meta?.files ?? []);
   const assignment = store.createAssignment({
     taskId: orchestration.taskId,
@@ -617,6 +800,45 @@ function spawnImplementer(
   return run;
 }
 
+// Resolving the implementer's agent is deliberately separate from spawning it:
+// the approve-each gate has to name the agent it is asking about ("who exactly
+// will get this subtask?"), and that answer must be the very same one the spawn
+// then uses.
+function resolveImplementerAgent(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  subtask: Subtask,
+  deps: OrchestratorDeps,
+): RegisteredAgent {
+  // The user's pick, when they approved this assignment with a different agent,
+  // outranks both the leader's preference and the roster default: they were
+  // shown exactly this decision and answered it.
+  const chosen = approvedAgentOverride(store, orchestration, `implement:${subtask.id}`);
+  if (chosen) {
+    const agent = store.getRegisteredAgent(chosen);
+    if (agent) return agent;
+  }
+  const meta = getSubtaskMeta(store, orchestration.id, subtask.id);
+  if (meta?.agentPreference) assertProviderAllowed(orchestration, meta.agentPreference.provider, "implementer");
+  return resolveStaffAgent(store, orchestration, deps, "implement", meta?.agentPreference);
+}
+
+function resolveReviewerAgent(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  reviewerMeta: ReviewerPlanMeta,
+  deps: OrchestratorDeps,
+  approvalKey: string,
+): RegisteredAgent {
+  const chosen = approvedAgentOverride(store, orchestration, approvalKey);
+  if (chosen) {
+    const agent = store.getRegisteredAgent(chosen);
+    if (agent) return agent;
+  }
+  if (reviewerMeta.agentPreference) assertProviderAllowed(orchestration, reviewerMeta.agentPreference.provider, "reviewer");
+  return resolveStaffAgent(store, orchestration, deps, "review", reviewerMeta.agentPreference);
+}
+
 function spawnReviewer(
   store: MemoryStore,
   orchestration: Orchestration,
@@ -625,13 +847,13 @@ function spawnReviewer(
   deps: OrchestratorDeps,
 ): AgentRun {
   const role = mustGetRole(store, reviewerMeta.role ?? "reviewer");
-  if (reviewerMeta.agentPreference) assertProviderAllowed(orchestration, reviewerMeta.agentPreference.provider, "reviewer");
-  const agent = reviewerMeta.agentPreference
-    ? resolveAgentForPreference(store, reviewerMeta.agentPreference, {
-        allowCreate: false,
-        requiredCapabilities: ["review"],
-      })
-    : mustDefaultAgent(store, "reviewer", orchestration.teamProviders);
+  const agent = resolveReviewerAgent(
+    store,
+    orchestration,
+    reviewerMeta,
+    deps,
+    `review:${reviewerMeta.reviewerKey}:${scopeSubtasks.map((pair) => pair.entry.key).join(",")}`,
+  );
   const task = mustGetTask(store, orchestration.taskId);
   const assignmentsBySubtask = new Map(
     scopeSubtasks.map((pair) => [
@@ -719,10 +941,20 @@ function stepAdjudicating(
     ),
   );
   if (!finished) {
+    const key = `adjudicate:${adjudicateRuns.length}`;
     const adjudicator = findCapabilityAgent(store, "adjudicate", orchestration.teamProviders, orchestration.leaderAgentId);
-    const agent = adjudicator ?? mustGetAgent(store, orchestration.leaderAgentId);
-    const actor = adjudicator ? "adjudicator" : "leader";
-    const gated = gateSpawn(store, orchestration, `adjudicate:${adjudicateRuns.length}`, `Run the ${actor}'s adjudication turn`);
+    const chosen = agentForKey(store, orchestration, key);
+    const agent = chosen ?? adjudicator ?? mustGetAgent(store, orchestration.leaderAgentId);
+    // A user-picked agent takes the adjudicator seat regardless of who would
+    // have had it, unless it is the leader itself — then this is a leader turn.
+    const actor = agent.id === orchestration.leaderAgentId ? "leader" : "adjudicator";
+    const gated = gateSpawn(
+      store,
+      orchestration,
+      key,
+      `Run the ${actor}'s adjudication turn with ${describeAgent(agent)}`,
+      agent.id,
+    );
     if (gated) return gated;
     const prompt = buildAdjudicationPrompt(store, orchestration, deps, actor);
     const run = spawnTurn(deps, store, orchestration, agent, prompt, "adjudicate");
@@ -1203,14 +1435,125 @@ function mustGetRole(store: MemoryStore, roleName: string) {
   return role;
 }
 
-function mustDefaultAgent(store: MemoryStore, capability: string, allowedProviders?: string[]): RegisteredAgent {
-  const required = capability === "implementer" ? "implement" : capability === "reviewer" ? "review" : capability;
+// Resolution can legitimately fail while building an approval prompt (no
+// provider left to staff): the gate must still be able to ask the question —
+// with the user free to answer it by naming an agent themselves — and the spawn
+// itself reports the real error.
+function tryResolveAgent(resolve: () => RegisteredAgent): RegisteredAgent | undefined {
+  try {
+    return resolve();
+  } catch {
+    return undefined;
+  }
+}
+
+function describeAgent(agent: RegisteredAgent | undefined): string {
+  return agent
+    ? `${agent.name} (${agent.provider}${agent.model ? `/${agent.model}` : ""})`
+    : "an agent that still has to be staffed";
+}
+
+function findDefaultAgent(
+  store: MemoryStore,
+  capability: string,
+  allowedProviders?: string[],
+): RegisteredAgent | undefined {
   const allowed = allowedProviders?.length ? new Set(allowedProviders) : undefined;
-  const agent = store
+  return store
     .listRegisteredAgents({ enabled: true, limit: 500 })
-    .find((candidate) => (!allowed || allowed.has(candidate.provider)) && agentSupportsCapabilities(candidate, [required]));
-  if (!agent) throw new Error(`No enabled registered agent available for ${capability} role.`);
-  return agent;
+    .find((candidate) => (!allowed || allowed.has(candidate.provider)) && agentSupportsCapabilities(candidate, [capability]));
+}
+
+// The single door every implementer/reviewer spawn goes through.
+//
+// The roster stays the first and preferred answer: an agent the user registered
+// and enabled in the Agents tab. But an empty (or capability-short) roster used
+// to be a hard stop — the leader planned, then every spawn threw "No enabled
+// registered agent available", and the orchestration died with nothing to show.
+// Rather than fail, register the agent the plan calls for and say so in the
+// timeline; it lands in the Agents tab where the user can retune or disable it.
+// teamProviders still bounds what may be created, so an explicit allowlist is
+// never widened behind the user's back.
+function resolveStaffAgent(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  deps: OrchestratorDeps,
+  capability: "implement" | "review",
+  preference?: LeaderAgentPreference,
+): RegisteredAgent {
+  if (preference) {
+    try {
+      return resolveAgentForPreference(store, preference, {
+        allowCreate: false,
+        requiredCapabilities: [capability],
+      });
+    } catch (error) {
+      const created = autoStaffAgent(store, orchestration, deps, capability, preference);
+      if (!created) throw error;
+      return created;
+    }
+  }
+  const existing = findDefaultAgent(store, capability, orchestration.teamProviders);
+  if (existing) return existing;
+  const created = autoStaffAgent(store, orchestration, deps, capability);
+  if (created) return created;
+  throw new Error(
+    `No enabled registered agent available for ${capability} work, and none could be registered automatically. ` +
+      `Add an agent with the "${capability}" capability in the Agents tab.`,
+  );
+}
+
+// Registers one CLI agent for the best provider the plan/allowlist/machine can
+// agree on. Returns undefined when there is no provider left to try, so the
+// caller can surface the original, more specific error.
+function autoStaffAgent(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  deps: OrchestratorDeps,
+  capability: "implement" | "review",
+  preference?: LeaderAgentPreference,
+): RegisteredAgent | undefined {
+  const allowed = orchestration.teamProviders?.length ? new Set<string>(orchestration.teamProviders) : undefined;
+  const installed = deps.listProviders?.().map((option) => option.provider) ?? [];
+  const leaderProvider = store.getRegisteredAgent(orchestration.leaderAgentId)?.provider;
+  const candidates = [preference?.provider, ...(orchestration.teamProviders ?? []), ...installed, leaderProvider]
+    .filter((provider): provider is string => Boolean(provider))
+    .filter((provider) => !allowed || allowed.has(provider));
+
+  for (const provider of [...new Set(candidates)]) {
+    // No known command means nothing to launch; skipping is better than
+    // registering an agent whose every spawn dies with ENOENT.
+    const command = deps.defaultCommandFor ? deps.defaultCommandFor(provider) : provider;
+    if (!command) continue;
+    // Model/effort are only carried over when the leader asked for this very
+    // provider — pairing another provider's model id with it spawns nothing.
+    const forPreference = preference?.provider === provider ? preference : undefined;
+    const agent = store.createRegisteredAgent({
+      name: uniqueAgentName(
+        store,
+        [provider, forPreference?.model, forPreference?.reasoningEffort].filter(Boolean).join("-"),
+      ),
+      provider: provider as RegisteredAgent["provider"],
+      // Auto-staffing only ever creates CLI agents: an api-mode agent needs a
+      // base URL and a credential this code has no way to invent.
+      mode: "cli",
+      command,
+      model: forPreference?.model,
+      reasoningEffort: forPreference?.reasoningEffort,
+      // Both capabilities, so one auto-staffed agent can also review later
+      // instead of triggering a second round of this.
+      capabilities: ["implement", "review"],
+    });
+    recordEvent(
+      store,
+      orchestration,
+      capability === "implement" ? "implement" : "review",
+      "user_action",
+      `Auto-registered agent "${agent.name}" (${provider}${agent.model ? `/${agent.model}` : ""}) for ${capability} work; the roster had no enabled agent that could take it.`,
+    );
+    return agent;
+  }
+  return undefined;
 }
 
 function findCapabilityAgent(
@@ -1237,11 +1580,12 @@ function assertProviderAllowed(orchestration: Orchestration, provider: string, r
 }
 
 // What the leader is told it can staff from: the enabled agents in the Agents
-// tab and nothing else, narrowed further by the orchestration's teamProviders
-// allowlist when the user set one. Installed-but-unregistered CLIs are
-// deliberately NOT offered — the roster is the permission list, and spawning
-// something absent from it is exactly what strict resolution refuses to do, so
-// naming it here would only invite a plan that dies at spawn time.
+// tab, narrowed further by the orchestration's teamProviders allowlist when the
+// user set one. Installed-but-unregistered CLIs are offered ONLY when that
+// roster comes back empty — otherwise the leader would plan around agents the
+// user chose not to enable. When it is empty, naming the installed providers is
+// the only way to get a usable plan at all, and the spawn path registers
+// whichever one the leader picks (see autoStaffAgent).
 function resolveProviderOptions(
   store: MemoryStore,
   orchestration: Orchestration,
@@ -1249,7 +1593,8 @@ function resolveProviderOptions(
 ): {
   availableProviders: string[];
   providerModels: Record<string, string[]>;
-  agentRoster: Array<{ name: string; provider: string; model?: string; capabilities: string[] }>;
+  agentRoster: Array<{ name: string; description?: string; provider: string; model?: string; capabilities: string[] }>;
+  autoStaff: boolean;
 } {
   const allowed = orchestration.teamProviders?.length ? new Set(orchestration.teamProviders) : undefined;
   const agents = store
@@ -1269,17 +1614,29 @@ function resolveProviderOptions(
       providerModels,
       agentRoster: filtered.map((agent) => ({
         name: agent.name,
+        description: agent.description,
         provider: agent.provider,
         model: agent.model,
         capabilities: agent.capabilities,
       })),
+      autoStaff: false,
     };
   };
-  if (!allowed) return collect(agents);
-  const narrowed = agents.filter((agent) => allowed.has(agent.provider));
-  // An explicit allowlist is a hard boundary. An empty matching roster must be
-  // visible as unstaffable instead of silently widening back to every provider.
-  return collect(narrowed);
+  // Installed CLIs, used only as the empty-roster fallback. The allowlist still
+  // applies: it bounds what auto-staffing is allowed to register.
+  const fromInstalled = () => {
+    const catalogs = (_deps.listProviders?.() ?? []).filter((option) => !allowed || allowed.has(option.provider as RegisteredAgent["provider"]));
+    const providerModels: Record<string, string[]> = {};
+    for (const option of catalogs) providerModels[option.provider] = option.models;
+    return {
+      availableProviders: catalogs.map((option) => option.provider),
+      providerModels,
+      agentRoster: [],
+      autoStaff: catalogs.length > 0,
+    };
+  };
+  const narrowed = allowed ? agents.filter((agent) => allowed.has(agent.provider)) : agents;
+  return narrowed.length ? collect(narrowed) : fromInstalled();
 }
 
 function createQuestion(store: MemoryStore, orchestration: Orchestration, question: LeaderQuestion): void {

@@ -2,6 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import type { Command } from "commander";
 import { antigravityArtifact, claudeManagedSection, codexManagedSection, patchManagedSection } from "@agent-bridge/adapters";
 import { compileContext, loadOptionalTokenizer } from "@agent-bridge/core";
+import { writeAntigravityRules } from "./antigravity.js";
 import { renderRepoMap, type AgentKind } from "@agent-bridge/memory";
 import {
   getActiveTaskId,
@@ -10,6 +11,7 @@ import {
   policyBudgets,
   readConfig,
   readStdinUtf8,
+  resolveTokenBudget,
   syncCurrentTaskArtifact
 } from "../workspace.js";
 
@@ -39,7 +41,10 @@ export function registerContext(program: Command): void {
       }) => {
       const config = readConfig();
       const agent = options.agent ?? config.defaultAgent;
-      const budget = Number(options.budget ?? config.tokenBudget);
+      const budget = resolveTokenBudget(
+        process.cwd(),
+        options.budget === undefined ? undefined : Number(options.budget),
+      );
       const store = openStore();
       try {
         const taskId = getActiveTaskId(store, undefined, options.task, agent);
@@ -74,6 +79,7 @@ export function registerContext(program: Command): void {
         if (agent === "codex") patchManagedSection("AGENTS.md", codexManagedSection());
         if (agent === "claude") patchManagedSection("CLAUDE.md", claudeManagedSection());
         if (agent === "antigravity") {
+          writeAntigravityRules(process.cwd());
           const p = paths();
           mkdirSync(p.artifacts, { recursive: true });
           writeFileSync(

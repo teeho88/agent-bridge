@@ -4,19 +4,19 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Command } from "commander";
-import { compileContext } from "@agent-bridge/core";
-import { isGraphSourceFile, renderRepoMap } from "@agent-bridge/memory";
+import { firstLineSummary } from "@agent-bridge/core";
+import { isGraphSourceFile } from "@agent-bridge/memory";
 import type { AgentRequest, AgentRequestType, CreateHandoffInput, Handoff } from "@agent-bridge/memory";
 import { refreshBriefs } from "../graph-brief.js";
 import { writeHandoffArtifacts } from "./handoff.js";
 import { applyTaskLabelSuggestion } from "../task-suggestions.js";
 import {
+  adoptContinuationTask,
   ensureWorkspace,
   endAgentSession,
   consumePendingNewTask,
+  writeCompiledContextFor,
   openStore,
-  paths,
-  policyBudgets,
   readConfig,
   redactIfEnabled,
   rememberSessionWindowHandle,
@@ -25,7 +25,6 @@ import {
   resolveCurrentTaskId,
   setCurrentTask,
   syncAgentSession,
-  syncCurrentTaskArtifact,
   writeCurrentTaskArtifact,
 } from "../workspace.js";
 
@@ -152,6 +151,12 @@ export function handleClaudeHook(
   // here — stay completely read-only for these.
   if (process.env.AGENT_BRIDGE_SPAWNED_RUN) return undefined;
 
+  // A Work Board launcher has already created the task/card for this terminal.
+  // Normalize Claude's native session id to the launcher's stable id so the
+  // first prompt fills that card instead of opening another one.
+  const terminalSessionId = process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID?.trim();
+  if (terminalSessionId) input = { ...input, session_id: terminalSessionId };
+
   const cwd = input.cwd ? resolve(input.cwd) : process.cwd();
   ensureWorkspace(cwd);
 
@@ -196,6 +201,16 @@ export function handleClaudeHook(
       let taskId = pendingNewTask || sharedSessionTask
         ? null
         : resolveClaudeSessionTask(store, cwd, input.session_id);
+      // Before opening a task, check whether the prompt continues one that is
+      // already in flight — that task's handoff is the context to work from.
+      if (!taskId && !pendingNewTask) {
+        taskId = adoptContinuationTask(store, cwd, {
+          prompt,
+          agent: "claude",
+          sessionId: input.session_id,
+          currentTaskId: null,
+        }).taskId;
+      }
       if (!taskId) {
         const task = store.createTask({
           title: titleFromPrompt(prompt),
@@ -332,6 +347,12 @@ export function handleClaudeHook(
             taskId,
             type: "note",
             content: redactIfEnabled(`Claude latest response: ${compact}`, cwd),
+            // The full response stays in content for the UI; the compiled pack
+            // renders one bullet per memory, so it needs a one-line summary.
+            summary: redactIfEnabled(
+              `Claude latest response: ${firstLineSummary(compact)}`,
+              cwd,
+            ),
             importance: 3,
             sourceAgent: "claude",
             tags: ["claude-code", eventName.toLowerCase(), "latest-response"],
@@ -590,6 +611,12 @@ function contextOutput(
     "agent-bridge synced this Claude Code session.",
     `Current task: ${pack.task.title}`,
     "Use .agent-memory/compiled-context.md for compact project memory.",
+    ...(pack.handoff
+      ? [
+          `This task was handed off by ${pack.handoff.fromAgent ?? "another agent"}: ${pack.handoff.summary}`,
+          "Read the Latest Handoff section of .agent-memory/compiled-context.md before continuing it.",
+        ]
+      : []),
     "When you discover durable facts, mention them clearly so the hook can persist them.",
   ].join("\n");
 
@@ -672,7 +699,7 @@ function captureTaskFindings(
     taskId,
     type: "note",
     content,
-    summary: content,
+    summary: lines.join("; ").slice(0, 400),
     importance: 4,
     tags: ["claude-code", "task-finding"],
     sourceAgent: "claude",
@@ -699,27 +726,7 @@ function writeCompiledContext(
   cwd: string,
   taskId: string,
 ) {
-  const config = readConfig(cwd);
-  syncCurrentTaskArtifact(store, taskId, cwd);
-  const repoMap = config.graph?.injectRepoMap !== false && store.getGraphStats().files > 0
-    ? renderRepoMap(store.buildRepoMap({ limit: config.graph?.repoMapLimit ?? 30 }))
-    : undefined;
-  const pack = compileContext(store, {
-    taskId,
-    agent: "claude",
-    tokenBudget: config.tokenBudget,
-    ...policyBudgets(cwd),
-    repoMap,
-  });
-  writeFileSync(
-    paths(cwd).compiledContext,
-    `${pack.renderedMarkdown}\n`,
-    "utf8",
-  );
-  const taskContextPath = join(paths(cwd).tasks, taskId, "compiled-context.md");
-  mkdirSync(dirname(taskContextPath), { recursive: true });
-  writeFileSync(taskContextPath, `${pack.renderedMarkdown}\n`, "utf8");
-  return pack;
+  return writeCompiledContextFor(store, cwd, taskId, "claude");
 }
 
 function withAgentBridgeHooks(

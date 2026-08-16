@@ -1,10 +1,7 @@
-import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
 import type { Command } from "commander";
 import type { AgentProvider, AgentRunMode, RegisteredAgent } from "@agent-bridge/memory";
-import { getProviderCatalog, listProviderCatalogs, mergeProviderCatalog, type ProviderCatalog } from "@agent-bridge/adapters";
-import { openStore, parseList, paths } from "../workspace.js";
+import { openStore, parseList } from "../workspace.js";
+import { loadRuntimeProviderCatalogs } from "../provider-catalog.js";
 
 export function registerAgent(program: Command): void {
   const agent = program.command("agent").description("Manage registered workforce agents");
@@ -12,6 +9,7 @@ export function registerAgent(program: Command): void {
   agent
     .command("add")
     .argument("<name>", "agent name")
+    .option("--description <text>", "expertise profile used by orchestration leaders")
     .requiredOption("--provider <provider>", "codex | claude | gemini | antigravity | openai-compatible | deepseek | kimi | glm | manual | generic")
     .requiredOption("--mode <mode>", "cli | api | manual")
     .option("--command <command>", "CLI command for cli-mode agents")
@@ -20,11 +18,12 @@ export function registerAgent(program: Command): void {
     .option("--reasoning <level>", "reasoning effort for CLI agents")
     .option("--credential <credentialRef>", "credential reference id")
     .option("--capabilities <items>", "comma-separated capabilities")
-    .action((name: string, options: { provider: string; mode: string; command?: string; baseUrl?: string; model?: string; reasoning?: string; credential?: string; capabilities?: string }) => {
+    .action((name: string, options: { description?: string; provider: string; mode: string; command?: string; baseUrl?: string; model?: string; reasoning?: string; credential?: string; capabilities?: string }) => {
       const store = openStore();
       try {
         const created = store.createRegisteredAgent({
           name,
+          description: options.description,
           provider: parseProvider(options.provider),
           mode: parseMode(options.mode),
           command: options.command,
@@ -77,6 +76,7 @@ export function registerAgent(program: Command): void {
     .command("update")
     .argument("<agent>", "agent id or name")
     .option("--name <name>", "new agent name")
+    .option("--description <text>", "expertise profile used by orchestration leaders")
     .option("--provider <provider>", "codex | claude | gemini | antigravity | openai-compatible | deepseek | kimi | glm | manual | generic")
     .option("--mode <mode>", "cli | api | manual")
     .option("--command <command>", "CLI command for cli-mode agents")
@@ -90,6 +90,7 @@ export function registerAgent(program: Command): void {
         value: string,
         options: {
           name?: string;
+          description?: string;
           provider?: string;
           mode?: string;
           command?: string;
@@ -106,6 +107,7 @@ export function registerAgent(program: Command): void {
           if (!found) throw new Error(`Agent not found: ${value}`);
           const updated = store.updateRegisteredAgent(found.id, {
             name: options.name,
+            description: options.description,
             provider: options.provider ? parseProvider(options.provider) : undefined,
             mode: options.mode ? parseMode(options.mode) : undefined,
             command: options.command,
@@ -163,48 +165,27 @@ export function registerAgent(program: Command): void {
     .command("catalog")
     .description("List known models and reasoning levels per CLI provider")
     .option("--provider <provider>", "codex | claude | antigravity")
-    .action((options: { provider?: string }) => {
-      const cache = readCatalogCache();
-      const catalogs = options.provider
-        ? [getProviderCatalog(options.provider)].filter((catalog): catalog is ProviderCatalog => Boolean(catalog))
-        : listProviderCatalogs();
-      if (options.provider && !catalogs.length) throw new Error(`Unknown provider: ${options.provider}`);
-      const merged = catalogs.map((catalog) =>
-        cache[catalog.provider] ? mergeProviderCatalog(catalog, cache[catalog.provider]) : catalog,
-      );
-      console.log(JSON.stringify(merged, null, 2));
+    .action(async (options: { provider?: string }) => {
+      const result = await loadRuntimeProviderCatalogs({ provider: options.provider });
+      console.log(JSON.stringify(result.catalogs, null, 2));
     });
 
   agent
     .command("probe")
-    .description("Run `<command> --help` for a provider and cache any extra models/flags it reports")
+    .description("Query a provider CLI for its current model catalog and cache the result")
     .argument("<provider>", "codex | claude | antigravity")
     .option("--command <command>", "override the CLI command to probe")
     .option("--timeout-ms <ms>", "probe timeout", "10000")
-    .action((provider: string, options: { command?: string; timeoutMs: string }) => {
-      const catalog = getProviderCatalog(provider);
-      if (!catalog) throw new Error(`Unknown provider: ${provider}. Only CLI providers have a probe-able catalog.`);
-      const executable = options.command ?? catalog.defaultCommand;
-      let helpText = "";
-      try {
-        helpText = execFileSync(executable, ["--help"], {
-          encoding: "utf8",
-          timeout: Number(options.timeoutMs),
-          windowsHide: true,
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.log(JSON.stringify({ provider, probed: false, reason: `Could not run "${executable} --help": ${message}` }, null, 2));
-        return;
-      }
-      const discoveredModels = extractModelMentions(helpText, catalog.models.map((model) => model.value));
-      const cache = readCatalogCache();
-      cache[provider] = {
-        models: discoveredModels.map((value) => ({ value, label: value })),
-        reasoning: cache[provider]?.reasoning ?? [],
-      };
-      writeCatalogCache(cache);
-      console.log(JSON.stringify({ provider, probed: true, discoveredModels }, null, 2));
+    .action(async (provider: string, options: { command?: string; timeoutMs: string }) => {
+      const result = await loadRuntimeProviderCatalogs({
+        provider,
+        command: options.command,
+        timeoutMs: Number(options.timeoutMs),
+      });
+      const error = result.errors[provider];
+      console.log(JSON.stringify(error
+        ? { provider, probed: false, reason: error }
+        : { provider, probed: true, models: result.catalogs[0]?.models ?? [] }, null, 2));
     });
 }
 
@@ -216,31 +197,6 @@ function parseProvider(value: string): AgentProvider {
   const allowed: AgentProvider[] = ["codex", "claude", "gemini", "antigravity", "openai-compatible", "deepseek", "kimi", "glm", "manual", "generic"];
   if (allowed.includes(value as AgentProvider)) return value as AgentProvider;
   throw new Error(`Invalid provider "${value}". Use one of: ${allowed.join(", ")}.`);
-}
-
-type CatalogCache = Record<string, { models: Array<{ value: string; label: string }>; reasoning: Array<{ value: string; label: string }> }>;
-
-function catalogCachePath(): string {
-  return `${paths().memoryDir}/catalog.json`;
-}
-
-function readCatalogCache(): CatalogCache {
-  try {
-    return JSON.parse(readFileSync(catalogCachePath(), "utf8")) as CatalogCache;
-  } catch {
-    return {};
-  }
-}
-
-function writeCatalogCache(cache: CatalogCache): void {
-  const path = catalogCachePath();
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(cache, null, 2), "utf8");
-}
-
-function extractModelMentions(helpText: string, knownModels: string[]): string[] {
-  const found = new Set<string>(knownModels.filter((model) => helpText.includes(model)));
-  return [...found];
 }
 
 function parseMode(value: string): AgentRunMode {

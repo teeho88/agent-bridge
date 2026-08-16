@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { registerAgent } from "./commands/agent.js";
+import { registerAntigravity } from "./commands/antigravity.js";
+import { registerAssignment } from "./commands/assignment.js";
 import { registerClaude } from "./commands/claude.js";
 import { registerCodex } from "./commands/codex.js";
 import { registerContext } from "./commands/context.js";
@@ -31,9 +33,11 @@ registerInit(program);
 registerAgent(program);
 registerClaude(program);
 registerCodex(program);
+registerAntigravity(program);
 registerTask(program);
 registerSession(program);
 registerSubtask(program);
+registerAssignment(program);
 registerMemory(program);
 registerContext(program);
 registerCredential(program);

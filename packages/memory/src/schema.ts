@@ -549,3 +549,25 @@ export const antigravityCommandRepointStatements = [
      WHERE provider = 'antigravity'
        AND (command IS NULL OR command IN ('antigravity', 'antigravity.exe', 'gemini'))`
 ];
+
+// v23: free-form expertise profile shown to leaders during planning. Capability
+// tags remain hard spawn constraints; this description gives the leader enough
+// detail to choose among multiple eligible agents without favoring its provider.
+export const agentDescriptionColumnStatements = [
+  `ALTER TABLE agents ADD COLUMN description TEXT`
+];
+
+// v24: preset identity and selection are separate from enabled/disabled. An
+// unchecked preset disappears from the roster but keeps all user edits so the
+// same customized agent can be restored on the next check.
+export const agentPresetColumnStatements = [
+  `ALTER TABLE agents ADD COLUMN preset_key TEXT`,
+  `ALTER TABLE agents ADD COLUMN preset_selected INTEGER NOT NULL DEFAULT 1`
+];
+
+// v25: a hidden preset is removed from the default-agent table itself, not just
+// from the roster. Built-in presets are re-seeded on every dashboard load, so
+// the removal has to be recorded on the row instead of deleting it.
+export const agentPresetHiddenColumnStatements = [
+  `ALTER TABLE agents ADD COLUMN preset_hidden INTEGER NOT NULL DEFAULT 0`
+];

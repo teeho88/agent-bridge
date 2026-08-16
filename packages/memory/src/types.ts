@@ -17,6 +17,7 @@ export type AgentRunMode = "cli" | "api" | "manual";
 export type RegisteredAgent = {
   id: string;
   name: string;
+  description?: string;
   provider: AgentProvider;
   mode: AgentRunMode;
   command?: string;
@@ -25,6 +26,9 @@ export type RegisteredAgent = {
   reasoningEffort?: string;
   credentialRef?: string;
   capabilities: string[];
+  presetKey?: string;
+  presetSelected?: boolean;
+  presetHidden?: boolean;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -32,6 +36,7 @@ export type RegisteredAgent = {
 
 export type CreateRegisteredAgentInput = {
   name: string;
+  description?: string;
   provider: AgentProvider;
   mode: AgentRunMode;
   command?: string;
@@ -40,6 +45,9 @@ export type CreateRegisteredAgentInput = {
   reasoningEffort?: string;
   credentialRef?: string;
   capabilities?: string[];
+  presetKey?: string;
+  presetSelected?: boolean;
+  presetHidden?: boolean;
   enabled?: boolean;
 };
 

@@ -1,7 +1,8 @@
 ﻿import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
+  renderRepoMap,
   DEFAULT_CONSOLIDATE_THRESHOLD,
   DEFAULT_DECAY_HALF_LIFE_DAYS,
   DEFAULT_DEDUPE_THRESHOLD,
@@ -11,16 +12,18 @@ import {
   SQLiteMemoryStore,
   type AgentKind,
   type LifecycleConfig,
+  type Handoff,
   type RecordSessionEventInput,
   type SessionEvent,
   type Task,
 } from "@agent-bridge/memory";
+import { shouldSeedTitle } from "./task-suggestions.js";
 import {
   claudeManagedSection,
   codexManagedSection,
   patchManagedSection,
 } from "@agent-bridge/adapters";
-import { redactSecrets } from "@agent-bridge/core";
+import { compileContext, redactSecrets } from "@agent-bridge/core";
 
 export type BridgeConfig = {
   version: 1;
@@ -39,11 +42,22 @@ export type BridgeConfig = {
   // earlier session is resumed instead of clobbering the current one or
   // spawning a duplicate. Keyed by session id (unique across agents).
   sessionTasks?: Record<string, string>;
-  // Best-effort OS window handles captured when an agent terminal starts a
-  // session. Used by the dashboard to focus an existing terminal window.
+  // Native agent session currently hosted by a stable Work Board terminal.
+  // The terminal id survives commands such as Codex /clear; the native id
+  // changes and is used to decide when that window should move to a new task.
+  terminalNativeSessions?: Record<string, string>;
+  // Stable Windows Terminal ids and best-effort process/window handles used
+  // by the dashboard to track and focus an existing agent terminal.
   sessionWindows?: Record<
     string,
-    { hwnd: string; taskId: string; agent: AgentKind; updatedAt: string }
+    {
+      hwnd?: string;
+      windowId?: string;
+      pid?: number;
+      taskId: string;
+      agent: AgentKind;
+      updatedAt: string;
+    }
   >;
   pendingNewTasks?: Partial<Record<AgentKind, true>>;
   defaultAgent: AgentKind;
@@ -209,6 +223,9 @@ export function ensureWorkspace(cwd = process.cwd()): void {
         "  max_memory_tokens: 800",
         "  max_logs_tokens: 300",
         "  max_handoff_tokens: 600",
+        "  max_repo_map_tokens: 1000",
+        "  max_constraint_tokens: 400",
+        "  max_decision_tokens: 400",
         "  prefer_summary_over_raw: true",
         "  include_tests_first: true",
         "  include_latest_handoff: true",
@@ -259,6 +276,9 @@ export type TokenPolicy = {
   maxMemoryTokens?: number;
   maxLogsTokens?: number;
   maxHandoffTokens?: number;
+  maxRepoMapTokens?: number;
+  maxConstraintTokens?: number;
+  maxDecisionTokens?: number;
   preferSummaryOverRaw?: boolean;
 };
 
@@ -293,6 +313,9 @@ export function readTokenPolicy(cwd = process.cwd()): TokenPolicy {
     maxMemoryTokens: num("max_memory_tokens"),
     maxLogsTokens: num("max_logs_tokens"),
     maxHandoffTokens: num("max_handoff_tokens"),
+    maxRepoMapTokens: num("max_repo_map_tokens"),
+    maxConstraintTokens: num("max_constraint_tokens"),
+    maxDecisionTokens: num("max_decision_tokens"),
     preferSummaryOverRaw: values["prefer_summary_over_raw"] === true,
   };
 }
@@ -303,12 +326,32 @@ export function readTokenPolicy(cwd = process.cwd()): TokenPolicy {
 export function policyBudgets(cwd = process.cwd()): {
   memoryTokenBudget?: number;
   fileTokenBudget?: number;
+  handoffTokenBudget?: number;
+  repoMapTokenBudget?: number;
+  constraintTokenBudget?: number;
+  decisionTokenBudget?: number;
 } {
   const policy = readTokenPolicy(cwd);
   return {
     memoryTokenBudget: policy.maxMemoryTokens,
     fileTokenBudget: policy.maxFileSnippetTokens,
+    handoffTokenBudget: policy.maxHandoffTokens,
+    repoMapTokenBudget: policy.maxRepoMapTokens,
+    constraintTokenBudget: policy.maxConstraintTokens,
+    decisionTokenBudget: policy.maxDecisionTokens,
   };
+}
+
+// max_prompt_tokens is the authority for the whole pack budget; config.json's
+// tokenBudget is the fallback for workspaces without a policy file. An explicit
+// caller value (the `context --budget` flag) still wins, so the flag is never
+// silently overridden by the policy.
+export function resolveTokenBudget(
+  cwd = process.cwd(),
+  explicit?: number,
+): number {
+  if (typeof explicit === "number" && Number.isFinite(explicit)) return explicit;
+  return readTokenPolicy(cwd).maxPromptTokens ?? readConfig(cwd).tokenBudget;
 }
 
 export function readConfig(cwd = process.cwd()): BridgeConfig {
@@ -480,23 +523,25 @@ export function rememberSessionWindowHandle(
   cwd = process.cwd(),
   hwnd?: string,
 ): string | undefined {
+  const config = readConfig(cwd);
+  const existing = config.sessionWindows?.[sessionId];
   const capturedHwnd =
     hwnd ?? captureForegroundWindowHandle(terminalTitle(agent, taskId, sessionId));
-  if (!capturedHwnd) return undefined;
-  const config = readConfig(cwd);
+  if (!capturedHwnd && !existing) return undefined;
   writeConfig({
     ...config,
     sessionWindows: {
       ...(config.sessionWindows ?? {}),
       [sessionId]: {
-        hwnd: capturedHwnd,
+        ...existing,
+        hwnd: capturedHwnd ?? existing?.hwnd,
         taskId,
         agent,
         updatedAt: new Date().toISOString(),
       },
     },
   }, cwd);
-  return capturedHwnd;
+  return capturedHwnd ?? existing?.hwnd;
 }
 
 function captureForegroundWindowHandle(title?: string): string | undefined {
@@ -557,6 +602,7 @@ export function cleanupStaleAgentSessions(
     untrackedStaleAfterMs?: number;
     windowCheckIntervalMs?: number;
     isSessionWindowAlive?: (hwnd: string) => boolean | undefined;
+    isSessionProcessAlive?: (pid: number) => boolean;
   } = {},
 ): number {
   const config = readConfig(cwd);
@@ -573,7 +619,24 @@ export function cleanupStaleAgentSessions(
     if (terminalSessionKinds.has(event.kind)) continue;
     const tracked = Boolean(activeSessions[event.sessionId]);
     const ageMs = nowMs - Date.parse(event.createdAt);
-    const hwnd = config.sessionWindows?.[event.sessionId]?.hwnd;
+    const sessionWindow = config.sessionWindows?.[event.sessionId];
+    const processAlive = sessionWindow?.pid
+      ? (options.isSessionProcessAlive ?? isSessionProcessAlive)(sessionWindow.pid)
+      : undefined;
+    if (processAlive === true) continue;
+    if (processAlive === false) {
+      store.recordSessionEvent({
+        sessionId: event.sessionId,
+        taskId: event.taskId,
+        agent: event.agent,
+        kind: "session_ended",
+        summary: `${agentLabel(event.agent)} session marked ended after its terminal process closed.`,
+      });
+      endAgentSession(event.sessionId, cwd);
+      closed += 1;
+      continue;
+    }
+    const hwnd = sessionWindow?.hwnd;
     const windowAlive = hwnd
       ? cachedSessionWindowAlive(
           hwnd,
@@ -608,6 +671,16 @@ export function cleanupStaleAgentSessions(
   }
 
   return closed;
+}
+
+function isSessionProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function cachedSessionWindowAlive(
@@ -679,6 +752,25 @@ export function rememberSessionTask(
       delete sessionTasks[stale];
   }
   writeConfig({ ...config, sessionTasks }, cwd);
+}
+
+export function syncTerminalNativeSession(
+  terminalSessionId: string,
+  nativeSessionId: string,
+  cwd = process.cwd(),
+): "initial" | "same" | "changed" {
+  const config = readConfig(cwd);
+  const previous = config.terminalNativeSessions?.[terminalSessionId];
+  if (previous === nativeSessionId) return "same";
+  const terminalNativeSessions = { ...(config.terminalNativeSessions ?? {}) };
+  delete terminalNativeSessions[terminalSessionId];
+  terminalNativeSessions[terminalSessionId] = nativeSessionId;
+  const keys = Object.keys(terminalNativeSessions);
+  if (keys.length > 100) {
+    for (const stale of keys.slice(0, keys.length - 100)) delete terminalNativeSessions[stale];
+  }
+  writeConfig({ ...config, terminalNativeSessions }, cwd);
+  return previous ? "changed" : "initial";
 }
 
 // Consume the one-shot marker set at SessionStart. The first prompt in a new
@@ -848,6 +940,159 @@ export function syncCurrentTaskArtifact(
   if (!task) throw new Error(`Current task missing from database: ${taskId}`);
   writeCurrentTaskArtifact(task, cwd);
   return task;
+}
+
+// Recompile the shared context artifact for one agent. `.agent-memory/compiled-context.md`
+// is a single file stamped with whoever compiled it last, so every integration
+// has to call this on its own prompt event: an agent that never compiles reads
+// another agent's view of the task, or a view several turns out of date.
+export function writeCompiledContextFor(
+  store: SQLiteMemoryStore,
+  cwd: string,
+  taskId: string,
+  agent: AgentKind,
+) {
+  const config = readConfig(cwd);
+  syncCurrentTaskArtifact(store, taskId, cwd);
+  const repoMap =
+    config.graph?.injectRepoMap !== false && store.getGraphStats().files > 0
+      ? renderRepoMap(
+          store.buildRepoMap({ limit: config.graph?.repoMapLimit ?? 30 }),
+        )
+      : undefined;
+  const pack = compileContext(store, {
+    taskId,
+    agent,
+    tokenBudget: resolveTokenBudget(cwd),
+    ...policyBudgets(cwd),
+    repoMap,
+  });
+  writeFileSync(paths(cwd).compiledContext, `${pack.renderedMarkdown}\n`, "utf8");
+  const taskContextPath = join(paths(cwd).tasks, taskId, "compiled-context.md");
+  mkdirSync(dirname(taskContextPath), { recursive: true });
+  writeFileSync(taskContextPath, `${pack.renderedMarkdown}\n`, "utf8");
+  return pack;
+}
+
+// Every unfinished task can carry its own handoff, so "which handoff do I
+// continue?" is really "which task is this prompt about?". Score the prompt
+// against each open task's title, goal and handoff text; an explicit
+// continuation phrase ("tiếp tục", "continue", ...) lowers the bar but never
+// replaces evidence, so an unrelated new request still starts a new task.
+const continuationPhrase =
+  /(ti[eế]p t[uụ]c|l[aà]m ti[eế]p|l[aà]m n[oố]t|ho[aà]n thi[eệ]n|continue|resume|carry on|pick up where|finish the)/i;
+const stopWords = new Set([
+  "that", "this", "with", "from", "into", "have", "then", "when", "what",
+  "please", "should", "would", "could", "there", "their", "about", "cho",
+  "cua", "cùng", "được", "duoc", "trong", "theo", "nhung", "nhưng", "này",
+  "nay", "vào", "vao", "task", "file", "code", "hãy", "hay", "cần", "can",
+]);
+
+export type ContinuationMatch = {
+  task: Task;
+  handoff?: Handoff;
+  score: number;
+};
+
+type ContinuationStore = {
+  getTask(id: string): Task | undefined;
+  listTasks(limit?: number): Task[];
+  getLatestHandoff(taskId: string): Handoff | undefined;
+};
+
+export function findContinuationTask(
+  store: ContinuationStore,
+  prompt: string,
+  options: { excludeTaskId?: string; agent?: AgentKind } = {},
+): ContinuationMatch | undefined {
+  const promptTerms = significantTerms(prompt);
+  if (!promptTerms.size) return undefined;
+  const explicit = continuationPhrase.test(prompt);
+
+  let best: ContinuationMatch | undefined;
+  for (const task of store.listTasks(50)) {
+    if (terminalTaskStatuses.has(task.status)) continue;
+    if (task.id === options.excludeTaskId) continue;
+    const handoff = store.getLatestHandoff(task.id);
+    const haystack = significantTerms(
+      [
+        task.title,
+        task.goal ?? "",
+        handoff?.summary ?? "",
+        ...(handoff?.next ?? []),
+        ...(handoff?.filesChanged ?? []),
+      ].join(" "),
+    );
+    let overlap = 0;
+    for (const term of promptTerms) if (haystack.has(term)) overlap += 1;
+    if (!overlap) continue;
+    // A handoff is what makes a task resumable at all, so it outweighs a bare
+    // title match; an explicit "continue" phrase is worth one extra term.
+    const score = overlap + (handoff ? 1 : 0) + (explicit ? 1 : 0);
+    if (!best || score > best.score) best = { task, handoff, score };
+  }
+
+  const threshold = explicit ? 3 : 4;
+  return best && best.score >= threshold ? best : undefined;
+}
+
+function significantTerms(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter((word) => word.length >= 4 && !stopWords.has(word)),
+  );
+}
+
+// Rebind this session to the task the prompt is continuing. Returns the task id
+// to work with: the matched one when the prompt continues earlier work, the
+// caller's own otherwise. A placeholder task the integration had just opened
+// for this session is removed so the board does not fill with empty shells.
+export function adoptContinuationTask(
+  store: SQLiteMemoryStore,
+  cwd: string,
+  input: {
+    prompt: string;
+    agent: AgentKind;
+    sessionId?: string;
+    currentTaskId: string | null;
+  },
+): { taskId: string | null; adopted?: ContinuationMatch } {
+  const current = input.currentTaskId
+    ? store.getTask(input.currentTaskId)
+    : undefined;
+  // A task that already has real work on it is the session's task, not a shell
+  // waiting to be reassigned; only an unnamed placeholder may be replaced.
+  if (current && !shouldSeedTitle(current)) {
+    return { taskId: current.id };
+  }
+  const match = findContinuationTask(store, input.prompt, {
+    excludeTaskId: input.currentTaskId ?? undefined,
+    agent: input.agent,
+  });
+  if (!match) return { taskId: input.currentTaskId };
+
+  store.updateTask(match.task.id, { status: "in_progress" });
+  rememberSessionTask(input.sessionId, match.task.id, cwd);
+  setCurrentTask(match.task.id, cwd, input.agent);
+  writeCurrentTaskArtifact(
+    store.getTask(match.task.id) ?? match.task,
+    cwd,
+  );
+  store.recordSessionEvent({
+    sessionId: input.sessionId ?? `${input.agent}-continuation`,
+    taskId: match.task.id,
+    agent: input.agent,
+    kind: "session_resumed",
+    summary: `${input.agent} continued task "${match.task.title}" from its handoff.`,
+  });
+  if (current && store.listMemoriesForTask(current.id, 1).length === 0) {
+    store.deleteTask(current.id);
+    syncAfterTaskDeleted(store, current.id, cwd);
+    setCurrentTask(match.task.id, cwd, input.agent);
+  }
+  return { taskId: match.task.id, adopted: match };
 }
 
 // Redact secrets from text before it is persisted, unless the project config

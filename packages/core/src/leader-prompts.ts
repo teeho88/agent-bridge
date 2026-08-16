@@ -37,7 +37,11 @@ export function renderPlanPrompt(input: {
   maxParallel: number;
   availableProviders: string[];
   providerModels?: Record<string, string[]>;
-  agentRoster?: Array<{ name: string; provider: string; model?: string; capabilities: string[] }>;
+  agentRoster?: Array<{ name: string; description?: string; provider: string; model?: string; capabilities: string[] }>;
+  // True when the providers above are installed CLIs with no registered agent
+  // yet: the orchestrator registers one on first use, so the roster is not the
+  // hard boundary it normally is.
+  autoStaff?: boolean;
   revision?: PlanRevisionInput;
   answers?: Array<{ question: string; answer: string }>;
 }): string {
@@ -51,7 +55,7 @@ export function renderPlanPrompt(input: {
     "",
     ...renderProviderList(input.availableProviders, input.providerModels, input.agentRoster),
     `The orchestrator will run at most ${input.maxParallel} implementer(s) in parallel.`,
-    ...renderStaffingRules(input.availableProviders),
+    ...renderStaffingRules(input.availableProviders, input.autoStaff),
   );
   if (input.contextHint) lines.push("", "## Context", "", input.contextHint);
   if (input.revision) lines.push(...renderRevisionSection(input.revision));
@@ -147,7 +151,7 @@ export function renderPlanPrompt(input: {
 function renderProviderList(
   providers: string[],
   models?: Record<string, string[]>,
-  roster?: Array<{ name: string; provider: string; model?: string; capabilities: string[] }>,
+  roster?: Array<{ name: string; description?: string; provider: string; model?: string; capabilities: string[] }>,
 ): string[] {
   if (!providers.length) return ["Available agent providers in this workspace: none registered yet."];
   const lines = [`Available agent providers for this team: ${providers.join(", ")}.`];
@@ -159,30 +163,43 @@ function renderProviderList(
     lines.push("", "Registered agents and enforced capabilities:");
     for (const agent of roster) {
       lines.push(
-        `- ${agent.name}: ${agent.provider}${agent.model ? `/${agent.model}` : ""} — capabilities: ${agent.capabilities.join(", ") || "none"}`,
+        `- ${agent.name}: ${agent.provider}${agent.model ? `/${agent.model}` : ""} — capabilities: ${agent.capabilities.join(", ") || "none"}${agent.description ? ` — expertise: ${agent.description}` : ""}`,
       );
     }
   }
   return lines;
 }
 
-function renderStaffingRules(providers: string[]): string[] {
-  const lines = [
-    "",
-    "## Staffing Rules",
-    // This is enforced, not advisory: the orchestrator resolves every
-    // agentPreference against the user's registered, enabled agents and will
-    // not create a new one. Saying so up front is cheaper than a plan that
-    // fails at spawn time.
-    "- Staff ONLY from the roster above. It is the complete list of agents the user has enabled; any other provider or model id is rejected when the subtask is spawned.",
-    "- Every subtask agentPreference MUST resolve to an agent whose capabilities include `implement`.",
-    "- Every reviewer agentPreference MUST resolve to an agent whose capabilities include `review`.",
-    "- Capabilities are enforced at spawn time. Never assign implement or review work to an agent missing that exact capability.",
-    "- Do not invent, request, or assume an agent that is not listed, even if you know its CLI exists on this machine.",
-  ];
+function renderStaffingRules(providers: string[], autoStaff = false): string[] {
+  const lines = autoStaff
+    ? [
+        "",
+        "## Staffing Rules",
+        // No agent is registered yet, so the providers above are installed CLIs
+        // the orchestrator will register on first use. Telling the leader it may
+        // only use "the roster" here would leave it with nothing to staff at all.
+        "- The providers above are installed on this machine but have no registered agent yet. The orchestrator registers one automatically the first time you staff them, so you may use any of them.",
+        "- Stay within that provider list. A provider outside it cannot be launched and is rejected when the subtask is spawned.",
+        "- Every subtask agentPreference is staffed for `implement`; every reviewer agentPreference for `review`.",
+      ]
+    : [
+        "",
+        "## Staffing Rules",
+        // This is enforced, not advisory: the orchestrator resolves every
+        // agentPreference against the user's registered, enabled agents first.
+        // Saying so up front is cheaper than a plan that gets silently re-staffed.
+        "- Staff from the roster above. It is the list of agents the user has enabled, and it is what the orchestrator resolves every agentPreference against.",
+        "- Every subtask agentPreference MUST resolve to an agent whose capabilities include `implement`.",
+        "- Every reviewer agentPreference MUST resolve to an agent whose capabilities include `review`.",
+        "- Capabilities are enforced at spawn time. Never assign implement or review work to an agent missing that exact capability.",
+        "- Do not invent a provider that is not listed: the list is the user's allowlist, and anything outside it is rejected at spawn time.",
+      ];
   if (providers.length > 1) {
     lines.push(
-      "- You are NOT limited to your own provider. Mix them deliberately across subtasks and reviewers.",
+      "- You are NOT limited to your own provider. Your own provider has no staffing preference or tie-break advantage.",
+      "- Choose the best eligible agent for each job from its capabilities and expertise description; then use provider/model fit and quota diversity as secondary considerations.",
+      "- In each `reason`, cite the selected agent's relevant expertise. If its expertise is not specified, do not invent strengths or default to your own provider.",
+      "- Mix providers deliberately across subtasks and reviewers when their expertise fits.",
       "- Spread the load so no single provider's quota carries the whole project; if one provider does every subtask, that is a planning mistake.",
       "- Have a reviewer come from a different provider than the implementer whose work it reviews — a second vendor catches what the first one is blind to.",
       "- Still match the agent to the job: say in `reason` why that provider/model fits this subtask, not just that it was next in the rotation.",
@@ -235,6 +252,7 @@ export function renderAdjudicatePrompt(input: {
   maxCycles: number;
   availableProviders?: string[];
   providerModels?: Record<string, string[]>;
+  autoStaff?: boolean;
   actor?: "leader" | "adjudicator";
   adjudicatorProposal?: string;
 }): string {
@@ -266,7 +284,7 @@ export function renderAdjudicatePrompt(input: {
     lines.push(
       "",
       ...renderProviderList(input.availableProviders, input.providerModels),
-      ...renderStaffingRules(input.availableProviders),
+      ...renderStaffingRules(input.availableProviders, input.autoStaff),
     );
   }
   lines.push("", "## Subtask Status");

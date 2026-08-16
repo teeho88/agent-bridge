@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import type { Command } from "commander";
 import type { AgentKind } from "@agent-bridge/memory";
+import { firstLineSummary } from "@agent-bridge/core";
 import {
   endAgentSession,
   rememberSessionWindowHandle,
@@ -62,7 +63,7 @@ export function registerSession(program: Command): void {
         const summary = text.trim();
         if (!summary) throw new Error("Session summary cannot be empty.");
         store.upsertLatestMemory(
-          { taskId, type: "note", content: `${agentLabel(agent)} latest response: ${summary}`, importance: 3, sourceAgent: agent, tags: [agent, "latest-response"] },
+          { taskId, type: "note", content: `${agentLabel(agent)} latest response: ${summary}`, summary: `${agentLabel(agent)} latest response: ${firstLineSummary(summary)}`, importance: 3, sourceAgent: agent, tags: [agent, "latest-response"] },
           { latestTag: "latest-response", legacyContentPrefix: `${agentLabel(agent)} latest response:` },
         );
         const task = applyTaskLabelSuggestion(store, taskId, { titleText: summary, goalText: summary });

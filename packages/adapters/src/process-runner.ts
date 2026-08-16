@@ -273,6 +273,12 @@ export function spawnAgentRun(
 
   let run = store.createAgentRun({
     ...runInput,
+    // Stamp what this run was actually launched with. Without it the row keeps
+    // provider/model/effort empty and the board can only guess from the agent
+    // record, which hides the effort level and lies once the agent is edited.
+    provider: runInput.provider ?? preview.provider,
+    model: runInput.model ?? preview.model,
+    reasoningEffort: runInput.reasoningEffort ?? preview.reasoningEffort,
     command: preview.command,
     cwd: preview.cwd,
     status: "starting",

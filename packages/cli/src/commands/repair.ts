@@ -11,7 +11,13 @@ import {
   shouldRepairText,
   type RepairOptions
 } from "@agent-bridge/memory";
-import { openStore, paths, policyBudgets, readConfig } from "../workspace.js";
+import {
+  openStore,
+  paths,
+  policyBudgets,
+  readConfig,
+  resolveTokenBudget,
+} from "../workspace.js";
 
 const repairableExtensions = new Set([".md", ".json", ".txt", ".yaml", ".yml"]);
 
@@ -51,7 +57,7 @@ export function registerRepair(program: Command): void {
             const pack = compileContext(store, {
               taskId: config.currentTaskId,
               agent: config.defaultAgent,
-              tokenBudget: config.tokenBudget,
+              tokenBudget: resolveTokenBudget(),
               ...policyBudgets()
             });
             writeFileSync(p.compiledContext, `${pack.renderedMarkdown}\n`, "utf8");

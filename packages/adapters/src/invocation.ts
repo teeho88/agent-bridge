@@ -8,6 +8,8 @@ export type AgentInvocation = {
   provider: RegisteredAgent["provider"];
   agentId: string;
   agentName: string;
+  model?: string;
+  reasoningEffort?: string;
   executable?: string;
   args?: string[];
   command?: string;
@@ -39,6 +41,8 @@ export function buildSpawnPreview(
     provider: agent.provider,
     agentId: agent.id,
     agentName: agent.name,
+    model: agent.model,
+    reasoningEffort: agent.reasoningEffort,
     promptArtifactPath,
     cwd,
   };

@@ -27,6 +27,14 @@ export type CompileContextInput = {
   // omitted, the compiler falls back to fractions of tokenBudget.
   memoryTokenBudget?: number;
   fileTokenBudget?: number;
+  // Caps the rendered handoff (its list fields; the summary is always kept) and
+  // the injected repo map, so neither can crowd out the task-specific sections.
+  handoffTokenBudget?: number;
+  repoMapTokenBudget?: number;
+  // The stable cache prefix (constraints + known decisions) also grows without
+  // bound as a task accumulates rules, so it gets its own caps.
+  constraintTokenBudget?: number;
+  decisionTokenBudget?: number;
   // Pre-rendered repository knowledge graph map (from the graph index). When
   // present it is injected as a compact "## Repo Map" section so the agent can
   // navigate the repo without reading every file. Supplied by the CLI, which
@@ -39,6 +47,19 @@ export type CompileContextInput = {
   // from raw current-state memory so the next agent gets a compact operating
   // brief before historical notes.
   sharedMemoryTokenBudget?: number;
+};
+
+// Per-section count of entries dropped by the token budgets. Rendered into the
+// markdown so an agent reading the pack can tell truncated sections from
+// genuinely empty ones.
+export type OmittedCounts = {
+  currentState: number;
+  sharedMemory: number;
+  relevantFiles: number;
+  repoMap: number;
+  handoff: number;
+  constraints: number;
+  knownDecisions: number;
 };
 
 export type PromptPack = {
@@ -54,6 +75,7 @@ export type PromptPack = {
   handoff?: Handoff;
   repoMap?: string;
   currentAssignment?: CurrentAssignmentContext;
+  omitted: OmittedCounts;
   tokenEstimate: number;
   renderedMarkdown: string;
 };

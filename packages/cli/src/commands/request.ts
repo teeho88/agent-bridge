@@ -338,7 +338,7 @@ function recordAssignmentOutcome(
     sourceAgent: request.agent,
     dedupe: false,
   });
-  store.createHandoff({
+  store.upsertTaskHandoff({
     taskId: assignment.taskId,
     fromAgent: request.agent,
     summary: safeContent,

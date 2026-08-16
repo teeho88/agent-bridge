@@ -1,5 +1,8 @@
 import type Database from "better-sqlite3";
 import {
+  agentDescriptionColumnStatements,
+  agentPresetColumnStatements,
+  agentPresetHiddenColumnStatements,
   agentArchiveColumnStatements,
   antigravityCommandRepointStatements,
   agentRunCycleColumnStatements,
@@ -55,7 +58,10 @@ const migrations: Migration[] = [
   { version: 19, statements: agentArchiveColumnStatements },
   { version: 20, statements: agentRunCycleColumnStatements },
   { version: 21, statements: orchestrationTeamProvidersColumnStatements },
-  { version: 22, statements: antigravityCommandRepointStatements }
+  { version: 22, statements: antigravityCommandRepointStatements },
+  { version: 23, statements: agentDescriptionColumnStatements },
+  { version: 24, statements: agentPresetColumnStatements },
+  { version: 25, statements: agentPresetHiddenColumnStatements }
 ];
 
 // Register custom SQL functions on a connection. The `fold` function is called
@@ -84,7 +90,16 @@ export function runMigrations(db: Database.Database): void {
   const migrate = db.transaction(() => {
     for (const migration of pending) {
       for (const statement of migration.statements) {
-        db.prepare(statement).run();
+        try {
+          db.prepare(statement).run();
+        } catch (error) {
+          // A column-adding migration is skipped when the column is already
+          // there: a database can reach a newer shape than its recorded
+          // user_version (repaired files, rewound versions), and re-running the
+          // ALTER would otherwise abort the whole upgrade.
+          const message = error instanceof Error ? error.message : String(error);
+          if (!/duplicate column name/i.test(message)) throw error;
+        }
       }
       db.pragma(`user_version = ${migration.version}`);
     }

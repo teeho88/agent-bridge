@@ -58,6 +58,15 @@ describe("renderPromptPack cache layout", () => {
       constraints: ["Do not touch payment auth flow"],
       nextActions: [],
       risks: [],
+      omitted: {
+        currentState: 0,
+        sharedMemory: 0,
+        relevantFiles: 0,
+        repoMap: 0,
+        handoff: 0,
+        constraints: 0,
+        knownDecisions: 0,
+      },
     });
 
     const { prefix, suffix } = splitCacheable(markdown);

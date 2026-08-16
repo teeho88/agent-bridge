@@ -15,7 +15,8 @@ export function claudeManagedSection(): string {
 - After the edit is recorded with \`brief-auto --task-edited\`, release the lease with \`agent-bridge file release "<lease-id>"\`.
 - Work-Git leases are enforced by \`brief-auto --task-edited\`; if another task holds the file, coordinate through handoff/request and do not edit it.
 - After reading a relevant source/config/test/doc file, run \`agent-bridge graph brief-auto "<repo-relative-path>"\`.
-- After editing a relevant source/config/test/doc file, run \`agent-bridge graph brief-auto "<repo-relative-path>" --task-edited\`.
+- After editing a relevant source/config/test/doc file, run \`agent-bridge graph brief-auto "<repo-relative-path>" --task-edited --agent claude\`.
+- Always pass \`--agent claude\` with \`--task-edited\`; without it the lease check resolves the default agent's task and rejects your own lease.
 - You may pass multiple paths to one \`brief-auto\` call. Skip generated/vendor files and unrelated files.
 - Update \`.agent-memory/handoff.md\` after meaningful progress.
 

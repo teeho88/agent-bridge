@@ -46,7 +46,7 @@ export function registerHandoff(program: Command): void {
         try {
           const taskId = options.task ?? getActiveTaskId(store, undefined, undefined, options.from);
           syncCurrentTaskArtifact(store, taskId);
-          const created = store.createHandoff({
+          const created = store.upsertTaskHandoff({
             taskId,
             fromAgent: options.from,
             toAgent: options.to,

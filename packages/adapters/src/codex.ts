@@ -33,10 +33,21 @@ At the start of work:
    After meaningful progress, save a short state with \`agent-bridge session summary "<state>" --agent codex\`; finish with \`agent-bridge session end --agent codex\`.
 
 ## Compiled Context
-See \`.agent-memory/compiled-context.md\`.
+See \`.agent-memory/compiled-context.md\`. The agent-bridge hook recompiles it for
+codex on every user prompt, so it is always current when you open it — but reading
+it costs tokens, so do not re-read it every turn. Read it once at the start of
+work, then again only when:
+- the task changes, or the user asks you to continue work you did not do yourself;
+- the user refers to another agent's work, a handoff, or an earlier decision;
+- you are about to edit and no longer hold this task's constraints and handoff.
+Within one task, keep working from what you already read.
 
 ## Handoff
-See \`.agent-memory/handoff.md\` if present.
+The \`## Latest Handoff\` section of \`.agent-memory/compiled-context.md\` carries the
+current handoff of the task you are on, whichever agent wrote it. When a prompt
+continues work someone else started, re-read that section — it is the context to
+work from. Rewrite it for the next agent with \`agent-bridge handoff create\` — one
+handoff per task, so your packet replaces the previous one.
 
 ## Work-Git Rules
 - Before editing any source/config/test/doc file for task work, acquire a write lease:
@@ -57,9 +68,10 @@ See \`.agent-memory/handoff.md\` if present.
   \`\`\`
 - After editing any source/config/test/doc file, run:
   \`\`\`bash
-  agent-bridge graph brief-auto "<repo-relative-path>" --task-edited
+  agent-bridge graph brief-auto "<repo-relative-path>" --task-edited --agent codex
   \`\`\`
   The first \`--task-edited\` brief moves the task from \`todo\` to \`in_progress\`.
+  Always pass \`--agent codex\`; without it the lease check resolves the default agent's task and rejects your own lease.
 - You may pass multiple paths to one \`brief-auto\` call. Skip generated/vendor files and files outside the current task.
 
 ## Completion Rules

@@ -1,8 +1,12 @@
-import { orderByRelevance, type MemoryStore } from "@agent-bridge/memory";
+import {
+  orderByRelevance,
+  type Handoff,
+  type MemoryStore,
+} from "@agent-bridge/memory";
 import {
   dedupeStrings,
   estimateTokens,
-  trimToTokenBudget,
+  trimToTokenBudgetDetailed,
 } from "./token-optimizer.js";
 import { renderPromptPack } from "./prompt-pack.js";
 import type { CompileContextInput, PromptPack } from "./types.js";
@@ -31,12 +35,10 @@ export function compileContext(
   const memories = orderByRelevance(allMemories, ranked);
   const decisions = store.listDecisions(task.id);
   const files = input.includeFiles === false ? [] : store.listFileSummaries();
-  const latestHandoff = store.getLatestHandoff(task.id);
-  const handoff =
-    latestHandoff &&
-    (!latestHandoff.toAgent || latestHandoff.toAgent === input.agent)
-      ? latestHandoff
-      : undefined;
+  // A handoff belongs to the task, not to one agent: whoever picks the task up
+  // next needs it, and that is rarely the agent named in `toAgent` (which is
+  // only an advisory hint about who was expected to continue).
+  const handoff = store.getLatestHandoff(task.id);
   const currentAssignment = resolveCurrentAssignment(store, task.id, input);
 
   const memoryBudget =
@@ -44,7 +46,7 @@ export function compileContext(
   const fileBudget =
     input.fileTokenBudget ?? Math.floor(input.tokenBudget * 0.2);
 
-  const currentState = trimToTokenBudget(
+  const currentStateTrim = trimToTokenBudgetDetailed(
     dedupeStrings(
       memories
         .filter(
@@ -58,25 +60,37 @@ export function compileContext(
     ),
     memoryBudget,
   );
+  const currentState = currentStateTrim.items;
 
-  const constraints = dedupeStrings(
-    memories
-      .filter((memory) => memory.type === "constraint")
-      .map((memory) => memory.summary || memory.content),
-  );
-
-  const knownDecisions = dedupeStrings([
-    ...decisions.map((decision) =>
-      decision.reason
-        ? `${decision.decision} - ${decision.reason}`
-        : decision.decision,
+  // Constraints and decisions sit in the cache prefix, which made them easy to
+  // leave uncapped - but a long-lived task keeps adding rules, and an unbounded
+  // prefix silently eats the budget the dynamic sections were sized against.
+  const constraintsTrim = trimToTokenBudgetDetailed(
+    dedupeStrings(
+      memories
+        .filter((memory) => memory.type === "constraint")
+        .map((memory) => memory.summary || memory.content),
     ),
-    ...memories
-      .filter((memory) => memory.type === "decision")
-      .map((memory) => memory.summary || memory.content),
-  ]);
+    input.constraintTokenBudget ?? Math.floor(input.tokenBudget * 0.1),
+  );
+  const constraints = constraintsTrim.items;
 
-  const relevantFiles = trimToTokenBudget(
+  const knownDecisionsTrim = trimToTokenBudgetDetailed(
+    dedupeStrings([
+      ...decisions.map((decision) =>
+        decision.reason
+          ? `${decision.decision} - ${decision.reason}`
+          : decision.decision,
+      ),
+      ...memories
+        .filter((memory) => memory.type === "decision")
+        .map((memory) => memory.summary || memory.content),
+    ]),
+    input.decisionTokenBudget ?? Math.floor(input.tokenBudget * 0.1),
+  );
+  const knownDecisions = knownDecisionsTrim.items;
+
+  const relevantFilesTrim = trimToTokenBudgetDetailed(
     dedupeStrings([
       ...files.map((file) =>
         file.summary ? `${file.path}: ${file.summary}` : file.path,
@@ -87,6 +101,7 @@ export function compileContext(
     ]),
     fileBudget,
   );
+  const relevantFiles = relevantFilesTrim.items;
 
   const nextActions = dedupeStrings([
     ...(handoff?.next ?? []),
@@ -106,7 +121,7 @@ export function compileContext(
   // Distilled shared-memory layer: compact operating state for the next agent,
   // not a transcript. It follows the Karpathy-style handoff habit of pinning
   // objective, invariants, decisions, facts, files, next move, and risks first.
-  const sharedMemory = trimToTokenBudget(
+  const sharedMemoryTrim = trimToTokenBudgetDetailed(
     dedupeStrings([
       `Objective: ${task.goal || task.title}`,
       ...constraints.slice(0, 4).map((item) => `Invariant: ${item}`),
@@ -127,6 +142,20 @@ export function compileContext(
     ]),
     sharedMemoryBudget,
   );
+  const sharedMemory = sharedMemoryTrim.items;
+
+  // The handoff and the repo map used to be rendered whole. Both grow without
+  // bound (a long-running task accumulates done/files entries; the repo map
+  // grows with the graph), which let them outweigh the task-specific sections
+  // that were already capped. Give each its own budget.
+  const trimmedHandoff = trimHandoff(
+    handoff,
+    input.handoffTokenBudget ?? Math.floor(input.tokenBudget * 0.15),
+  );
+  const trimmedRepoMap = trimRepoMap(
+    input.repoMap,
+    input.repoMapTokenBudget ?? Math.floor(input.tokenBudget * 0.25),
+  );
 
   const basePack = {
     agent: input.agent,
@@ -143,15 +172,62 @@ export function compileContext(
     constraints,
     nextActions,
     risks,
-    handoff,
-    repoMap: input.repoMap,
+    handoff: trimmedHandoff.handoff,
+    repoMap: trimmedRepoMap.repoMap,
     currentAssignment,
+    omitted: {
+      currentState: currentStateTrim.omitted,
+      sharedMemory: sharedMemoryTrim.omitted,
+      relevantFiles: relevantFilesTrim.omitted,
+      repoMap: trimmedRepoMap.omitted,
+      handoff: trimmedHandoff.omitted,
+      constraints: constraintsTrim.omitted,
+      knownDecisions: knownDecisionsTrim.omitted,
+    },
   };
   const renderedMarkdown = renderPromptPack(basePack);
   return {
     ...basePack,
     tokenEstimate: estimateTokens(renderedMarkdown),
     renderedMarkdown,
+  };
+}
+
+// The summary is the one field a handoff cannot lose, so it is charged against
+// the budget but never dropped. The lists are filled in priority order: what to
+// do next and what to avoid outrank the history of what was already done.
+function trimHandoff(
+  handoff: Handoff | undefined,
+  budget: number,
+): { handoff: Handoff | undefined; omitted: number } {
+  if (!handoff) return { handoff: undefined, omitted: 0 };
+  let remaining = Math.max(0, budget - estimateTokens(handoff.summary));
+  let omitted = 0;
+  const take = (items: string[]): string[] => {
+    const result = trimToTokenBudgetDetailed(items, remaining);
+    remaining -= result.used;
+    omitted += result.omitted;
+    return result.items;
+  };
+  const next = take(handoff.next);
+  const risks = take(handoff.risks);
+  const done = take(handoff.done);
+  const filesChanged = take(handoff.filesChanged);
+  return {
+    handoff: { ...handoff, next, risks, done, filesChanged },
+    omitted,
+  };
+}
+
+function trimRepoMap(
+  repoMap: string | undefined,
+  budget: number,
+): { repoMap: string | undefined; omitted: number } {
+  if (!repoMap) return { repoMap: undefined, omitted: 0 };
+  const trimmed = trimToTokenBudgetDetailed(repoMap.split("\n"), budget);
+  return {
+    repoMap: trimmed.items.join("\n").trim() || undefined,
+    omitted: trimmed.omitted,
   };
 }
 
