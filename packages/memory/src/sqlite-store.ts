@@ -1346,6 +1346,13 @@ export class SQLiteMemoryStore implements MemoryStore {
     ).map(toDecision);
   }
 
+  getFileSummary(path: string): FileSummary | undefined {
+    const row = this.db.prepare("SELECT * FROM files WHERE path = ?").get(path) as
+      | Row
+      | undefined;
+    return row ? toFileSummary(row) : undefined;
+  }
+
   listFileSummaries(): FileSummary[] {
     return (
       this.db

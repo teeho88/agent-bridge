@@ -34,6 +34,8 @@ describe("Claude session lifecycle", () => {
         expect(result.listTasks(10)).toHaveLength(1);
         expect(readConfig(cwd).sessionTasks?.["claude-terminal-1"]).toBe(taskId);
         expect(result.listActiveSessionEvents()).toHaveLength(1);
+        expect(result.getTask(taskId)?.title).toBe("Fix the work board card");
+        expect(result.getTask(taskId)?.goal).toBe("Fix the work board card");
       } finally { result.close(); }
     } finally {
       if (previous === undefined) delete process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID;

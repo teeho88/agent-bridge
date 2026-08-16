@@ -489,7 +489,7 @@ describe("initializeWorkspace", () => {
         "tiếp tục p1.2",
       );
       expect(compiled).toContain("- Title: Knowledge graph scan scoping");
-      expect(compiled).toContain("- Status: in_progress");
+      expect(compiled).toContain("- Task: in_progress");
       expect(
         readFileSync(join(dir, ".agent-memory", "handoff.md"), "utf8"),
       ).toContain("Knowledge graph work completed.");
@@ -501,7 +501,7 @@ describe("initializeWorkspace", () => {
       );
       expect(
         readFileSync(join(dir, ".agent-memory", "compiled-context.md"), "utf8"),
-      ).toContain("- Status: done");
+      ).toContain("- Task: done");
 
       handleClaudeHook({
         cwd: dir,

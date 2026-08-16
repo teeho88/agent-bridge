@@ -1,12 +1,13 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   ANTIGRAVITY_HOOK_VERSION,
   getAntigravityHookStatus,
   handleAntigravityHook,
   installAntigravityHooks,
+  neutralizeHookOutput,
   runManagedAntigravity,
 } from "./antigravity.js";
 import { openStore, readConfig, startAgentSession } from "../workspace.js";
@@ -32,6 +33,18 @@ function plannerResponse(text: string): Record<string, unknown> {
 }
 
 describe("Antigravity hooks", () => {
+  beforeEach(() => {
+    delete process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID;
+    delete process.env.AGENT_BRIDGE_SPAWNED_RUN;
+    delete process.env.AGENT_BRIDGE_HOOK_JSON_B64;
+  });
+
+  afterEach(() => {
+    delete process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID;
+    delete process.env.AGENT_BRIDGE_SPAWNED_RUN;
+    delete process.env.AGENT_BRIDGE_HOOK_JSON_B64;
+  });
+
   it("installs agy lifecycle hooks without dropping other named hooks", () => {
     const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-agy-"));
     try {
@@ -47,10 +60,16 @@ describe("Antigravity hooks", () => {
       const hooks = JSON.parse(readFileSync(join(cwd, ".agents", "hooks.json"), "utf8"));
       expect(hooks["lint-checker"]).toBeDefined();
       const preCommand = hooks["agent-bridge"].PreInvocation[0].command;
+      const preToolCommand = hooks["agent-bridge"].PreToolUse[0].hooks[0].command;
+      const postToolCommand = hooks["agent-bridge"].PostToolUse[0].hooks[0].command;
       const stopCommand = hooks["agent-bridge"].Stop[0].command;
       expect(preCommand).toContain("-EncodedCommand");
+      expect(preToolCommand).toContain("-EncodedCommand");
+      expect(postToolCommand).toContain("-EncodedCommand");
       expect(stopCommand).toContain("-EncodedCommand");
       expect(decodePowerShellCommand(preCommand)).toContain("agent-bridge-antigravity-hook.ps1' 'PreInvocation'");
+      expect(decodePowerShellCommand(preToolCommand)).toContain("agent-bridge-antigravity-hook.ps1' 'PreToolUse'");
+      expect(decodePowerShellCommand(postToolCommand)).toContain("agent-bridge-antigravity-hook.ps1' 'PostToolUse'");
       expect(decodePowerShellCommand(stopCommand)).toContain("agent-bridge-antigravity-hook.ps1' 'Stop'");
       expect(
         readFileSync(join(cwd, ".agents", "agent-bridge-antigravity-hook.ps1"), "utf8"),
@@ -209,6 +228,52 @@ describe("Antigravity hooks", () => {
     }
   });
 
+  it("keeps a launcher terminal on its own card instead of adopting another agent's task", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-agy-adopt-"));
+    const previous = process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID;
+    try {
+      const store = openStore(cwd);
+      const claudeTask = store.createTask({
+        title: "Refactor the workboard session adapter",
+        goal: "Refactor the workboard session adapter registry",
+        ownerAgent: "claude",
+      });
+      store.createHandoff({
+        taskId: claudeTask.id,
+        fromAgent: "claude",
+        summary: "Refactor the workboard session adapter registry so far.",
+        next: ["Finish the workboard adapter registry refactor"],
+      });
+      const terminalTask = store.createTask({
+        title: "Antigravity terminal",
+        ownerAgent: "antigravity",
+      });
+      store.close();
+      startAgentSession("antigravity-terminal-2", terminalTask.id, cwd, "antigravity");
+      process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID = "antigravity-terminal-2";
+      const transcriptPath = writeTranscript(cwd, [
+        userInput("tiep tuc refactor the workboard session adapter registry"),
+      ]);
+
+      handleAntigravityHook({ workspacePaths: [cwd], transcriptPath }, "PreInvocation");
+
+      const finalStore = openStore(cwd);
+      try {
+        expect(readConfig(cwd).sessionTasks?.["antigravity-terminal-2"]).toBe(terminalTask.id);
+        expect(readConfig(cwd).currentTasks?.antigravity).toBe(terminalTask.id);
+        expect(
+          finalStore.listSessionEvents({ taskId: claudeTask.id, limit: 10 }),
+        ).toHaveLength(0);
+      } finally {
+        finalStore.close();
+      }
+    } finally {
+      if (previous === undefined) delete process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID;
+      else process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID = previous;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("tracks a managed agy process on the Work Board for its lifetime", () => {
     const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-agy-managed-"));
     try {
@@ -239,6 +304,257 @@ describe("Antigravity hooks", () => {
       }
       expect(readConfig(cwd).currentTaskId).toBeNull();
       expect(readConfig(cwd).currentTasks?.antigravity).toBeUndefined();
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("creates a question request when ask_question tool is called", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-agy-question-"));
+    try {
+      const transcriptPath = writeTranscript(cwd, [userInput("Help me set up database")]);
+      handleAntigravityHook(
+        { workspacePaths: [cwd], conversationId: "conv-q", transcriptPath },
+        "PreInvocation",
+      );
+
+      handleAntigravityHook(
+        {
+          workspacePaths: [cwd],
+          conversationId: "conv-q",
+          transcriptPath,
+          toolCall: {
+            name: "ask_question",
+            args: {
+              questions: [
+                {
+                  question: "Which database would you like to use?",
+                  options: ["PostgreSQL", "SQLite", "MySQL"],
+                },
+              ],
+            },
+          },
+        },
+        "PreToolUse",
+      );
+
+      const store = openStore(cwd);
+      try {
+        const requests = store.listAgentRequests({ status: "pending", limit: 10 });
+        expect(requests).toHaveLength(1);
+        expect(requests[0]?.agent).toBe("antigravity");
+        expect(requests[0]?.type).toBe("question");
+        expect(requests[0]?.title).toContain("Which database would you like to use?");
+        expect(requests[0]?.payload).toContain("Tool:\nask_question");
+        expect(requests[0]?.payload).toContain("PostgreSQL, SQLite, MySQL");
+      } finally {
+        store.close();
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("answers every PreToolUse call with a decision agy accepts", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-agy-decision-"));
+    try {
+      const transcriptPath = writeTranscript(cwd, [userInput("Run the test suite")]);
+      handleAntigravityHook(
+        { workspacePaths: [cwd], conversationId: "conv-dec", transcriptPath },
+        "PreInvocation",
+      );
+
+      const command = handleAntigravityHook(
+        {
+          workspacePaths: [cwd],
+          conversationId: "conv-dec",
+          transcriptPath,
+          toolCall: { name: "run_command", args: { CommandLine: "npm test" } },
+        },
+        "PreToolUse",
+      );
+      const question = handleAntigravityHook(
+        {
+          workspacePaths: [cwd],
+          conversationId: "conv-dec",
+          transcriptPath,
+          toolCall: { name: "ask_question", args: { question: "Which database?" } },
+        },
+        "PreToolUse",
+      );
+
+      // A gated tool goes through agy's own confirmation; asking the user a
+      // question was never gated, so it stays unprompted.
+      expect(command?.decision).toBe("ask");
+      expect(command?.reason).toContain("npm test");
+      expect(question?.decision).toBe("allow");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("never leaves a PreToolUse reply without a decision", () => {
+    // The hook stays read-only for orchestrator-spawned runs, and a body with
+    // no decision is how agy is told to refuse the tool call.
+    process.env.AGENT_BRIDGE_SPAWNED_RUN = "1";
+    expect(neutralizeHookOutput(undefined, "PreToolUse")).toEqual({ decision: "allow" });
+    expect(neutralizeHookOutput(undefined, "Stop")).toEqual({});
+    expect(neutralizeHookOutput({ decision: "ask" }, "PreToolUse")).toEqual({ decision: "ask" });
+  });
+
+  it("creates an approval request when ask_question contains permission keywords", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-agy-approval-"));
+    try {
+      const transcriptPath = writeTranscript(cwd, [userInput("Apply database migrations")]);
+      handleAntigravityHook(
+        { workspacePaths: [cwd], conversationId: "conv-app", transcriptPath },
+        "PreInvocation",
+      );
+
+      handleAntigravityHook(
+        {
+          workspacePaths: [cwd],
+          conversationId: "conv-app",
+          transcriptPath,
+          toolCall: {
+            name: "ask_question",
+            args: {
+              questions: [
+                {
+                  question: "Please confirm and approve running migration against production db?",
+                  options: ["Approve", "Deny"],
+                },
+              ],
+            },
+          },
+        },
+        "PreToolUse",
+      );
+
+      const store = openStore(cwd);
+      try {
+        const requests = store.listAgentRequests({ status: "pending", limit: 10 });
+        expect(requests).toHaveLength(1);
+        expect(requests[0]?.agent).toBe("antigravity");
+        expect(requests[0]?.type).toBe("approval");
+        expect(requests[0]?.title).toContain("Please confirm and approve running");
+      } finally {
+        store.close();
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("creates a command request when run_command tool is called and resolves it on PostToolUse", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-agy-cmd-"));
+    try {
+      const transcriptPath = writeTranscript(cwd, [userInput("Run test suite")]);
+      handleAntigravityHook(
+        { workspacePaths: [cwd], conversationId: "conv-cmd", transcriptPath },
+        "PreInvocation",
+      );
+
+      handleAntigravityHook(
+        {
+          workspacePaths: [cwd],
+          conversationId: "conv-cmd",
+          transcriptPath,
+          toolCall: {
+            name: "run_command",
+            args: {
+              CommandLine: "npm test",
+              Cwd: cwd,
+            },
+          },
+        },
+        "PreToolUse",
+      );
+
+      const store = openStore(cwd);
+      try {
+        const requests = store.listAgentRequests({ status: "pending", limit: 10 });
+        expect(requests).toHaveLength(1);
+        expect(requests[0]?.agent).toBe("antigravity");
+        expect(requests[0]?.type).toBe("command");
+        expect(requests[0]?.title).toContain("npm test");
+        expect(requests[0]?.payload).toContain("Tool:\nrun_command");
+        expect(requests[0]?.payload).toContain("npm test");
+      } finally {
+        store.close();
+      }
+
+      // Simulate successful tool execution
+      handleAntigravityHook(
+        {
+          workspacePaths: [cwd],
+          conversationId: "conv-cmd",
+          transcriptPath,
+          toolCall: {
+            name: "run_command",
+          },
+        },
+        "PostToolUse",
+      );
+
+      const storeAfter = openStore(cwd);
+      try {
+        const pending = storeAfter.listAgentRequests({ status: "pending", limit: 10 });
+        expect(pending).toHaveLength(0);
+        const resolved = storeAfter.listAgentRequests({ status: "accepted", limit: 10 });
+        expect(resolved).toHaveLength(1);
+        expect(resolved[0]?.status).toBe("accepted");
+        expect(resolved[0]?.response).toContain("run_command completed");
+      } finally {
+        storeAfter.close();
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves tool request as rejected when PostToolUse receives error", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-agy-err-"));
+    try {
+      const transcriptPath = writeTranscript(cwd, [userInput("Run failing script")]);
+      handleAntigravityHook(
+        { workspacePaths: [cwd], conversationId: "conv-err", transcriptPath },
+        "PreInvocation",
+      );
+
+      handleAntigravityHook(
+        {
+          workspacePaths: [cwd],
+          conversationId: "conv-err",
+          transcriptPath,
+          toolCall: {
+            name: "run_command",
+            args: { CommandLine: "exit 1" },
+          },
+        },
+        "PreToolUse",
+      );
+
+      handleAntigravityHook(
+        {
+          workspacePaths: [cwd],
+          conversationId: "conv-err",
+          transcriptPath,
+          toolCall: { name: "run_command" },
+          error: "Permission denied by user",
+        },
+        "PostToolUse",
+      );
+
+      const store = openStore(cwd);
+      try {
+        const resolved = store.listAgentRequests({ status: "rejected", limit: 10 });
+        expect(resolved).toHaveLength(1);
+        expect(resolved[0]?.status).toBe("rejected");
+        expect(resolved[0]?.response).toContain("Permission denied by user");
+      } finally {
+        store.close();
+      }
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

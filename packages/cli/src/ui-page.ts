@@ -1086,6 +1086,7 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     let memoryImportanceTouched = false;
     let handoffEditTouched = false;
     let lastTasks = [];
+    let lastOptionalTools = [];
     let lastState = null;
     let selectedLiveTaskId = '';
     let graphAnim = null;
@@ -1159,6 +1160,7 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       const selected = liveTasks.find(item => item.task.id === selectedLiveTaskId);
       const current = selected ? selected.task : state.currentTask;
       lastTasks = state.tasks || [];
+      lastOptionalTools = state.optionalTools || [];
       const stats = selected?.tokenStats || state.tokenStats || { rawTokens: 0, cleanedTokens: 0, compiledTokens: 0, cacheableTokens: 0, savedTokens: 0, savingsPercent: 0, stages: [] };
       els.workspacePill.textContent = state.workspace || 'Workspace';
       const hookStatus = state.claudeHookStatus || { installed: state.claudeHookInstalled, current: state.claudeHookInstalled };
@@ -1297,7 +1299,47 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
         '<div class="metric-pill"><strong>' + escapeHtml(String(stats.compiledTokens)) + '</strong><span>compiled</span></div>' +
         '<div class="metric-pill"><strong>' + escapeHtml(String(stats.savedTokens)) + '</strong><span>saved ' + escapeHtml(String(stats.savingsPercent)) + '%</span></div>' +
         '</div><details style="margin-top:10px"><summary class="meta" style="cursor:pointer">Show stage breakdown</summary><div class="stack" style="margin-top:8px">' + stages + '</div></details>' +
-        '<div class="muted" style="margin-top:8px">Cacheable: ' + escapeHtml(String(stats.cacheableTokens)) + ' tokens.</div>';
+        renderCacheReportSlot();
+    }
+
+    function ccusageInstalled() {
+      return lastOptionalTools.some(tool => tool.name === 'ccusage' && tool.installed);
+    }
+
+    // Everything above this point is estimated. ccusage reads what the
+    // providers actually billed, so the button is the only way to tell whether
+    // the estimate means anything - and it is useless without ccusage on PATH.
+    function renderCacheReportSlot() {
+      if (!ccusageInstalled()) {
+        return '<div class="muted" style="margin-top:10px">Measured cache usage needs ccusage. Install it with <code>npm i -g ccusage</code>, or use the Install button in Optional Tools.</div>';
+      }
+      return '<div style="margin-top:10px"><button class="secondary" id="cacheReportButton" type="button">Measured cache report</button>' +
+        '<div id="cacheReportBody" style="margin-top:8px"></div></div>';
+    }
+
+    function renderCacheReport(report) {
+      if (!report.ok) return '<div class="muted">' + escapeHtml(report.reason || 'ccusage failed.') + '</div>';
+      // report.days counts days with data; report.window is what was asked for.
+      if (!report.days) return '<div class="muted">No agent usage recorded in the last ' + escapeHtml(String(report.window)) + ' days.</div>';
+
+      const models = (report.models || []).map(model =>
+        '<div class="memory-row"><div class="toolbar" style="justify-content:space-between"><strong>' + escapeHtml(model.model) + '</strong><span class="pill ok">' + escapeHtml(String(model.hitRatePct)) + '%</span></div>' +
+        '<div class="meta">' + fmtNum(model.cacheReadTokens) + ' read from cache · $' + escapeHtml(model.cost.toFixed(2)) + '</div></div>'
+      ).join('');
+
+      // A hit rate is only readable next to what it is a rate of, so the raw
+      // read/write/uncached split stays on screen with it.
+      return '<div class="metric-row">' +
+        '<div class="metric-pill"><strong>' + escapeHtml(String(report.hitRatePct)) + '%</strong><span>cache hit</span></div>' +
+        '<div class="metric-pill"><strong>' + fmtNum(report.cacheReadTokens) + '</strong><span>read</span></div>' +
+        '<div class="metric-pill"><strong>' + fmtNum(report.cacheCreationTokens) + '</strong><span>written</span></div>' +
+        '<div class="metric-pill"><strong>' + fmtNum(report.inputTokens) + '</strong><span>uncached</span></div>' +
+        '<div class="metric-pill"><strong>$' + escapeHtml(report.cost.toFixed(2)) + '</strong><span>cost</span></div>' +
+        '</div>' +
+        '<div class="meta" style="margin-top:6px">Measured by ccusage over ' + escapeHtml(String(report.days)) + ' day(s)' +
+        (report.firstPeriod ? ', ' + escapeHtml(report.firstPeriod) + ' to ' + escapeHtml(report.lastPeriod || 'now') : '') +
+        ' · ' + escapeHtml(String(report.readPerWrite)) + 'x read per write. These are the agent CLIs\\' own cache breakpoints, not agent-bridge\\'s.</div>' +
+        (models ? '<div class="stack" style="margin-top:8px">' + models + '</div>' : '');
     }
 
     function fmtNum(value) {
@@ -2009,6 +2051,25 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     });
 
     document.addEventListener('click', async event => {
+      // The button is rendered into the Token Savings popup, so it only exists
+      // while that popup is open - delegation rather than a bound handler.
+      const cacheReport = event.target.closest && event.target.closest('#cacheReportButton');
+      if (cacheReport) {
+        const body = document.getElementById('cacheReportBody');
+        cacheReport.disabled = true;
+        cacheReport.textContent = 'Reading ccusage...';
+        if (body) body.innerHTML = '';
+        try {
+          const report = await api('/api/cache-report?days=7');
+          if (body) body.innerHTML = renderCacheReport(report);
+        } catch (error) {
+          if (body) body.innerHTML = '<div class="muted">' + escapeHtml(error.message || String(error)) + '</div>';
+        } finally {
+          cacheReport.disabled = false;
+          cacheReport.textContent = 'Measured cache report';
+        }
+        return;
+      }
       const openAgentTerminal = event.target.closest && event.target.closest('.open-agent-terminal');
       if (openAgentTerminal) {
         const agent = openAgentTerminal.dataset.agent || '';

@@ -47,16 +47,34 @@ function assignmentBullets(pack: Omit<PromptPack, "renderedMarkdown" | "tokenEst
   if (current.assignment.riskSummary) items.push(`Risks: ${current.assignment.riskSummary}`);
   return items;
 }
-// Layout is ordered for prompt caching: a STABLE prefix (rules, expected output,
-// constraints, known decisions) comes first, then a cache breakpoint marker,
-// then the DYNAMIC suffix (goal, current state, files, handoff, next actions,
-// risks). Anthropic caches by prefix, so keeping the rarely-changing content at
-// the top lets it be reused across turns. See prompt-cache.ts / docs.
+// Layout is ordered for prompt caching: a STABLE prefix comes first, then a
+// cache breakpoint marker, then the DYNAMIC suffix. Caching is positional — a
+// changed byte invalidates everything after it — so sections are ordered by how
+// often they change, cheapest first, and anything that moves per turn stays out
+// of the prefix entirely:
+//
+//   never      # Agent Task Brief, ## Expected Output (both literal)
+//   per task   ## Task title, ## Goal
+//   sometimes  ## Constraints, ## Known Decisions (a new memory/decision)
+//   on rebuild ## Repo Map — last, because it is the largest block and must not
+//              sit behind anything more volatile than itself
+//
+// Two sections look stable but are not, and belong below the marker. Task
+// STATUS flips todo -> in_progress on the first recorded edit. Shared Memory is
+// distilled from the handoff summary, done list, files changed, and current
+// state (see context-compiler), so it is rewritten on every handoff; parking it
+// above Repo Map would drop ~1.6k cached tokens each time. See prompt-cache.ts.
 export function renderPromptPack(
   pack: Omit<PromptPack, "renderedMarkdown" | "tokenEstimate">,
 ): string {
   const prefix = [
     "# Agent Task Brief",
+    "",
+    "## Task",
+    `- Title: ${toSingleLine(pack.task.title)}`,
+    "",
+    "## Goal",
+    toSingleLine(pack.task.goal ?? "") || "No explicit goal recorded.",
     "",
     "## Expected Output",
     "- Minimal diff.",
@@ -70,13 +88,16 @@ export function renderPromptPack(
     bullets(pack.knownDecisions, pack.omitted.knownDecisions),
   ];
 
+  if (pack.repoMap) {
+    prefix.push("", "## Repo Map", pack.repoMap);
+    if (pack.omitted.repoMap > 0) {
+      prefix.push(omissionNote(pack.omitted.repoMap));
+    }
+  }
+
   const suffix = [
-    "## Task",
-    `- Title: ${toSingleLine(pack.task.title)}`,
-    `- Status: ${pack.task.status}`,
-    "",
-    "## Goal",
-    toSingleLine(pack.task.goal ?? "") || "No explicit goal recorded.",
+    "## Status",
+    `- Task: ${pack.task.status}`,
     "",
     "## Current Assignment",
     bullets(assignmentBullets(pack)),
@@ -90,13 +111,6 @@ export function renderPromptPack(
     "## Relevant Files",
     bullets(pack.relevantFiles, pack.omitted.relevantFiles),
   ];
-
-  if (pack.repoMap) {
-    suffix.push("", "## Repo Map", pack.repoMap);
-    if (pack.omitted.repoMap > 0) {
-      suffix.push(omissionNote(pack.omitted.repoMap));
-    }
-  }
 
   if (pack.handoff) {
     suffix.push(

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { compileContext } from "./context-compiler.js";
+import { splitCacheable } from "./prompt-cache.js";
 import type { MemoryStore } from "@agent-bridge/memory";
 
 describe("compileContext", () => {
@@ -360,7 +361,10 @@ describe("compileContext", () => {
     expect(pack.knownDecisions.length).toBeLessThan(30);
     expect(pack.omitted.constraints).toBeGreaterThan(0);
     expect(pack.omitted.knownDecisions).toBeGreaterThan(0);
-    const prefix = pack.renderedMarkdown.split("## Task")[0] ?? "";
+    // Truncation notes belong to the constraints and decisions sections, which
+    // live in the cacheable prefix. Anchor on the breakpoint, not on a heading
+    // whose position is free to move.
+    const { prefix } = splitCacheable(pack.renderedMarkdown);
     expect(prefix).toContain("omitted by the token budget");
   });
 

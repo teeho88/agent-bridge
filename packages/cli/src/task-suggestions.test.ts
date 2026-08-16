@@ -42,6 +42,38 @@ describe("task label suggestions", () => {
     }
   });
 
+  it("replaces the provisional Work Board terminal goal with the first task prompt", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-task-suggestion-"));
+    try {
+      const store = openStore(cwd);
+      try {
+        const task = store.createTask({
+          title: "Antigravity terminal",
+          goal: "Interactive Antigravity CLI opened from Work Board.",
+          ownerAgent: "antigravity",
+        });
+
+        const seeded = applyTaskLabelSuggestion(store, task.id, {
+          titleText: "Improve the cache proxy plan",
+          goalText: "Improve the cache proxy plan",
+        });
+        expect(seeded?.title).toBe("Improve the cache proxy plan");
+        expect(seeded?.goal).toBe("Improve the cache proxy plan");
+
+        const second = applyTaskLabelSuggestion(store, task.id, {
+          titleText: "Do not replace the established task",
+          goalText: "Do not replace the established task",
+        });
+        expect(second?.title).toBe("Improve the cache proxy plan");
+        expect(second?.goal).toBe("Improve the cache proxy plan");
+      } finally {
+        store.close();
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("keeps only the first prompt source for delayed Codex seeding", () => {
     const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-task-suggestion-"));
     try {

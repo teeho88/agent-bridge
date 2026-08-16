@@ -218,6 +218,12 @@ export function handleClaudeHook(
           ownerAgent: "claude",
         });
         taskId = task.id;
+      } else {
+        // A Work Board launcher opens the card before any prompt exists, so it
+        // carries a placeholder title ("Claude terminal"). The first real prompt
+        // is what names it; applyTaskLabelSuggestion leaves any other title
+        // alone, so a renamed or TaskCreated card is never clobbered.
+        applyTaskLabelSuggestion(store, taskId, { titleText: prompt, goalText: prompt });
       }
       markTaskInProgress(store, taskId);
       activateClaudeTask(store, cwd, taskId);

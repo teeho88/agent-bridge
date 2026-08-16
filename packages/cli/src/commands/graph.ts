@@ -125,7 +125,12 @@ export function registerGraph(program: Command): void {
         });
 
         if (options.all) console.log(`Refreshed ${results.length} briefs.`);
-        else results.forEach((file) => console.log(`Saved auto brief for ${file.path}${file.manualPriority == null ? "" : ` (priority ${file.manualPriority})`}.`));
+        else
+          results.forEach((file) =>
+            console.log(
+              `${file.reused ? "Reused cached brief for" : "Saved auto brief for"} ${file.path}${file.manualPriority == null ? "" : ` (priority ${file.manualPriority})`}.`
+            )
+          );
       } finally {
         store.close();
       }

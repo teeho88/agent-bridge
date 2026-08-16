@@ -6,7 +6,7 @@ import { splitCacheable } from "./prompt-cache.js";
 export type TokenStackModuleId =
   | "rtk"
   | "claude-token-efficient"
-  | "cache-proxy"
+  | "stable-prefix"
   | "token-optimizer"
   | "repomix"
   | "ccusage";
@@ -62,11 +62,12 @@ export function defaultTokenStackModules(): TokenStackModule[] {
       enabled: true
     },
     {
-      id: "cache-proxy",
-      label: "cache proxy",
-      purpose: "Keep stable context blocks reusable; avoid resending unchanged instructions.",
-      usage: "Currently estimated locally; full proxy integration is optional.",
-      enabled: false
+      id: "stable-prefix",
+      label: "stable prefix layout",
+      purpose: "Order the compiled context so the unchanging part stays byte-identical and a provider can cache it.",
+      usage:
+        "Applied by every `context compile`: sections above the cache breakpoint marker are the reusable prefix. agent-bridge only lays the context out — the provider decides what it actually caches.",
+      enabled: true
     },
     {
       id: "token-optimizer",
@@ -85,9 +86,10 @@ export function defaultTokenStackModules(): TokenStackModule[] {
     {
       id: "ccusage",
       label: "ccusage",
-      purpose: "Optional Claude Code usage and cost viewer.",
-      usage: "After install, run ccusage to inspect Claude Code usage.",
-      enabled: false
+      purpose:
+        "Measure real prompt-cache reads and cost billed to the agent CLIs - the only non-estimated number in this stack.",
+      usage: "Run `agent-bridge optimize cache-report` (requires ccusage on PATH).",
+      enabled: true
     }
   ];
 }
@@ -145,12 +147,13 @@ export function estimateTokenSavings(input: TokenSavingsEstimateInput): TokenSav
             : "Keeps task goal, relevant memories, decisions, handoff, and risks."
       },
       {
-        id: "cache-proxy",
-        label: "Cache proxy",
+        id: "stable-prefix",
+        label: "Stable prefix (cache candidate)",
         beforeTokens: compiledTokens,
         afterTokens: effectiveCompiledTokens,
         savedTokens: cacheableTokens,
-        note: "Estimated reusable stable context; dynamic task state should not be cached."
+        note:
+          "Potential, not realised: the size of the prefix above the cache breakpoint. It only becomes a saving if the provider caches it and the same prefix is resent within its TTL. Run `optimize cache-report` for measured cache reads."
       },
       {
         id: "token-optimizer",
@@ -169,11 +172,17 @@ function renderTaskRaw(task?: Task): string {
   return [task.title, task.goal ?? "", task.status, task.ownerAgent ?? ""].filter(Boolean).join("\n");
 }
 
-// Sections of the compiled context that change rarely between turns and are
-// therefore good Anthropic prompt-cache breakpoints (cache_control). Exported
-// so an integration layer can place real cache_control markers at the start of
-// each of these headings. See docs/prompt-caching.md.
-export const cacheableSectionHeadings = ["## Constraints", "## Known Decisions", "## Expected Output"] as const;
+// Sections that change rarely between the turns of one task. These mirror the
+// prefix built by renderPromptPack and are only used as a fallback for older
+// packs that predate the cache breakpoint marker. See docs/prompt-caching.md.
+export const cacheableSectionHeadings = [
+  "## Task",
+  "## Goal",
+  "## Expected Output",
+  "## Constraints",
+  "## Known Decisions",
+  "## Repo Map"
+] as const;
 
 function estimateCacheableTokens(compiledContext: string): number {
   // Preferred path: count the real tokens of the stable prefix (everything

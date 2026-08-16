@@ -29,6 +29,11 @@ const provisionalTitles = new Set([
   "Claude terminal",
   "Antigravity terminal",
 ]);
+const provisionalGoals = new Set([
+  "Interactive Codex CLI opened from Work Board.",
+  "Interactive Claude CLI opened from Work Board.",
+  "Interactive Antigravity CLI opened from Work Board.",
+]);
 
 export function placeholderTaskTitle(agent?: AgentKind): string {
   if (agent === "codex") return "Codex session";
@@ -89,7 +94,9 @@ export function applyTaskLabelSuggestion(
   const title = shouldSeedTitle(task, input.replaceAutoTitle === true)
     ? titleFromSuggestion(titleText || goalText || "")
     : undefined;
-  const goal = !task.goal && goalText ? goalText : undefined;
+  const goal = (!task.goal || provisionalGoals.has(task.goal.trim())) && goalText
+    ? goalText
+    : undefined;
   if (!title && !goal && !input.status) return task;
   return store.updateTask(taskId, {
     title,

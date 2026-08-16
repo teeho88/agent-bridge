@@ -3,6 +3,7 @@ import type { Command } from "commander";
 import { compressLog, loadOptionalTokenizer } from "@agent-bridge/core";
 import { openStore, parseList, paths, readConfig, resolveCurrentTaskId } from "../workspace.js";
 import { computeBaseline, formatBaselineRunSummary, parseBaselineRun } from "../optimize-baseline.js";
+import { daysAgoStamp, readCacheUsage } from "../cache-report.js";
 
 const fmt = (value: number): string => value.toLocaleString("en-US");
 
@@ -139,6 +140,76 @@ export function registerOptimize(program: Command): void {
         }
       }
     );
+
+  optimize
+    .command("cache-report")
+    .description(
+      "Show measured prompt-cache usage from ccusage - the real cache reads the providers billed, as opposed to the estimated stable prefix in the token stack"
+    )
+    .option("--days <n>", "how many days back to include", "7")
+    .option("--since <YYYYMMDD>", "explicit start date; overrides --days")
+    .option("--json", "print machine-readable JSON")
+    .action((options: { days: string; since?: string; json?: boolean }) => {
+      const since = options.since ?? daysAgoStamp(Math.max(0, Number(options.days) || 7));
+      const result = readCacheUsage(since);
+      if (!result.ok) {
+        if (options.json) console.log(JSON.stringify({ ok: false, reason: result.reason }, null, 2));
+        else console.log(result.reason);
+        return;
+      }
+
+      const summary = result.summary;
+      if (options.json) {
+        console.log(JSON.stringify({ ok: true, since, ...summary }, null, 2));
+        return;
+      }
+
+      if (!summary.days) {
+        console.log(`No agent usage recorded since ${since}.`);
+        return;
+      }
+
+      console.log("Measured prompt-cache usage (source: ccusage)");
+      console.log(
+        `Window: ${summary.firstPeriod ?? since} to ${summary.lastPeriod ?? "now"} (${summary.days} day${summary.days === 1 ? "" : "s"})`
+      );
+      console.log("");
+      console.log(`Prompt tokens:      ${fmt(summary.promptTokens)}`);
+      console.log(`  read from cache:  ${fmt(summary.cacheReadTokens)}`);
+      console.log(`  written to cache: ${fmt(summary.cacheCreationTokens)}`);
+      console.log(`  sent uncached:    ${fmt(summary.inputTokens)}`);
+      console.log(`Output tokens:      ${fmt(summary.outputTokens)}`);
+      console.log("");
+      console.log(`Cache hit rate:     ${summary.hitRatePct}% of prompt tokens`);
+      console.log(`Read per write:     ${summary.readPerWrite}x`);
+      console.log(`Cost:               $${summary.cost.toFixed(2)}`);
+
+      if (summary.models.length) {
+        console.log("");
+        console.log("By model:");
+        for (const model of summary.models) {
+          console.log(
+            `  ${model.model.padEnd(24)} ${String(model.hitRatePct).padStart(5)}% hit  ${fmt(model.cacheReadTokens).padStart(12)} read  $${model.cost.toFixed(2)}`
+          );
+        }
+      }
+
+      console.log("");
+      // The number only earns its place if it changes a decision, so say which.
+      if (summary.hitRatePct >= 80) {
+        console.log(
+          "Caching is already working: the agent CLIs place their own breakpoints and most of the prompt is being reused. There is little headroom for agent-bridge to add on top."
+        );
+      } else if (summary.readPerWrite < 1 && summary.cacheCreationTokens > 0) {
+        console.log(
+          "More is being written to cache than read back. Prompts are likely changing between turns, or turns are further apart than the cache TTL."
+        );
+      } else {
+        console.log(
+          "Hit rate has headroom. Check that the compiled-context prefix (`optimize report`) is stable across turns before adding anything more."
+        );
+      }
+    });
 
   optimize
     .command("logs")

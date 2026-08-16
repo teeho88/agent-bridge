@@ -41,7 +41,7 @@ describe("estimateTokenSavings", () => {
     expect(estimate.stages.map((stage) => stage.id)).toEqual([
       "rtk",
       "context-compile",
-      "cache-proxy",
+      "stable-prefix",
       "token-optimizer"
     ]);
     expect(estimate.savingsPercent).toBeGreaterThanOrEqual(0);

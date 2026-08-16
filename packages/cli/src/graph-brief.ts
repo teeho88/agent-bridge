@@ -15,9 +15,15 @@ export function contentHash(root: string, path: string): string | undefined {
 
 // Build a brief for one file from the indexed graph data plus the file's own
 // leading comment. Falls back to a one-off extraction when the file is not yet
-// indexed.
-export function automaticBrief(store: Store, root: string, path: string): { summary: string; ranges: string[] } {
-  const indexed = store.listGraphFiles(5000).find((file) => file.path === path);
+// indexed. `indexedFiles` lets a batch caller pay for the graph listing once
+// instead of once per file.
+export function automaticBrief(
+  store: Store,
+  root: string,
+  path: string,
+  indexedFiles?: ReturnType<Store["listGraphFiles"]>
+): { summary: string; ranges: string[] } {
+  const indexed = (indexedFiles ?? store.listGraphFiles(5000)).find((file) => file.path === path);
   let symbols = store.getFileSymbols(path);
   let imports = store.getImports(path);
 
@@ -65,31 +71,55 @@ export type RefreshBriefsOptions = {
   manualPriority?: number; // explicit override
   taskId?: string;
   taskEdited?: boolean;
+  // Rebuild even when the file content is unchanged. `all` implies it: a
+  // whole-repo refresh is usually run right after `graph build`, when the graph
+  // relations a brief draws on have moved even though the files have not.
+  force?: boolean;
 };
 
 // Regenerate briefs for the given files (or all indexed files). Automatic
 // refreshes preserve an existing manual priority and never create one.
+//
+// Briefs are content-addressed: agents run `graph brief-auto` after every file
+// they read, so the same unchanged file is re-briefed many times per session.
+// When the stored last_seen_hash still matches the file on disk we reuse the
+// stored summary and only touch the task metadata, which skips the symbol and
+// import queries plus the fallback extractGraph parse.
 export function refreshBriefs(
   store: Store,
   root: string,
   options: RefreshBriefsOptions
-): { path: string; manualPriority?: number }[] {
-  const targets = options.all ? store.listGraphFiles(5000).map((file) => file.path) : options.paths ?? [];
+): { path: string; manualPriority?: number; reused: boolean }[] {
+  const indexedFiles = store.listGraphFiles(5000);
+  const targets = options.all ? indexedFiles.map((file) => file.path) : options.paths ?? [];
+  const force = options.force || options.all;
 
-  const results: { path: string; manualPriority?: number }[] = [];
+  const results: { path: string; manualPriority?: number; reused: boolean }[] = [];
   for (const target of targets) {
     const normalizedPath = target.replace(/\\/g, "/");
-    const brief = automaticBrief(store, root, normalizedPath);
+    const hash = contentHash(root, normalizedPath);
+    const stored = force ? undefined : store.getFileSummary(normalizedPath);
+    // A hash is only a valid cache key when we can compute one for a file that
+    // is actually on disk; a deleted file yields undefined and must not match
+    // a stored undefined.
+    const reused = Boolean(hash && stored?.summary && stored.lastSeenHash === hash);
+
+    const brief = reused
+      ? { summary: stored!.summary!, ranges: stored!.importantRanges }
+      : automaticBrief(store, root, normalizedPath, indexedFiles);
+
     const file = store.upsertFileSummary({
       path: normalizedPath,
-      summary: redactIfEnabled(brief.summary),
+      // Reused summaries were redacted on the way in; redacting again would
+      // rewrite already-masked text.
+      summary: reused ? brief.summary : redactIfEnabled(brief.summary),
       manualPriority: options.manualPriority,
       importantRanges: brief.ranges,
-      lastSeenHash: contentHash(root, normalizedPath),
+      lastSeenHash: hash,
       lastTaskId: options.taskId,
       markTaskEdited: options.taskEdited
     });
-    results.push({ path: file.path, manualPriority: file.manualPriority });
+    results.push({ path: file.path, manualPriority: file.manualPriority, reused });
   }
   // First real edit promotes the task out of the "todo" backlog: a task is only
   // "in_progress" once work touches a file, not the moment a prompt creates it.

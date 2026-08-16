@@ -116,6 +116,7 @@ import {
   parseBaselineRun,
 } from "../optimize-baseline.js";
 import { refreshBriefs } from "../graph-brief.js";
+import { daysAgoStamp, readCacheUsage } from "../cache-report.js";
 
 type JsonBody = Record<string, unknown>;
 
@@ -1443,6 +1444,7 @@ async function handleRequest(
         {
           timeout: 120000,
           maxBuffer: 1024 * 1024,
+          shell: process.platform === "win32",
         },
       );
       sendJson(res, 200, {
@@ -1647,6 +1649,22 @@ async function handleRequest(
     } finally {
       store.close();
     }
+    return;
+  }
+
+  // Measured cache usage, as opposed to the estimated prefix size in
+  // tokenStats. Kept off /api/state because it shells out to ccusage, which is
+  // far slower than the rest of the state build and is only wanted on demand.
+  if (method === "GET" && url.pathname === "/api/cache-report") {
+    const days = Math.min(Math.max(Number(url.query.days ?? 7) || 7, 1), 90);
+    const result = readCacheUsage(daysAgoStamp(days));
+    sendJson(
+      res,
+      200,
+      // `summary.days` counts the days ccusage actually has data for, which is
+      // the number worth showing; `days` is only the requested window.
+      result.ok ? { ok: true, window: days, ...result.summary } : { ok: false, window: days, reason: result.reason },
+    );
     return;
   }
 
