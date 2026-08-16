@@ -1,18 +1,20 @@
 # Agent Bridge
 
-Agent Bridge is a local-first memory, context, and orchestration layer for coding agents. It lets Claude, Codex, Antigravity, and other providers work on the same project without repeatedly loading the full conversation or losing task state during handoffs.
+Agent Bridge is a local-first memory, context, and orchestration layer for coding agents. It lets Claude Code, Codex, Antigravity (`agy`), and other providers work on the same project without repeatedly loading the full conversation or losing task state during handoffs.
 
 The tool runs locally, stores project state in `.agent-memory/`, and exposes both a CLI and a local web dashboard.
 
 ## What it provides
 
-- Persistent tasks, decisions, memories, handoffs, reviews, and run history.
-- Token-budgeted context compilation for different coding agents.
-- Claude Code hooks and Codex lifecycle integration.
-- A repository knowledge graph and concise per-file briefs.
-- Registered agents with provider, model, reasoning level, and capabilities.
-- Leader-driven orchestration with implementation, review, adjudication, and reporting phases.
-- A local dashboard for tasks, agents, runs, approvals, memory, and orchestration.
+- Persistent tasks, subtasks, assignments, decisions, memories, handoffs, reviews, and run history.
+- Token-budgeted context compilation per agent, with prompt packs and a cacheable prompt prefix.
+- Token-saving instrumentation: compiled-context trends, baseline savings, and provider cache reports.
+- Claude Code, Codex, and Antigravity (`agy`) lifecycle hook integration.
+- A repository knowledge graph with concise per-file briefs and automatic brief refresh (`graph brief-auto`).
+- Registered agents with provider, model, reasoning level, and capabilities, plus a curated default-agent preset list and live model discovery from installed provider CLIs.
+- Leader-driven orchestration with plan, implement, review, adjudication, and reporting phases.
+- Per-task file leases so parallel agents do not edit the same file.
+- A local dashboard (Work Board, Orchestrator, Task, Knowledge, Context, Graph, Handoff, Tools).
 - UTF-8-safe input paths and secret redaction before logs or memories are stored.
 
 ## Requirements
@@ -30,7 +32,7 @@ API-mode and manual agents can also be registered without a local provider CLI.
 git clone https://github.com/teeho88/agent-bridge.git
 cd agent-bridge
 corepack pnpm install
-npm run build
+corepack pnpm -r build
 powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -AddToUserPath
 ```
 
@@ -91,7 +93,8 @@ For Vietnamese, other non-ASCII text, or multi-line input, prefer `--stdin`:
 
 ```powershell
 agent-bridge context compile --agent codex --budget 4000
-agent-bridge context compile --agent claude --budget 4000
+agent-bridge context compile --agent claude --budget 4000 --precise
+agent-bridge context compile --agent codex --assignment <assignmentId>
 agent-bridge handoff create --from codex --to claude `
   --summary "Session restoration is fixed" `
   --done "Patched cookie parsing" `
@@ -99,7 +102,32 @@ agent-bridge handoff create --from codex --to claude `
   --risks "Do not change payment authentication"
 ```
 
-The compiler combines the current task, relevant memories, decisions, file briefs, repository map, constraints, and the latest handoff within a token budget.
+The compiler combines the current task, relevant memories, decisions, file briefs, repository map, constraints, the assigned subtask, and the latest handoff within a token budget. `--no-repo-map` and `--repo-map-limit <n>` control the injected repository map.
+
+`compiled-context.md` is a single shared file, overwritten and stamped with the agent it was compiled for. Recompile for your own agent before relying on it.
+
+### Knowledge graph and file briefs
+
+```powershell
+agent-bridge graph build
+agent-bridge graph brief src/auth/session.ts
+agent-bridge graph brief-auto src/auth/session.ts
+agent-bridge graph brief-auto src/auth/session.ts --task-edited --agent claude
+agent-bridge graph neighbors src/auth/session.ts
+agent-bridge graph map
+```
+
+`brief-auto` refreshes the brief and records the file against the current task. With `--task-edited` it also enforces the file lease, so another task holding the file blocks the edit; always pass `--agent <agent>` together with `--task-edited`.
+
+### File leases
+
+```powershell
+agent-bridge file lease "src/auth/session.ts" --mode write --agent claude
+agent-bridge file leases --task <taskId>
+agent-bridge file release <leaseId>
+```
+
+Leases are per task, default to a one-hour TTL, and are the coordination primitive for parallel agents. Continue only when the acquire response reports `"acquired": true`.
 
 ### Register agents
 
@@ -126,6 +154,8 @@ agent-bridge agent test codex-implementer
 
 Common capability names are `implement`, `review`, `adjudicate`, and `report`. Implementer, reviewer, adjudicator, and reporter selection is capability-gated; a registered agent without the required capability is not eligible for that phase.
 
+The dashboard also ships a curated set of default agent presets (Claude, Codex, and Antigravity models) that can be toggled on, customised, or restored, and it can refresh the model catalog by querying the installed provider CLIs.
+
 ### Run an orchestration
 
 ```powershell
@@ -145,9 +175,13 @@ Useful controls:
 agent-bridge orchestration status
 agent-bridge orchestration step
 agent-bridge orchestration watch
+agent-bridge orchestration autonomy auto
 agent-bridge orchestration pause
 agent-bridge orchestration resume
 agent-bridge orchestration stop
+
+agent-bridge assignment list
+agent-bridge assignment update <assignmentId> --status done --result "Merged"
 ```
 
 The normal lifecycle is:
@@ -156,7 +190,7 @@ The normal lifecycle is:
 plan -> implement -> review -> adjudicate -> re-plan or report
 ```
 
-`Team Providers` is a hard allowlist for both the initial plan and change-request re-plans. Routine adjudication can be handled by an eligible adjudicator; risky, conflicting, blocked, or project-completion decisions are escalated to the leader.
+`Team Providers` is a hard allowlist for both the initial plan and change-request re-plans. Routine adjudication can be handled by an eligible adjudicator; risky, conflicting, blocked, or project-completion decisions are escalated to the leader. The dashboard adds spawn approvals, leader questions, change requests, per-task lanes (patch or worktree), and live run logs.
 
 Generate a final report with:
 
@@ -166,21 +200,45 @@ agent-bridge report generate
 
 An eligible reporter must have the `report` capability and belong to an allowed provider. If reporter execution fails, Agent Bridge can generate a deterministic fallback report.
 
-### Claude Code integration
-
-`agent-bridge init` installs local Claude Code hooks by default. To skip them:
+### Token savings
 
 ```powershell
-agent-bridge init --no-claude-hooks
+agent-bridge optimize report
+agent-bridge optimize report --baseline
+agent-bridge optimize baseline --record
+agent-bridge optimize cache-report
+agent-bridge optimize logs <path>
+```
+
+`optimize report` tracks compiled-context size over recorded runs, `optimize baseline` measures what the compiled context saves against loading the raw files, `cache-report` summarises provider prompt-cache usage, and `optimize logs` compresses a log file before it is fed to an agent.
+
+### Agent CLI integrations
+
+`agent-bridge init` installs local Claude Code and Antigravity (`agy`) hooks by default. To skip them:
+
+```powershell
+agent-bridge init --no-claude-hooks --no-antigravity-hooks
 ```
 
 Install or restore them later with:
 
 ```powershell
 agent-bridge claude install-hooks
+agent-bridge antigravity install-hooks
+agent-bridge codex install-hooks
 ```
 
-Restart Claude Code after installing hooks. Claude lifecycle events then update the current task, save compact memories, and refresh compiled context automatically.
+Restart the agent CLI after installing hooks. Lifecycle events then update the current task, save compact memories, and refresh compiled context automatically.
+
+Agents without native hooks can report lifecycle events manually:
+
+```powershell
+agent-bridge session start --agent codex
+agent-bridge session summary --agent codex
+agent-bridge session end --agent codex
+```
+
+`agent-bridge antigravity run -- <agy args>` launches `agy` interactively inside a tracked Work Board session.
 
 ### Repair text encoding
 
@@ -195,16 +253,16 @@ Characters already replaced by `?` cannot be reconstructed, but reversible mojib
 
 ## Command map
 
-| Area          | Commands                                        |
-| ------------- | ----------------------------------------------- |
-| Workspace     | `init`, `ui`, `repair`, `watch`                 |
-| Tasks         | `task`, `subtask`, `session`                    |
-| Knowledge     | `memory`, `context`, `graph`, `optimize`        |
-| Collaboration | `handoff`, `request`, `file`                    |
-| Agents        | `agent`, `run`, `claude`, `codex`, `credential` |
-| Orchestration | `orchestration`, `report`                       |
+| Area          | Commands                                                        |
+| ------------- | --------------------------------------------------------------- |
+| Workspace     | `init`, `ui`, `repair`, `watch`                                   |
+| Tasks         | `task`, `subtask`, `assignment`, `session`                        |
+| Knowledge     | `memory`, `context`, `graph`, `optimize`                          |
+| Collaboration | `handoff`, `request`, `file`, `git`                               |
+| Agents        | `agent`, `run`, `claude`, `codex`, `antigravity`, `credential`    |
+| Orchestration | `orchestration`, `report`                                         |
 
-Use `agent-bridge <command> --help` for complete options.
+`git` is a placeholder for planned Git helpers. Use `agent-bridge <command> --help` for complete options.
 
 ## Local project data
 
@@ -213,9 +271,15 @@ Initialization creates local runtime state such as:
 ```text
 .agent-memory/
   memories.db
+  config.json
+  catalog.json
+  token-policy.yaml
   current-task.md
   compiled-context.md
   handoff.md
+  handoff.json
+  tasks/
+  reports/
   artifacts/
   logs/
 ```
@@ -235,7 +299,7 @@ These files are project-local runtime/integration state and should normally rema
 
 ```powershell
 corepack pnpm install
-npm run build
+corepack pnpm -r build
 npm test
 npm run lint
 ```
@@ -246,12 +310,14 @@ Run the CLI from source:
 npm run dev -- --help
 ```
 
+The dashboard is served from the built `dist/ui-page.js`, so rebuild after editing UI source.
+
 The monorepo contains four packages:
 
-- `@agent-bridge/memory`: SQLite storage, types, retrieval, lifecycle, embeddings, and repository graph.
-- `@agent-bridge/core`: context compilation, orchestration, contracts, reports, security, and token optimization.
+- `@agent-bridge/memory`: SQLite storage, schema and migrations, types, retrieval, lifecycle, embeddings, leases, and repository graph.
+- `@agent-bridge/core`: context compilation, prompt packs and prompt cache, orchestration, contracts, reports, security, and token optimization.
 - `@agent-bridge/adapters`: provider catalogs, invocation builders, managed sections, and process execution.
-- `@agent-bridge/cli`: CLI commands, workspace integration, and the local dashboard.
+- `@agent-bridge/cli`: CLI commands, workspace integration, provider/model discovery, default agent presets, and the local dashboard.
 
 ## Security notes
 
