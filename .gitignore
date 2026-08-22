@@ -14,6 +14,8 @@ coverage/
 /CLAUDE.md
 /AGENT_MEMORY_BRIDGE_IMPLEMENTATION_SPEC.md
 /*.bak
+.handoff/
+docs/
 
 # Local configuration and credentials
 .env
