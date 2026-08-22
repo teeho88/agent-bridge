@@ -30,7 +30,10 @@ At the start of work:
 See `.agent-memory/compiled-context.md`.
 
 ## Handoff
-See `.agent-memory/handoff.md` if present.
+Read `.handoff/CURRENT.md` when resuming the latest work. If the user names a
+topic, use `.handoff/INDEX.md` to locate the matching archived checkpoint
+without scanning all of `.handoff/history/`. Handoffs are task-scoped: any agent
+that continues the task receives the same context.
 
 ## Work-Git Rules
 - Before editing any source/config/test/doc file for task work, acquire a write lease:
@@ -67,7 +70,7 @@ Before finishing:
    ```
 4. Create or update handoff notes:
    ```bash
-   agent-bridge handoff create --from codex --to claude --summary "<summary>" --next "<next action>"
+   agent-bridge handoff create --from codex --summary "<summary>" --next "<next action>"
    ```
 5. Avoid including unnecessary full file contents.
 

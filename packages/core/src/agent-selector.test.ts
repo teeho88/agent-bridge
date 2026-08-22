@@ -3,7 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { SQLiteMemoryStore } from "@agent-bridge/memory";
-import { resolveAgentForPreference } from "./agent-selector.js";
+import {
+  ensureAgentsForProviders,
+  isLeaderOnlyAgent,
+  resolveAgentForPreference,
+  resolveLeaderAgent,
+} from "./agent-selector.js";
 
 describe("resolveAgentForPreference", () => {
   function withStore(fn: (store: SQLiteMemoryStore) => void): void {
@@ -165,6 +170,76 @@ describe("resolveAgentForPreference", () => {
           { allowCreate: false, requiredCapabilities: ["review"] },
         ),
       ).toThrow(/capabilities: review/);
+    });
+  });
+});
+
+describe("resolveLeaderAgent", () => {
+  function withStore(fn: (store: SQLiteMemoryStore) => void): void {
+    const dir = mkdtempSync(join(tmpdir(), "agent-bridge-leader-"));
+    const store = new SQLiteMemoryStore(join(dir, "memories.db"));
+    try {
+      fn(store);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("creates a lead-only agent instead of reusing a staff agent", () => {
+    withStore((store) => {
+      const staff = store.createRegisteredAgent({
+        name: "codex-implementer",
+        provider: "codex",
+        mode: "cli",
+        command: "codex",
+        capabilities: ["implement", "review"],
+      });
+
+      const leader = resolveLeaderAgent(store, { provider: "codex", mode: "cli" }, { command: "codex" });
+
+      expect(leader.id).not.toBe(staff.id);
+      expect(leader.capabilities).toEqual(["lead"]);
+      expect(leader.name).toMatch(/-lead$/);
+      expect(isLeaderOnlyAgent(leader)).toBe(true);
+      expect(isLeaderOnlyAgent(staff)).toBe(false);
+    });
+  });
+
+  it("reuses the leader row on a second start instead of piling up agents", () => {
+    withStore((store) => {
+      const first = resolveLeaderAgent(store, { provider: "codex", mode: "cli", model: "gpt-5.6" }, { command: "codex" });
+      const second = resolveLeaderAgent(store, { provider: "codex", mode: "cli", model: "gpt-5.6" }, { command: "codex" });
+
+      expect(second.id).toBe(first.id);
+      expect(store.listRegisteredAgents({ limit: 50 })).toHaveLength(1);
+    });
+  });
+
+  it("is never staffable for implement/review work", () => {
+    withStore((store) => {
+      resolveLeaderAgent(store, { provider: "codex", mode: "cli" }, { command: "codex" });
+
+      expect(() =>
+        resolveAgentForPreference(
+          store,
+          { provider: "codex", mode: "cli" },
+          { allowCreate: false, requiredCapabilities: ["implement"] },
+        ),
+      ).toThrow(/capabilities: implement/);
+    });
+  });
+
+  it("does not let a leader row pass for a staffed team provider", () => {
+    withStore((store) => {
+      resolveLeaderAgent(store, { provider: "codex", mode: "cli" }, { command: "codex" });
+
+      expect(ensureAgentsForProviders(store, ["codex"], () => "codex")).toEqual(["codex"]);
+      const staff = store
+        .listRegisteredAgents({ provider: "codex", limit: 50 })
+        .filter((agent) => !isLeaderOnlyAgent(agent));
+      expect(staff).toHaveLength(1);
+      expect(staff[0]!.capabilities).toEqual(["implement", "review"]);
     });
   });
 });

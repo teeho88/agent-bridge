@@ -145,14 +145,21 @@ describe("agent invocation previews", () => {
     expect(preview.args).not.toContain("xhigh");
   });
 
-  it("refuses an agy prompt too long for a Windows command line, naming the real limit", () => {
-    expect(() =>
-      buildSpawnPreview(
-        registeredAgent({ provider: "antigravity", command: "agy" }),
-        promptFile("x".repeat(40_000), "huge.md"),
-        "C:/repo",
-      ),
-    ).toThrow(/command-line argument/);
+  it("points agy at the artifact when the prompt outgrows a Windows command line", () => {
+    // Failing the spawn here would strand the whole orchestration over a
+    // transport limit: the turn itself is fine, argv just cannot carry it.
+    const artifact = promptFile("x".repeat(40_000), "huge.md");
+    const preview = buildSpawnPreview(
+      registeredAgent({ provider: "antigravity", command: "agy" }),
+      artifact,
+      "C:/repo",
+    );
+    const inlinePrompt = preview.args?.at(-1) ?? "";
+    expect(preview.args?.at(-2)).toBe("--print");
+    expect(inlinePrompt.length).toBeLessThan(2_000);
+    expect(inlinePrompt).toContain(artifact);
+    expect(inlinePrompt).toContain("C:/repo");
+    expect(inlinePrompt).not.toContain("x".repeat(100));
   });
 
   it("describes API invocations using credential refs, not raw secrets", () => {

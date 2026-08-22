@@ -314,7 +314,9 @@ function recordFailedExecution(
   summary: string,
 ): ExecuteSpawnRequestResult {
   const updated = store.updateAssignment(assignment.id, { status: "failed", resultSummary: summary }) ?? assignment;
-  if (assignment.subtaskId) store.updateSubtask(assignment.subtaskId, { status: "blocked" });
+  if (assignment.subtaskId) {
+    store.updateSubtask(assignment.subtaskId, { status: "blocked", statusReason: summary });
+  }
   store.resolveAgentRequest(request.id, "resolved", `Approved spawn failed: ${summary}`);
   recordAssignmentOutcome(store, updated, request, `Assignment failed: ${summary}`, "bug", ["assignment", "failed"]);
   return { status: "failed", request, assignment: updated, preview, summary };

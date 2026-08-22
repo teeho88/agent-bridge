@@ -100,6 +100,41 @@ describe("spawnAgentRun", () => {
     }
   });
 
+  it("keeps multi-byte characters intact when they are split across stdout chunks", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-bridge-runner-"));
+    const store = new SQLiteMemoryStore(join(dir, "memories.db"));
+    try {
+      const agent = store.createRegisteredAgent({ name: "node-agent", provider: "generic", mode: "cli", command: process.execPath });
+      const task = store.createTask({ title: "Run task", ownerAgent: "codex" });
+      const promptPath = join(dir, "prompt.md");
+      writeFileSync(promptPath, "do the thing", "utf8");
+
+      // "mở rộng" — every accented letter is a 3-byte sequence. Writing the bytes
+      // one at a time forces a chunk boundary inside each of them, which is what
+      // a real agent's stdout does at random offsets over a long report.
+      const script = [
+        'const bytes = Buffer.from("mở rộng", "utf8");',
+        "for (const byte of bytes) process.stdout.write(Buffer.from([byte]));",
+        "process.exit(0);",
+      ].join("\n");
+
+      const run = spawnAgentRun(store, {
+        taskId: task.id,
+        agentId: agent.id,
+        runsDir: join(dir, "runs"),
+        preview: nodeInvocation(script, promptPath),
+      });
+
+      const finished = await waitForStatus(store, run.id, ["done", "failed"]);
+      const log = readFileSync(finished!.logPath!, "utf8");
+      expect(log).toContain("mở rộng");
+      expect(log).not.toContain("�");
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("turns a claude --output-format stream-json run into a readable log instead of raw NDJSON", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-bridge-runner-"));
     const store = new SQLiteMemoryStore(join(dir, "memories.db"));
@@ -170,10 +205,15 @@ describe("spawnAgentRun", () => {
             tool_info: { name: "write_to_file", parameters: { TargetFile: "index.html" } },
           },
         },
-        { event: "step_update", step_update: { step_index: 7, state: "ACTIVE", step_type: "agent_response", text_delta: '```json\n{"a"' } },
-        { event: "result", result: { status: "SUCCESS", response: '```json\n{"a":1}\n```' } },
+        { event: "step_update", step_update: { step_index: 7, state: "ACTIVE", step_type: "agent_response", text_delta: 'Báo cáo mở rộng\n```json\n{"a"' } },
+        { event: "result", result: { status: "SUCCESS", response: 'Báo cáo mở rộng\n```json\n{"a":1}\n```' } },
       ];
-      const script = events.map((event) => `console.log(${JSON.stringify(JSON.stringify(event))});`).join("\n") + "\nprocess.exit(0);";
+      const ndjson = `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
+      const script = [
+        `const bytes = Buffer.from(${JSON.stringify(ndjson)}, "utf8");`,
+        "for (const byte of bytes) process.stdout.write(Buffer.from([byte]));",
+        "process.exit(0);",
+      ].join("\n");
 
       const run = spawnAgentRun(store, {
         taskId: task.id,
@@ -194,6 +234,8 @@ describe("spawnAgentRun", () => {
       const log = readFileSync(finished!.logPath!, "utf8");
       expect(log).toContain("· agy gemini-3.1-pro-high");
       expect(log).toContain("→ write_to_file(index.html)");
+      expect(log).toContain("Báo cáo mở rộng");
+      expect(log).not.toContain("�");
       // One line per tool, not one per state transition.
       expect(log.match(/→ write_to_file/g)).toHaveLength(1);
       // The raw NDJSON never reaches the log, and the 60-entry tools array from

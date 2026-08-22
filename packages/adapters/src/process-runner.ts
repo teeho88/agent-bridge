@@ -1,6 +1,7 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import { redactSecrets } from "@agent-bridge/core";
 import type { AgentRun, CreateAgentRunInput, MemoryStore } from "@agent-bridge/memory";
@@ -308,7 +309,14 @@ export function spawnAgentRun(
     // Orchestrator board (keyed off the active task) render empty. This env
     // marker lets the hook recognize "I am a spawned run, not a human
     // session" and stay read-only.
-    env: { ...process.env, AGENT_BRIDGE_SPAWNED_RUN: run.id },
+    // AGENT_BRIDGE_ORCHESTRATION rides along so the CLI's spawned-run guard can
+    // name the context folder this agent should be writing instead of the
+    // workboard it just tried to write.
+    env: {
+      ...process.env,
+      AGENT_BRIDGE_SPAWNED_RUN: run.id,
+      ...(input.orchestrationId ? { AGENT_BRIDGE_ORCHESTRATION: input.orchestrationId } : {}),
+    },
   });
 
   liveProcesses.set(run.id, child);
@@ -372,10 +380,21 @@ export function spawnAgentRun(
     }
   };
 
-  const appendLog = (chunk: Buffer) => {
-    appendFileSync(logPath, redact(chunk.toString("utf8")));
-    safeUpdateAgentRun(run.id, { heartbeatAt: new Date().toISOString() });
+  // Each stream needs its own StringDecoder: a chunk boundary can fall inside a
+  // multi-byte UTF-8 sequence, and decoding a chunk on its own turns that one
+  // character into two or three U+FFFD replacement chars. Agent output is
+  // routinely non-ASCII (Vietnamese prose, box drawing, emoji) and the run log
+  // is what the final report is built from, so the partial bytes have to be
+  // held back until the rest of the sequence arrives.
+  const logAppender = () => {
+    const decoder = new StringDecoder("utf8");
+    return (chunk: Buffer) => {
+      appendFileSync(logPath, redact(decoder.write(chunk)));
+      safeUpdateAgentRun(run.id, { heartbeatAt: new Date().toISOString() });
+    };
   };
+  const appendLog = logAppender();
+  const appendStderrLog = logAppender();
   const streamFormatter = isClaudeStreamJson(preview)
     ? createClaudeStreamJsonFormatter()
     : isAgyStreamJson(preview)
@@ -383,8 +402,9 @@ export function spawnAgentRun(
       : undefined;
   if (streamFormatter) {
     const formatChunk = streamFormatter;
+    const stdoutDecoder = new StringDecoder("utf8");
     child.stdout?.on("data", (chunk: Buffer) => {
-      const formatted = formatChunk(chunk.toString("utf8"));
+      const formatted = formatChunk(stdoutDecoder.write(chunk));
       if (formatted) {
         appendFileSync(logPath, redact(formatted));
         safeUpdateAgentRun(run.id, { heartbeatAt: new Date().toISOString() });
@@ -393,7 +413,7 @@ export function spawnAgentRun(
   } else {
     child.stdout?.on("data", appendLog);
   }
-  child.stderr?.on("data", appendLog);
+  child.stderr?.on("data", appendStderrLog);
 
   const finalize = (status: "done" | "failed", exitCode: number | undefined, note?: string) => {
     liveProcesses.delete(run.id);

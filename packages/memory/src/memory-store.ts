@@ -1,5 +1,6 @@
 import type {
   AddMemoryInput,
+  UpdateMemoryInput,
   AgentRun,
   AgentRunStatus,
   CreateAgentRunInput,
@@ -9,6 +10,7 @@ import type {
   CreateOrchestrationInput,
   UpdateOrchestrationInput,
   OrchestrationEvent,
+  OrchestrationEventKind,
   RecordOrchestrationEventInput,
   Review,
   ReviewVerdict,
@@ -70,6 +72,8 @@ export interface MemoryStore {
   updateTaskStatus(id: string, status: Task["status"]): Task | undefined;
   listTasks(limit?: number): Task[];
   addMemory(input: AddMemoryInput): Memory;
+  updateRepoMemory(id: string, input: UpdateMemoryInput): Memory | undefined;
+  deleteRepoMemory(id: string): boolean;
   searchMemories(query: string, options?: MemorySearchOptions): Memory[];
   listMemoriesForTask(taskId: string, limit?: number): Memory[];
   listRepoMemories(limit?: number): Memory[];
@@ -79,6 +83,8 @@ export interface MemoryStore {
   getRegisteredAgent(id: string): RegisteredAgent | undefined;
   listRegisteredAgents(options?: { enabled?: boolean; provider?: string; includeUnselectedPresets?: boolean; includeHiddenPresets?: boolean; limit?: number }): RegisteredAgent[];
   updateRegisteredAgent(id: string, input: UpdateRegisteredAgentInput): RegisteredAgent | undefined;
+  // Throws when the agent still leads an unfinished orchestration: archiving it
+  // would leave that run unable to resolve its leader.
   deleteRegisteredAgent(id: string): boolean;
   createCredentialRef(input: CreateCredentialRefInput): CredentialRef;
   listCredentialRefs(provider?: string): CredentialRef[];
@@ -151,9 +157,14 @@ export interface MemoryStore {
   getOrchestration(id: string): Orchestration | undefined;
   getOrchestrationByTask(taskId: string): Orchestration | undefined;
   updateOrchestration(id: string, input: UpdateOrchestrationInput): Orchestration | undefined;
-  listOrchestrations(options?: { status?: OrchestrationStatus; limit?: number }): Orchestration[];
+  listOrchestrations(options?: { status?: OrchestrationStatus; leaderAgentId?: string; limit?: number }): Orchestration[];
   recordOrchestrationEvent(input: RecordOrchestrationEventInput): OrchestrationEvent;
-  listOrchestrationEvents(options?: { orchestrationId: string; limit?: number }): OrchestrationEvent[];
+  listOrchestrationEvents(options?: {
+    orchestrationId: string;
+    limit?: number;
+    kind?: OrchestrationEventKind;
+    summaryPrefix?: string;
+  }): OrchestrationEvent[];
   createReview(input: CreateReviewInput): Review;
   listReviews(options?: { taskId?: string; subtaskId?: string; consumed?: boolean; limit?: number }): Review[];
   markReviewConsumed(id: string): Review | undefined;

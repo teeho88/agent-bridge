@@ -1,3 +1,5 @@
+import { orchestratedRunSection } from "./managed-section.js";
+
 export function claudeManagedSection(): string {
   return `<!-- agent-bridge:start -->
 
@@ -18,7 +20,9 @@ export function claudeManagedSection(): string {
 - After editing a relevant source/config/test/doc file, run \`agent-bridge graph brief-auto "<repo-relative-path>" --task-edited --agent claude\`.
 - Always pass \`--agent claude\` with \`--task-edited\`; without it the lease check resolves the default agent's task and rejects your own lease.
 - You may pass multiple paths to one \`brief-auto\` call. Skip generated/vendor files and unrelated files.
-- Update \`.agent-memory/handoff.md\` after meaningful progress.
+- Create a portable handoff after meaningful progress with \`agent-bridge handoff create\`; the latest packet is \`.handoff/CURRENT.md\` and manual checkpoints are archived under \`.handoff/history/\`.
+
+${orchestratedRunSection()}
 
 <!-- agent-bridge:end -->`;
 }

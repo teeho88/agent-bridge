@@ -7,6 +7,72 @@ import { SQLiteMemoryStore } from "./sqlite-store.js";
 import { schemaStatements } from "./schema.js";
 
 describe("SQLiteMemoryStore", () => {
+  it("backfills reasons for legacy blocked and cancelled subtasks", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-bridge-"));
+    const path = join(dir, "memories.db");
+    try {
+      const store = new SQLiteMemoryStore(path);
+      const task = store.createTask({ title: "Legacy statuses", ownerAgent: "codex" });
+      const blocked = store.createSubtask({
+        parentTaskId: task.id,
+        title: "Blocked before reasons",
+        status: "blocked",
+        statusReason: "temporary",
+      });
+      store.close();
+
+      const legacy = new Database(path);
+      try {
+        legacy.prepare("UPDATE subtasks SET status_reason = NULL WHERE id = ?").run(blocked.id);
+        legacy.pragma("user_version = 28");
+      } finally {
+        legacy.close();
+      }
+
+      const migrated = new SQLiteMemoryStore(path);
+      try {
+        expect(migrated.listSubtasks({ parentTaskId: task.id })[0]?.statusReason).toBe(
+          "Legacy blocked task; no reason was recorded.",
+        );
+      } finally {
+        migrated.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("removes the obsolete handoff target-agent column", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-bridge-"));
+    const path = join(dir, "memories.db");
+    try {
+      const store = new SQLiteMemoryStore(path);
+      store.close();
+      const legacy = new Database(path);
+      try {
+        legacy.prepare("ALTER TABLE handoffs ADD COLUMN to_agent TEXT").run();
+        legacy.pragma("user_version = 27");
+      } finally {
+        legacy.close();
+      }
+
+      const migrated = new SQLiteMemoryStore(path);
+      migrated.close();
+      const verified = new Database(path, { readonly: true });
+      try {
+        const columns = (
+          verified.prepare("PRAGMA table_info(handoffs)").all() as Array<{ name: string }>
+        ).map((column) => column.name);
+        expect(columns).toContain("from_agent");
+        expect(columns).not.toContain("to_agent");
+      } finally {
+        verified.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("removes the legacy graph file importance column during migration", () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-bridge-"));
     const path = join(dir, "memories.db");
@@ -116,6 +182,28 @@ describe("SQLiteMemoryStore", () => {
       expect(store.listRepoMemories()).toHaveLength(1);
       expect(store.listRepoMemories()[0]?.content).toBe("Repo-wide rule");
       expect(store.listMemoriesForTask(task.id)).toHaveLength(1);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("updates and deletes repository memory without touching task memory", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-bridge-"));
+    const store = new SQLiteMemoryStore(join(dir, "memories.db"));
+    try {
+      const task = store.createTask({ title: "Task", ownerAgent: "codex" });
+      const repoMemory = store.addMemory({ type: "note", content: "Old fact", importance: 2 });
+      const taskMemory = store.addMemory({ taskId: task.id, type: "note", content: "Task fact" });
+
+      expect(store.updateRepoMemory(repoMemory.id, {
+        type: "constraint", content: "Updated fact", importance: 5, tags: ["shared"],
+      })).toMatchObject({ type: "constraint", content: "Updated fact", importance: 5, tags: ["shared"] });
+      expect(store.updateRepoMemory(taskMemory.id, { content: "Should not change" })).toBeUndefined();
+      expect(store.deleteRepoMemory(taskMemory.id)).toBe(false);
+      expect(store.deleteRepoMemory(repoMemory.id)).toBe(true);
+      expect(store.listRepoMemories()).toHaveLength(0);
+      expect(store.listMemoriesForTask(task.id)[0]?.content).toBe("Task fact");
     } finally {
       store.close();
       rmSync(dir, { recursive: true, force: true });
@@ -256,6 +344,8 @@ describe("SQLiteMemoryStore", () => {
       });
       expect(store.listSubtasks({ parentTaskId: task.id })).toHaveLength(1);
       expect(store.updateSubtask(subtask.id, { status: "assigned" })?.status).toBe("assigned");
+      expect(store.updateSubtask(subtask.id, { status: "blocked", statusReason: "Waiting for hardware." })?.statusReason).toBe("Waiting for hardware.");
+      expect(store.updateSubtask(subtask.id, { status: "assigned" })?.statusReason).toBeUndefined();
 
       const assignment = store.createAssignment({
         taskId: task.id,
@@ -370,6 +460,43 @@ describe("SQLiteMemoryStore", () => {
     }
   });
 
+  it("refuses to delete an agent that leads an unfinished orchestration, and allows it once the leader moved", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-bridge-"));
+    const store = new SQLiteMemoryStore(join(dir, "memories.db"));
+    try {
+      const leader = store.createRegisteredAgent({ name: "codex-lead", provider: "codex", mode: "cli", command: "codex" });
+      const replacement = store.createRegisteredAgent({
+        name: "claude-lead",
+        provider: "claude",
+        mode: "cli",
+        command: "claude",
+      });
+      const task = store.createTask({ title: "Orchestrated task", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
+
+      expect(() => store.deleteRegisteredAgent(leader.id)).toThrow(/leading 1 unfinished orchestration/i);
+      expect(store.getRegisteredAgent(leader.id)).toBeDefined();
+
+      // Unknown replacements are refused: writing one would recreate exactly the
+      // unresolvable-leader state this guard exists to prevent.
+      expect(() => store.updateOrchestration(orchestration.id, { leaderAgentId: "agent-nope" })).toThrow(
+        /Registered agent not found/,
+      );
+
+      const moved = store.updateOrchestration(orchestration.id, { leaderAgentId: replacement.id, lastError: null });
+      expect(moved?.leaderAgentId).toBe(replacement.id);
+      expect(store.listOrchestrations({ leaderAgentId: replacement.id })).toHaveLength(1);
+      expect(store.deleteRegisteredAgent(leader.id)).toBe(true);
+
+      // A finished run never steps again, so its leader is free to go.
+      store.updateOrchestration(orchestration.id, { status: "done" });
+      expect(store.deleteRegisteredAgent(replacement.id)).toBe(true);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("deletes agent requests individually and in bulk", () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-bridge-"));
     const store = new SQLiteMemoryStore(join(dir, "memories.db"));
@@ -459,20 +586,10 @@ describe("SQLiteMemoryStore", () => {
         leaderAgentId: leader.id,
         autonomy: "approve-each",
         maxParallel: 2,
-        teamProviders: ["codex", "claude"],
       });
       expect(orchestration.status).toBe("planning");
       expect(orchestration.cycle).toBe(0);
       expect(store.getOrchestrationByTask(task.id)?.id).toBe(orchestration.id);
-      // The allowlist has to survive the round trip: it is read on every
-      // planning turn to decide which providers the leader may staff from.
-      expect(store.getOrchestration(orchestration.id)?.teamProviders).toEqual(["codex", "claude"]);
-      expect(
-        store.getOrchestration(
-          store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id }).id,
-        )?.teamProviders,
-      ).toBeUndefined();
-
       const updatedOrchestration = store.updateOrchestration(orchestration.id, {
         status: "executing",
         cycle: 1,
@@ -815,7 +932,6 @@ describe("SQLiteMemoryStore", () => {
       const original = store.createHandoff({
         taskId: task.id,
         fromAgent: "claude",
-        toAgent: "codex",
         summary: "before",
         next: ["old next"],
       });
@@ -824,7 +940,6 @@ describe("SQLiteMemoryStore", () => {
         id: original.id,
         taskId: task.id,
         fromAgent: "codex",
-        toAgent: "claude",
         summary: "after",
         done: ["edited"],
         next: ["new next"],
@@ -845,7 +960,6 @@ describe("SQLiteMemoryStore", () => {
       expect(updated.createdAt).toBe(original.createdAt);
       expect(updated.summary).toBe("after");
       expect(updated.fromAgent).toBe("codex");
-      expect(updated.toAgent).toBe("claude");
       expect(store.getLatestHandoff(task.id)?.summary).toBe("after");
     } finally {
       store.close();
@@ -1587,6 +1701,67 @@ describe("agent run cycle", () => {
       // Adopted/manual runs and pre-migration rows have no cycle at all; the
       // board treats those as "unknown" rather than guessing.
       expect(store.getAgentRun(legacy.id)?.cycle).toBeUndefined();
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("filters orchestration events by kind and summary prefix instead of a newest-N window", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-bridge-"));
+    const store = new SQLiteMemoryStore(join(dir, "memories.db"));
+    try {
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const leader = store.createRegisteredAgent({ name: "leader", provider: "codex", mode: "cli", command: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
+
+      // The plan meta goes in first, then buried under noise: a caller reading
+      // the newest N events would lose it and mis-resolve the subtask's folder.
+      store.recordOrchestrationEvent({
+        orchestrationId: orchestration.id,
+        phase: "plan",
+        kind: "leader_turn",
+        summary: "subtask-meta:s1",
+        payload: JSON.stringify({ type: "subtask", key: "s1" }),
+      });
+      store.recordOrchestrationEvent({
+        orchestrationId: orchestration.id,
+        phase: "plan",
+        kind: "leader_turn",
+        summary: "reviewer-meta:r1",
+      });
+      for (let index = 0; index < 50; index += 1) {
+        store.recordOrchestrationEvent({
+          orchestrationId: orchestration.id,
+          phase: "implement",
+          kind: "spawn",
+          summary: `Spawned implementer ${index}`,
+        });
+      }
+
+      const metas = store.listOrchestrationEvents({
+        orchestrationId: orchestration.id,
+        kind: "leader_turn",
+        summaryPrefix: "subtask-meta:",
+        limit: 500,
+      });
+      expect(metas).toHaveLength(1);
+      expect(metas[0]?.summary).toBe("subtask-meta:s1");
+      expect(
+        store.listOrchestrationEvents({ orchestrationId: orchestration.id, kind: "spawn", limit: 500 }),
+      ).toHaveLength(50);
+
+      // `_` is a LIKE wildcard; a prefix that contains one must not match
+      // events that merely have some other character in that position.
+      store.recordOrchestrationEvent({
+        orchestrationId: orchestration.id,
+        phase: "plan",
+        kind: "leader_turn",
+        summary: "aXb:1",
+      });
+      expect(
+        store.listOrchestrationEvents({ orchestrationId: orchestration.id, summaryPrefix: "a_b:" }),
+      ).toHaveLength(0);
     } finally {
       store.close();
       rmSync(dir, { recursive: true, force: true });

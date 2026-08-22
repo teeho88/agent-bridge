@@ -55,6 +55,13 @@ describe("report generate helpers", () => {
       expect(content).toContain("Finish the module — Project Report");
       expect(store.getOrchestration(orchestration.id)?.status).toBe("done");
       expect(store.getOrchestration(orchestration.id)?.reportPath).toBe(result.reportPath);
+      expect(store.listOrchestrationEvents({ orchestrationId: orchestration.id, limit: 10 })).toContainEqual(
+        expect.objectContaining({
+          phase: "report",
+          kind: "run_ended",
+          summary: "Final project report written from the deterministic fallback.",
+        }),
+      );
     } finally {
       store.close();
       if (reportPath) rmSync(reportPath, { force: true });
@@ -111,6 +118,52 @@ describe("report generate helpers", () => {
       expect(readFileSync(result.reportPath, "utf8")).toContain("All done.");
       expect(store.listAgentRuns({ taskId: task.id, limit: 20 }).filter((item) => item.phase === "report")).toHaveLength(1);
       expect(store.getOrchestration(orchestration.id)?.status).toBe("done");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("requires approval before spawning a reporter in approve-each mode", () => {
+    cwd = mkdtempSync(join(tmpdir(), "agent-bridge-report-"));
+    const store = openStore(cwd);
+    try {
+      const reporter = store.createRegisteredAgent({
+        name: "reporter",
+        provider: "codex",
+        mode: "cli",
+        command: "codex",
+        capabilities: ["report"],
+      });
+      const task = store.createTask({ title: "Approval-gated report", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({
+        taskId: task.id,
+        leaderAgentId: reporter.id,
+        autonomy: "approve-each",
+      });
+      store.updateOrchestration(orchestration.id, { status: "reporting" });
+
+      const first = generateReport(store, { taskId: task.id, cwd });
+      const second = generateReport(store, { taskId: task.id, cwd });
+
+      expect(first.status).toBe("pending");
+      expect(second.status).toBe("pending");
+      expect(store.listAgentRuns({ taskId: task.id, limit: 20 })).toHaveLength(0);
+      const approvals = store.listAgentRequests({ taskId: task.id, status: "pending", limit: 20 });
+      expect(approvals).toHaveLength(1);
+      expect(JSON.parse(approvals[0]!.payload ?? "{}")).toMatchObject({
+        type: "spawn-approval",
+        key: "report:initial",
+        orchestrationId: orchestration.id,
+        agentId: reporter.id,
+      });
+      const reportEvents = store
+        .listOrchestrationEvents({ orchestrationId: orchestration.id, limit: 20 })
+        .filter((event) => event.phase === "report");
+      expect(reportEvents).toHaveLength(1);
+      expect(reportEvents[0]).toMatchObject({
+        kind: "user_action",
+        summary: 'Approval requested: spawn reporter "reporter" for the final project report.',
+      });
     } finally {
       store.close();
     }
@@ -208,17 +261,11 @@ describe("report generate helpers", () => {
     }
   });
 
-  it("selects reporters by report capability and Team providers", () => {
+  it("selects reporters by report capability", () => {
     cwd = mkdtempSync(join(tmpdir(), "agent-bridge-report-"));
     const store = openStore(cwd);
     try {
       const leader = store.createRegisteredAgent({ name: "leader", provider: "codex", mode: "manual" });
-      store.createRegisteredAgent({
-        name: "outside-reporter",
-        provider: "claude",
-        mode: "manual",
-        capabilities: ["report"],
-      });
       const reporter = store.createRegisteredAgent({
         name: "codex-reporter",
         provider: "codex",
@@ -226,7 +273,7 @@ describe("report generate helpers", () => {
         capabilities: ["report"],
       });
       const task = store.createTask({ title: "Scoped reporter", ownerAgent: "codex" });
-      store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id, teamProviders: ["codex"] });
+      store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
 
       expect(resolveReporterAgent(store, task.id, undefined)?.id).toBe(reporter.id);
       expect(() => resolveReporterAgent(store, task.id, leader.id)).toThrow(/does not have capability `report`/);

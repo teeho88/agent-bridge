@@ -105,7 +105,8 @@ export function buildSpawnPreview(
       //
       // stdin is not an option: `agy --print` ignores it entirely. So the
       // prompt travels as an argv string, which is what MAX_INLINE_PROMPT_CHARS
-      // guards.
+      // guards — and past that limit readPromptArtifact hands over a short
+      // pointer that tells agy to read the artifact off disk instead.
       //
       // --dangerously-skip-permissions matches what claude already runs with:
       // without it a spawned run stalls on a tool-approval prompt nobody can
@@ -132,7 +133,7 @@ export function buildSpawnPreview(
         "--output-format",
         "stream-json",
         "--print",
-        readPromptArtifact(promptArtifactPath),
+        readPromptArtifact(promptArtifactPath, cwd),
       ];
       return {
         ...base,
@@ -202,16 +203,24 @@ export function renderInvocationPrompt(input: {
 // which agent or which turn was too big.
 const MAX_INLINE_PROMPT_CHARS = 30_000;
 
-function readPromptArtifact(promptArtifactPath: string): string {
+function readPromptArtifact(promptArtifactPath: string, cwd: string): string {
   const prompt = readFileSync(promptArtifactPath, "utf8");
-  if (prompt.length > MAX_INLINE_PROMPT_CHARS) {
-    throw new Error(
-      `Prompt for this turn is ${prompt.length} characters; agy takes its prompt as a command-line argument, ` +
-        `which Windows caps near ${MAX_INLINE_PROMPT_CHARS}. Use a codex or claude agent for this turn (both read the ` +
-        `prompt from stdin), or shorten it. Prompt artifact: ${promptArtifactPath}`,
-    );
-  }
-  return prompt;
+  if (prompt.length <= MAX_INLINE_PROMPT_CHARS) return prompt;
+  // A leader turn on a real repo routinely runs past the argv cap, and failing
+  // the whole run there strands the orchestration: the turn is legitimate, only
+  // the transport is too small. agy has file tools and the artifact lives under
+  // --add-dir cwd, so hand it the path and make reading it step one. The
+  // pointer stays deliberately blunt — an agy turn that answers from the
+  // pointer alone would produce an off-contract reply the leader parser drops.
+  return [
+    "Your full instructions for this turn do not fit in a command-line argument, so they are on disk.",
+    "",
+    `Read this file FIRST, in full, before doing anything else: ${promptArtifactPath}`,
+    `Working directory: ${cwd}`,
+    "",
+    "That file is the real prompt: follow it exactly, including its output format and any JSON contract it specifies.",
+    "Do not answer from this message alone, and do not ask for the instructions to be repeated here.",
+  ].join("\n");
 }
 
 // Commands that were once written into agent rows but can never run a headless

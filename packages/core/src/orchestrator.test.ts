@@ -4,7 +4,14 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { SQLiteMemoryStore } from "@agent-bridge/memory";
 import type { AgentRun } from "@agent-bridge/memory";
-import { stepOrchestration, type OrchestratorDeps, type SpawnAgentTurnInput } from "./orchestrator.js";
+import {
+  changeOrchestrationLeader,
+  describeRunPlanLabels,
+  stepOrchestration,
+  DROP_OPEN_SUBTASKS_OPTION,
+  type OrchestratorDeps,
+  type SpawnAgentTurnInput,
+} from "./orchestrator.js";
 
 function fenced(obj: unknown): string {
   return `\`\`\`json\n${JSON.stringify(obj, null, 2)}\n\`\`\`\n`;
@@ -59,6 +66,61 @@ describe("orchestrator", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }
+
+  it("changes the leader of a live orchestration onto a dedicated lead-only row", () => {
+    withStore((store) => {
+      const leader = store.createRegisteredAgent({
+        name: "codex-lead",
+        provider: "codex",
+        mode: "cli",
+        command: "codex",
+        capabilities: ["lead"],
+      });
+      const staff = store.createRegisteredAgent({
+        name: "Claude Opus 5",
+        provider: "claude",
+        mode: "cli",
+        command: "claude",
+        model: "claude-opus-5",
+        capabilities: ["implement", "review"],
+      });
+      const task = store.createTask({ title: "Repair the leader", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
+      store.updateOrchestration(orchestration.id, { lastError: `Registered agent not found: ${leader.id}` });
+
+      const result = changeOrchestrationLeader(
+        store,
+        orchestration.id,
+        { provider: "claude", mode: "cli", model: "claude-opus-5", reasoningEffort: "high" },
+        { command: "claude" },
+      );
+
+      expect(result.changed).toBe(true);
+      expect(result.previousLeaderId).toBe(leader.id);
+      // A staff agent of the same provider/model is never promoted: the new
+      // leader is its own lead-only row, which is what keeps leaders out of the
+      // Agents tab.
+      expect(result.leader.id).not.toBe(staff.id);
+      expect(result.leader.capabilities).toEqual(["lead"]);
+      expect(result.orchestration.leaderAgentId).toBe(result.leader.id);
+      expect(result.orchestration.lastError).toBeUndefined();
+      expect(
+        store
+          .listOrchestrationEvents({ orchestrationId: orchestration.id, limit: 10 })
+          .some((event) => event.kind === "user_action" && /Leader changed/.test(event.summary ?? "")),
+      ).toBe(true);
+
+      // Asking for the same leader again is a no-op rather than a second row.
+      const again = changeOrchestrationLeader(
+        store,
+        orchestration.id,
+        { provider: "claude", mode: "cli", model: "claude-opus-5", reasoningEffort: "high" },
+        { command: "claude" },
+      );
+      expect(again.changed).toBe(false);
+      expect(again.leader.id).toBe(result.leader.id);
+    });
+  });
 
   it("drives plan -> execute -> review -> accept through to reporting", () => {
     withStore((store) => {
@@ -146,6 +208,19 @@ describe("orchestrator", () => {
       const reviewerAgent = store.getRegisteredAgent(reviewRun.agentId)!;
       expect(reviewerAgent.provider).toBe("claude");
       expect(reviewerAgent.capabilities).toContain("review");
+
+      // The Runs board labels each card with the leader's plan key and what the
+      // run is about, for both implementers and reviewers.
+      const labels = describeRunPlanLabels(
+        store,
+        orchestration.id,
+        [implementerRun, reviewRun],
+        store.listSubtasks({ parentTaskId: task.id }),
+      );
+      expect(labels[implementRunId]).toEqual({ key: "c1-s1-round1", title: "Implement the thing" });
+      // The reviewer card is named after the subtask it reviews, not after the
+      // reviewer key, so it lines up with the implementer card it follows.
+      expect(labels[reviewRunId]).toEqual({ key: "c1-s1-round1", title: "review Implement the thing" });
 
       finishRun(store, logs, reviewRunId, fenced({
         version: 1,
@@ -250,6 +325,7 @@ describe("orchestrator", () => {
       // reads as outstanding work forever and the leader will not call the
       // project complete.
       expect(original.status).toBe("cancelled");
+      expect(original.statusReason).toContain("Superseded by rework");
       expect(rework.status).toBe("todo");
 
       // executing: spawns an implementer for the rework subtask specifically
@@ -264,6 +340,20 @@ describe("orchestrator", () => {
       expect(step.spawnedRunIds).toHaveLength(1);
       const secondReviewRun = store.getAgentRun(step.spawnedRunIds[0]!)!;
       expect(secondReviewRun.phase).toBe("review");
+
+      // Both cards for the second attempt read "c1-s1-round2": the reviewer is named
+      // after the work and the round, not after the reviewer key, so it sits
+      // next to the implementer card it follows.
+      const labels = describeRunPlanLabels(
+        store,
+        orchestration.id,
+        [reworkImplementRun, secondReviewRun],
+        store.listSubtasks({ parentTaskId: task.id }),
+      );
+      expect(labels[reworkImplementRun.id]).toEqual({ key: "c1-s1-round2", title: "Fix the edge case" });
+      // The reviewer's scope still carries the cancelled original alongside the
+      // rework; the card names the latest attempt only, not both.
+      expect(labels[secondReviewRun.id]).toEqual({ key: "c1-s1-round2", title: "review Fix the edge case" });
     });
   });
 
@@ -290,6 +380,40 @@ describe("orchestrator", () => {
       step = stepOrchestration(store, orchestration.id, deps);
       expect(step.orchestration.status).toBe("paused");
       expect(store.listAgentRequests({ taskId: task.id, status: "pending" }).length).toBeGreaterThan(0);
+    });
+  });
+
+  it("does not spend the current leader parse retry on terminal runs from earlier turns", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const leader = store.createRegisteredAgent({ name: "leader", provider: "codex", mode: "cli", command: "codex" });
+      const task = store.createTask({ title: "Replan after old runs", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
+
+      for (let index = 0; index < 2; index += 1) {
+        const old = store.createAgentRun({
+          orchestrationId: orchestration.id,
+          taskId: task.id,
+          agentId: leader.id,
+          phase: "plan",
+          status: "done",
+        });
+        store.recordOrchestrationEvent({
+          orchestrationId: orchestration.id,
+          cycle: 0,
+          phase: "plan",
+          kind: "run_ended",
+          summary: `Consumed plan run ${old.id}.`,
+        });
+      }
+
+      let step = stepOrchestration(store, orchestration.id, deps);
+      finishRun(store, logs, step.spawnedRunIds[0]!, "malformed current reply");
+      step = stepOrchestration(store, orchestration.id, deps);
+
+      expect(step.orchestration.status).toBe("planning");
+      expect(step.spawnedRunIds).toHaveLength(1);
     });
   });
 
@@ -761,6 +885,97 @@ describe("orchestrator", () => {
     });
   });
 
+  it("carries every answered round into the prompt and stops re-parking after the question limit", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const prompts = new Map<string, string>();
+      const deps: OrchestratorDeps = {
+        ...makeDeps(store, logs),
+        spawn: (input: SpawnAgentTurnInput): AgentRun => {
+          const run = store.createAgentRun({
+            orchestrationId: input.orchestrationId,
+            taskId: input.taskId,
+            agentId: input.agent.id,
+            phase: input.phase,
+            status: "running",
+          });
+          prompts.set(run.id, input.prompt);
+          return run;
+        },
+      };
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      // Two rounds instead of the default four keeps the test short; it is the
+      // same field the start-orchestration form writes.
+      const orchestration = store.createOrchestration({
+        taskId: task.id,
+        leaderAgentId: leader.id,
+        maxQuestionRounds: 2,
+      });
+
+      // Each round the leader asks the same thing in different words, so the
+      // settled-title check cannot catch it.
+      const planAsking = (question: string) => ({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [{ key: "s1", title: "Subtask", acceptanceCriteria: [], dependsOn: [], files: [] }],
+        reviewers: [],
+        questions: [{ question, options: [] }],
+      });
+
+      const answerRound = (question: string, answer: string, runId: string) => {
+        const pending = store.listAgentRequests({ taskId: task.id, status: "pending" }).find((r) => r.title === question)!;
+        store.resolveAgentRequest(pending.id, "resolved", answer);
+        store.recordOrchestrationEvent({
+          orchestrationId: orchestration.id,
+          cycle: orchestration.cycle,
+          phase: "plan",
+          kind: "user_action",
+          summary: "Answered 1 leader question(s).",
+          payload: JSON.stringify({ type: "question-answers", answers: [{ question, answer }] }),
+        });
+        store.recordOrchestrationEvent({
+          orchestrationId: orchestration.id,
+          cycle: orchestration.cycle,
+          phase: "plan",
+          kind: "run_ended",
+          summary: `Consumed plan run ${runId} (superseded by answered questions).`,
+        });
+        store.updateOrchestration(orchestration.id, { status: "planning", lastError: null });
+      };
+
+      const firstRun = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
+      // The budget is stated as a ceiling — a leader told it "has 2 rounds"
+      // invents questions to fill them.
+      expect(prompts.get(firstRun)!).toContain("Question rounds are capped at 2 more");
+      expect(prompts.get(firstRun)!).toContain("HARD CEILING, not a target");
+      finishRun(store, logs, firstRun, fenced(planAsking("How many layers?")));
+      expect(stepOrchestration(store, orchestration.id, deps).orchestration.status).toBe("paused");
+      answerRound("How many layers?", "Two layers.", firstRun);
+
+      const secondRun = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
+      expect(prompts.get(secondRun)!).toContain("Question rounds are capped at 1 more");
+      finishRun(store, logs, secondRun, fenced(planAsking("What clearance?")));
+      expect(stepOrchestration(store, orchestration.id, deps).orchestration.status).toBe("paused");
+      answerRound("What clearance?", "0.2mm.", secondRun);
+
+      // Round three sees BOTH answers, not just the newest one.
+      const thirdRun = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
+      const prompt = prompts.get(thirdRun)!;
+      expect(prompt).toContain("Two layers.");
+      expect(prompt).toContain("0.2mm.");
+      expect(prompt).toContain("Do NOT ask anything else");
+
+      // And a third round of questions no longer parks the run: it plans on.
+      finishRun(store, logs, thirdRun, fenced(planAsking("How wide are the tracks?")));
+      const applied = stepOrchestration(store, orchestration.id, deps);
+      expect(applied.orchestration.status).toBe("executing");
+      expect(store.listSubtasks({ parentTaskId: task.id })).toHaveLength(1);
+    });
+  });
+
   it("approve-each asks before every agent, and a rejection pauses instead of spawning", () => {
     withStore((store) => {
       const logs = new Map<string, string>();
@@ -1004,6 +1219,75 @@ describe("orchestrator", () => {
     });
   });
 
+  it("asks again before retrying a reviewer whose process failed", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const leader = createWorkerLeader(store);
+      const claudeReviewer = store.createRegisteredAgent({
+        name: "claude-reviewer",
+        provider: "claude",
+        mode: "cli",
+        command: "claude",
+        capabilities: ["review"],
+      });
+      const task = store.createTask({ title: "Review with approval", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({
+        taskId: task.id,
+        leaderAgentId: leader.id,
+        autonomy: "approve-each",
+        maxParallel: 1,
+      });
+
+      stepOrchestration(store, orchestration.id, deps);
+      let approval = store.listAgentRequests({ taskId: task.id, status: "pending" }).find((request) => request.type === "approval")!;
+      store.resolveAgentRequest(approval.id, "accepted");
+      let step = stepOrchestration(store, orchestration.id, deps);
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [{ key: "s1", title: "Implement X", acceptanceCriteria: ["done"], dependsOn: [], files: [] }],
+        reviewers: [{ key: "r1", scope: ["s1"], agentPreference: { provider: "claude", mode: "cli" } }],
+        questions: [],
+      }));
+      stepOrchestration(store, orchestration.id, deps); // apply plan
+
+      stepOrchestration(store, orchestration.id, deps); // request implementer
+      approval = store.listAgentRequests({ taskId: task.id, status: "pending" }).find((request) => request.type === "approval")!;
+      store.resolveAgentRequest(approval.id, "accepted");
+      step = stepOrchestration(store, orchestration.id, deps);
+      finishRun(store, logs, step.spawnedRunIds[0]!, "implemented");
+      stepOrchestration(store, orchestration.id, deps); // implementation -> review
+
+      stepOrchestration(store, orchestration.id, deps); // request first reviewer
+      const firstReviewApproval = store
+        .listAgentRequests({ taskId: task.id, status: "pending" })
+        .find((request) => request.type === "approval")!;
+      store.resolveAgentRequest(firstReviewApproval.id, "accepted");
+      step = stepOrchestration(store, orchestration.id, deps);
+      expect(store.getAgentRun(step.spawnedRunIds[0]!)?.agentId).toBe(claudeReviewer.id);
+      finishRun(store, logs, step.spawnedRunIds[0]!, "review process failed", "failed");
+      stepOrchestration(store, orchestration.id, deps); // consume failed reviewer
+
+      step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.spawnedRunIds).toHaveLength(0);
+      const retryApproval = store
+        .listAgentRequests({ taskId: task.id, status: "pending" })
+        .find((request) => request.type === "approval")!;
+      expect(retryApproval.title).toContain("Assign review of Implement X");
+      expect(JSON.parse(retryApproval.payload!).key).not.toBe(JSON.parse(firstReviewApproval.payload!).key);
+      store.resolveAgentRequest(
+        retryApproval.id,
+        "accepted",
+        JSON.stringify({ type: "spawn-approval-response", agentId: leader.id }),
+      );
+      step = stepOrchestration(store, orchestration.id, deps);
+      expect(store.getAgentRun(step.spawnedRunIds[0]!)?.agentId).toBe(leader.id);
+    });
+  });
+
   it("leaves auto and manual orchestrations ungated", () => {
     withStore((store) => {
       for (const autonomy of ["auto", "manual"] as const) {
@@ -1041,13 +1325,19 @@ describe("orchestrator", () => {
         const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
         const existing = store.createSubtask({ parentTaskId: task.id, title: "Built earlier" });
         store.updateSubtask(existing.id, { status: "done" });
+        const staleReview = store.createSubtask({ parentTaskId: task.id, title: "Old review", status: "review" });
 
         const planRunId = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
         finishRun(store, logs, planRunId, fenced(emptyPlan));
         const step = stepOrchestration(store, orchestration.id, deps);
 
         expect(step.orchestration.status).toBe("reporting");
-        expect(store.listSubtasks({ parentTaskId: task.id })).toHaveLength(1);
+        const subtasks = store.listSubtasks({ parentTaskId: task.id });
+        expect(subtasks).toHaveLength(2);
+        expect(subtasks.find((subtask) => subtask.id === staleReview.id)).toMatchObject({
+          status: "cancelled",
+          statusReason: "Superseded when the leader found no work left in the newer plan.",
+        });
       }
 
       // First plan: nothing exists, so an empty plan is the leader failing.
@@ -1192,35 +1482,6 @@ describe("orchestrator", () => {
     });
   });
 
-  it("honours the orchestration's team-provider allowlist", () => {
-    withStore((store) => {
-      const logs = new Map<string, string>();
-      const prompts: string[] = [];
-      const deps: OrchestratorDeps = {
-        ...makeDeps(store, logs),
-        spawn: (input: SpawnAgentTurnInput) => {
-          prompts.push(input.prompt);
-          return makeDeps(store, logs).spawn(input);
-        },
-      };
-      const leader = createWorkerLeader(store);
-      store.createRegisteredAgent({ name: "claude-opus", provider: "claude", mode: "cli", command: "claude", capabilities: ["implement", "review"] });
-      store.createRegisteredAgent({ name: "gemini-pro", provider: "gemini", mode: "cli", command: "gemini", capabilities: ["implement", "review"] });
-      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
-      const orchestration = store.createOrchestration({
-        taskId: task.id,
-        leaderAgentId: leader.id,
-        teamProviders: ["codex", "claude"],
-      });
-
-      stepOrchestration(store, orchestration.id, deps);
-
-      // Roster order follows listRegisteredAgents (enabled, then name).
-      expect(prompts[0]).toContain("Available agent providers for this team: claude, codex.");
-      expect(prompts[0]).not.toContain("gemini");
-    });
-  });
-
   it("uses a capability-matched adjudicator first but requires the Leader to confirm completion", () => {
     withStore((store) => {
       const logs = new Map<string, string>();
@@ -1268,66 +1529,49 @@ describe("orchestrator", () => {
     });
   });
 
-  it("does not select an adjudicator outside Team providers", () => {
+  it("asks approve-each again before escalating an adjudicator proposal to the Leader", () => {
     withStore((store) => {
       const logs = new Map<string, string>();
       const deps = makeDeps(store, logs);
       const leader = createWorkerLeader(store);
-      store.createRegisteredAgent({
-        name: "claude-adjudicator",
-        provider: "claude",
+      const adjudicator = store.createRegisteredAgent({
+        name: "cheap-adjudicator",
+        provider: "codex",
         mode: "cli",
-        command: "claude",
+        command: "codex",
         capabilities: ["adjudicate"],
       });
-      const task = store.createTask({ title: "Codex-only adjudication", ownerAgent: "codex" });
+      const task = store.createTask({ title: "Approve escalation", ownerAgent: "codex" });
       const orchestration = store.createOrchestration({
         taskId: task.id,
         leaderAgentId: leader.id,
-        teamProviders: ["codex"],
+        autonomy: "approve-each",
       });
       store.updateOrchestration(orchestration.id, { status: "adjudicating", cycle: 1 });
 
-      const step = stepOrchestration(store, orchestration.id, deps);
-      expect(store.getAgentRun(step.spawnedRunIds[0]!)?.agentId).toBe(leader.id);
-    });
-  });
-
-  it("does not widen an allowlist when none of its providers are staffable", () => {
-    withStore((store) => {
-      const logs = new Map<string, string>();
-      const prompts: string[] = [];
-      const deps: OrchestratorDeps = {
-        ...makeDeps(store, logs),
-        spawn: (input: SpawnAgentTurnInput) => {
-          prompts.push(input.prompt);
-          return makeDeps(store, logs).spawn(input);
-        },
-      };
-      const leader = store.createRegisteredAgent({
-        name: "claude-leader",
-        provider: "claude",
-        mode: "cli",
-        command: "claude",
-      });
-      store.createRegisteredAgent({
-        name: "claude-worker",
-        provider: "claude",
-        mode: "cli",
-        command: "claude",
-        capabilities: ["implement", "review"],
-      });
-      const task = store.createTask({ title: "Codex-only team", ownerAgent: "claude" });
-      const orchestration = store.createOrchestration({
-        taskId: task.id,
-        leaderAgentId: leader.id,
-        teamProviders: ["codex"],
-      });
-
       stepOrchestration(store, orchestration.id, deps);
+      let approval = store.listAgentRequests({ taskId: task.id, status: "pending" }).find((request) => request.type === "approval")!;
+      store.resolveAgentRequest(approval.id, "accepted");
+      let step = stepOrchestration(store, orchestration.id, deps);
+      const adjudicatorRunId = step.spawnedRunIds[0]!;
+      expect(store.getAgentRun(adjudicatorRunId)?.agentId).toBe(adjudicator.id);
+      finishRun(store, logs, adjudicatorRunId, fenced({
+        version: 1,
+        phase: "adjudicate",
+        decisions: [],
+        projectComplete: true,
+        questions: [],
+      }));
 
-      expect(prompts[0]).toContain("none registered yet");
-      expect(prompts[0]).not.toContain("claude-worker");
+      step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.spawnedRunIds).toHaveLength(0);
+      approval = store.listAgentRequests({ taskId: task.id, status: "pending" }).find((request) => request.type === "approval")!;
+      expect(approval.title).toContain("Escalate adjudication to the Leader");
+      store.resolveAgentRequest(approval.id, "accepted");
+
+      step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.spawnedRunIds).toHaveLength(1);
+      expect(store.getAgentRun(step.spawnedRunIds[0]!)?.agentId).toBe(leader.id);
     });
   });
 
@@ -1411,95 +1655,6 @@ describe("orchestrator", () => {
     });
   });
 
-  it("refuses to staff a provider outside the team allowlist instead of registering it", () => {
-    withStore((store) => {
-      const logs = new Map<string, string>();
-      const deps: OrchestratorDeps = {
-        ...makeDeps(store, logs),
-        listProviders: () => [{ provider: "kimi", models: [] }],
-        defaultCommandFor: (provider) => provider,
-      };
-      const leader = createWorkerLeader(store);
-      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
-      const orchestration = store.createOrchestration({
-        taskId: task.id,
-        leaderAgentId: leader.id,
-        teamProviders: ["codex"],
-      });
-
-      const planStep = stepOrchestration(store, orchestration.id, deps);
-      finishRun(store, logs, planStep.spawnedRunIds[0]!, fenced({
-        version: 1,
-        phase: "plan",
-        complexity: "small",
-        planMarkdown: "# Plan",
-        subtasks: [
-          {
-            key: "s1",
-            title: "Implement X",
-            acceptanceCriteria: ["done"],
-            dependsOn: [],
-            files: [],
-            agentPreference: { provider: "kimi", mode: "cli" },
-          },
-        ],
-        reviewers: [],
-        questions: [],
-      }));
-      stepOrchestration(store, orchestration.id, deps);
-
-      expect(() => stepOrchestration(store, orchestration.id, deps)).toThrow(/not allowed for implementer staffing/);
-      expect(store.listRegisteredAgents({ provider: "kimi", limit: 10 })).toHaveLength(0);
-    });
-  });
-
-  it("never spawns a registered provider outside the orchestration team allowlist", () => {
-    withStore((store) => {
-      const logs = new Map<string, string>();
-      const deps = makeDeps(store, logs);
-      const leader = createWorkerLeader(store);
-      store.createRegisteredAgent({
-        name: "claude-implementer",
-        provider: "claude",
-        mode: "cli",
-        command: "claude",
-        capabilities: ["implement"],
-      });
-      const task = store.createTask({ title: "Codex-only re-plan", ownerAgent: "codex" });
-      const orchestration = store.createOrchestration({
-        taskId: task.id,
-        leaderAgentId: leader.id,
-        teamProviders: ["codex"],
-      });
-
-      const planStep = stepOrchestration(store, orchestration.id, deps);
-      finishRun(store, logs, planStep.spawnedRunIds[0]!, fenced({
-        version: 1,
-        phase: "plan",
-        complexity: "small",
-        planMarkdown: "# Plan",
-        subtasks: [{
-          key: "s1",
-          title: "Implement X",
-          acceptanceCriteria: ["done"],
-          dependsOn: [],
-          files: [],
-          agentPreference: { provider: "claude", mode: "cli" },
-        }],
-        reviewers: [],
-        questions: [],
-      }));
-      stepOrchestration(store, orchestration.id, deps);
-
-      expect(() => stepOrchestration(store, orchestration.id, deps)).toThrow(
-        /Provider "claude" is not allowed.*codex/,
-      );
-      expect(
-        store.listAgentRuns({ orchestrationId: orchestration.id, limit: 50 }).filter((run) => run.phase === "implement"),
-      ).toHaveLength(0);
-    });
-  });
-
   it("falls back within the roster when the leader asks for a model that is not registered", () => {
     withStore((store) => {
       const logs = new Map<string, string>();
@@ -1544,6 +1699,714 @@ describe("orchestrator", () => {
         "claude-opus",
         "leader",
       ]);
+    });
+  });
+
+  it("blocks an implementer the OS never let run instead of sending unrun work to review", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id, maxParallel: 1 });
+
+      let step = stepOrchestration(store, orchestration.id, deps);
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [{ key: "s1", title: "Implement X", acceptanceCriteria: ["done"], dependsOn: [], files: [] }],
+        reviewers: [{ key: "r1", scope: ["s1"] }],
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // -> executing
+
+      step = stepOrchestration(store, orchestration.id, deps); // spawn implementer
+      const implementRunId = step.spawnedRunIds[0]!;
+      // Exit code 0 with a polite sign-off is exactly what this looks like in
+      // the wild — the agent never got to run anything, so it explains what it
+      // would have done. Nothing downstream can tell that from lazy work.
+      const denial =
+        "ERROR exec error: windows sandbox: CreateProcessAsUserW failed: 5 (Access is denied.) | cmd=pwsh.exe -Command \"Get-Location\"";
+      finishRun(
+        store,
+        logs,
+        implementRunId,
+        `${denial}\n${denial}\n${denial}\nI was unable to inspect the workspace, so here is what I would have changed.`,
+        "done",
+      );
+
+      step = stepOrchestration(store, orchestration.id, deps);
+      const subtask = store.listSubtasks({ parentTaskId: task.id })[0]!;
+      expect(subtask.status).toBe("blocked");
+      expect(step.summary).toContain("environment failure");
+
+      // The summary the leader and reporter will replay says what happened,
+      // not the agent's apology.
+      const assignment = store.listAssignments({ subtaskId: subtask.id })[0]!;
+      expect(assignment.status).toBe("failed");
+      expect(assignment.resultSummary).toContain("ENVIRONMENT FAILURE");
+      expect(assignment.resultSummary).not.toContain("here is what I would have changed");
+
+      // The user is told once, because only they can fix it.
+      const question = store.listAgentRequests({ taskId: task.id, status: "pending" }).at(-1)!;
+      expect(question.title).toContain("cannot run commands on this machine");
+      const before = store.listAgentRequests({ taskId: task.id, limit: 500 }).length;
+      stepOrchestration(store, orchestration.id, deps);
+      expect(store.listAgentRequests({ taskId: task.id, limit: 500 }).length).toBe(before);
+    });
+  });
+
+  it("spends a cycle on rework but not on an accept-only adjudication", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id, maxParallel: 1 });
+
+      let step = stepOrchestration(store, orchestration.id, deps);
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [
+          { key: "s1", title: "Parse the netlist", acceptanceCriteria: ["parses"], dependsOn: [], files: [] },
+          { key: "s2", title: "Render the board", acceptanceCriteria: ["renders"], dependsOn: [], files: [] },
+        ],
+        // Two reviewer groups, so their reviews land — and are adjudicated —
+        // separately. Charging a cycle per adjudication turned max_cycles into
+        // a cap on how many reviewer groups a plan may have.
+        reviewers: [{ key: "r1", scope: ["s1"] }, { key: "r2", scope: ["s2"] }],
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // -> executing
+
+      const acceptOne = (subtaskKey: string): void => {
+        step = stepOrchestration(store, orchestration.id, deps); // spawn implementer
+        finishRun(store, logs, step.spawnedRunIds[0]!, "attempt");
+        step = stepOrchestration(store, orchestration.id, deps); // -> review
+        step = stepOrchestration(store, orchestration.id, deps); // spawn reviewer
+        finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+          version: 1,
+          phase: "review",
+          reviews: [{ subtaskKey, verdict: "pass", summary: "Good." }],
+        }));
+        step = stepOrchestration(store, orchestration.id, deps); // record review
+        step = stepOrchestration(store, orchestration.id, deps); // -> adjudicating
+        step = stepOrchestration(store, orchestration.id, deps); // spawn adjudicate
+        finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+          version: 1,
+          phase: "adjudicate",
+          decisions: [{ subtaskKey, verdict: "accept" }],
+          projectComplete: false,
+          questions: [],
+        }));
+        step = stepOrchestration(store, orchestration.id, deps); // apply
+      };
+
+      acceptOne("s1");
+      expect(step.orchestration.cycle).toBe(1);
+      acceptOne("s2");
+      // Two adjudications, zero rework: the budget is untouched.
+      expect(step.orchestration.cycle).toBe(1);
+    });
+  });
+
+  it("re-points a reworked subtask's dependents instead of stranding them", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const prompts = new Map<string, string>();
+      const deps = makeDeps(store, logs, prompts);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id, maxParallel: 1 });
+
+      let step = stepOrchestration(store, orchestration.id, deps);
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [
+          { key: "s1", title: "Parse the netlist", acceptanceCriteria: ["parses"], dependsOn: [], files: [] },
+          { key: "s2", title: "Render the board", acceptanceCriteria: ["renders"], dependsOn: ["s1"], files: [] },
+        ],
+        reviewers: [{ key: "r1", scope: ["s1", "s2"] }],
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // -> executing
+
+      // s1 runs, is reviewed, and is sent back for rework.
+      step = stepOrchestration(store, orchestration.id, deps);
+      finishRun(store, logs, step.spawnedRunIds[0]!, "first attempt");
+      step = stepOrchestration(store, orchestration.id, deps); // s1 -> review
+      step = stepOrchestration(store, orchestration.id, deps); // spawn reviewer
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "review",
+        reviews: [{ subtaskKey: "s1", verdict: "rework", summary: "Missing an edge case." }],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // record review
+      step = stepOrchestration(store, orchestration.id, deps); // -> adjudicating
+      step = stepOrchestration(store, orchestration.id, deps); // spawn adjudicate
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "adjudicate",
+        decisions: [
+          {
+            subtaskKey: "s1",
+            verdict: "rework",
+            rework: { title: "Fix the parser", acceptanceCriteria: ["parses"] },
+          },
+        ],
+        projectComplete: false,
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // apply -> executing
+
+      // s2 depended on the subtask that just became `cancelled`. A dependency
+      // is only satisfied when it is `done`, and a cancelled subtask never
+      // will be — so without re-pointing, s2 can never be dispatched, nothing
+      // is left to review, and adjudication has no decision it can make.
+      const subtasks = store.listSubtasks({ parentTaskId: task.id });
+      const rework = subtasks.find((subtask) => subtask.title === "Fix the parser")!;
+      const dependent = subtasks.find((subtask) => subtask.title === "Render the board")!;
+      expect(dependent.dependsOn).toEqual([rework.id]);
+
+      // And it really does dispatch once the replacement is accepted.
+      step = stepOrchestration(store, orchestration.id, deps); // spawn rework implementer
+      finishRun(store, logs, step.spawnedRunIds[0]!, "fixed");
+      step = stepOrchestration(store, orchestration.id, deps); // rework -> review
+      step = stepOrchestration(store, orchestration.id, deps); // spawn reviewer
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "review",
+        reviews: [{ subtaskKey: "s1-rework-1", verdict: "pass", summary: "Good." }],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // record review
+      step = stepOrchestration(store, orchestration.id, deps); // -> adjudicating
+      step = stepOrchestration(store, orchestration.id, deps); // spawn adjudicate
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "adjudicate",
+        decisions: [{ subtaskKey: "s1-rework-1", verdict: "accept" }],
+        projectComplete: false,
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // apply -> executing
+
+      step = stepOrchestration(store, orchestration.id, deps);
+      const dependentRun = store.getAgentRun(step.spawnedRunIds[0]!)!;
+      expect(dependentRun.subtaskId).toBe(dependent.id);
+    });
+  });
+
+  it("names the outstanding subtasks when the leader adjudicates with nothing to decide", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id, maxParallel: 1 });
+
+      let step = stepOrchestration(store, orchestration.id, deps);
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [
+          { key: "s1", title: "Parse the netlist", acceptanceCriteria: ["parses"], dependsOn: [], files: [] },
+          { key: "s2", title: "Render the board", acceptanceCriteria: ["renders"], dependsOn: ["s1"], files: [] },
+        ],
+        reviewers: [{ key: "r1", scope: ["s1", "s2"] }],
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // -> executing
+      step = stepOrchestration(store, orchestration.id, deps); // spawn implementer for s1
+      finishRun(store, logs, step.spawnedRunIds[0]!, "attempt");
+      step = stepOrchestration(store, orchestration.id, deps); // s1 -> review
+      step = stepOrchestration(store, orchestration.id, deps); // spawn reviewer
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "review",
+        reviews: [{ subtaskKey: "s1", verdict: "pass", summary: "Good." }],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // record review
+      step = stepOrchestration(store, orchestration.id, deps); // -> adjudicating
+      step = stepOrchestration(store, orchestration.id, deps); // spawn adjudicate
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "adjudicate",
+        decisions: [],
+        projectComplete: false,
+        questions: [],
+      }));
+
+      step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.orchestration.status).toBe("paused");
+      const question = store.listAgentRequests({ taskId: task.id, status: "pending" }).at(-1)!;
+      // The old message told the user only that the leader "needs direction on
+      // what remains" — leaving them to work out what that was.
+      expect(question.title).toContain("Render the board");
+      expect(question.title).toContain("subtask(s) are still open");
+    });
+  });
+
+  it("does not finish when the leader claims completion with open subtasks", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const open = store.createSubtask({ parentTaskId: task.id, title: "Finish the router" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
+      store.updateOrchestration(orchestration.id, { status: "adjudicating", cycle: 1 });
+
+      let step = stepOrchestration(store, orchestration.id, deps);
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "adjudicate",
+        decisions: [],
+        projectComplete: true,
+        questions: [],
+      }));
+
+      step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.orchestration.status).toBe("paused");
+      expect(store.listSubtasks({ parentTaskId: task.id }).find((subtask) => subtask.id === open.id)?.status).toBe("todo");
+      const question = store.listAgentRequests({ taskId: task.id, status: "pending" }).at(-1)!;
+      expect(question.title).toContain("Finish the router");
+      expect(question.title).toContain("marked the project complete");
+    });
+  });
+
+  it("cancels review-ready work left behind by a newer plan and records why", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Replan", ownerAgent: "codex" });
+      const stale = store.createSubtask({ parentTaskId: task.id, title: "Old implementation", status: "review" });
+      const staleReview = store.createReview({
+        taskId: task.id,
+        subtaskId: stale.id,
+        verdict: "rework",
+        summary: "The old implementation needs rework.",
+      });
+      const historical = store.createSubtask({
+        parentTaskId: task.id,
+        title: "Already superseded implementation",
+        status: "cancelled",
+      });
+      const historicalReview = store.createReview({
+        taskId: task.id,
+        subtaskId: historical.id,
+        verdict: "rework",
+        summary: "A stale review left by an older version of the orchestrator.",
+      });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
+
+      const runId = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
+      finishRun(store, logs, runId, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Replacement plan",
+        subtasks: [{ key: "s1", title: "New implementation", acceptanceCriteria: [], dependsOn: [], files: [] }],
+        reviewers: [],
+        questions: [],
+      }));
+
+      stepOrchestration(store, orchestration.id, deps);
+      const updated = store.listSubtasks({ parentTaskId: task.id }).find((subtask) => subtask.id === stale.id)!;
+      expect(updated.status).toBe("cancelled");
+      expect(updated.statusReason).toBe("Superseded by a newer leader plan.");
+      expect(store.listReviews({ taskId: task.id, consumed: true }).map((review) => review.id)).toContain(staleReview.id);
+      expect(store.listReviews({ taskId: task.id, consumed: false }).map((review) => review.id)).toContain(historicalReview.id);
+
+      const dispatch = stepOrchestration(store, orchestration.id, deps);
+      expect(dispatch.orchestration.status).toBe("executing");
+      expect(dispatch.spawnedRunIds).toHaveLength(1);
+      expect(store.getAgentRun(dispatch.spawnedRunIds[0]!)?.phase).toBe("implement");
+    });
+  });
+
+  it("replays the leader's own draft and asked questions into the next planning turn", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const prompts = new Map<string, string>();
+      const deps = makeDeps(store, logs, prompts);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
+
+      const firstPlanRunId = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
+      // The first prompt has no ledger to show: nothing has been drafted yet.
+      expect(prompts.get(firstPlanRunId)!).not.toContain("## Your Previous Planning Draft");
+      finishRun(store, logs, firstPlanRunId, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "large",
+        planMarkdown: "# Plan\n\n1. Parse the netlist\n2. Emit the footprints",
+        subtasks: [{ key: "s1", title: "Parse the netlist", acceptanceCriteria: [], dependsOn: [], files: [] }],
+        reviewers: [],
+        questions: [{ question: "Which KiCad version?", options: ["7", "8"] }],
+      }));
+
+      const paused = stepOrchestration(store, orchestration.id, deps);
+      expect(paused.orchestration.status).toBe("paused");
+
+      const question = store.listAgentRequests({ taskId: task.id, status: "pending" })[0]!;
+      store.resolveAgentRequest(question.id, "resolved", "KiCad 8.");
+      store.recordOrchestrationEvent({
+        orchestrationId: orchestration.id,
+        cycle: orchestration.cycle,
+        phase: "plan",
+        kind: "user_action",
+        summary: "Answered 1 leader question(s).",
+        payload: JSON.stringify({
+          type: "question-answers",
+          answers: [{ question: question.title, answer: "KiCad 8." }],
+        }),
+      });
+      store.recordOrchestrationEvent({
+        orchestrationId: orchestration.id,
+        cycle: orchestration.cycle,
+        phase: "plan",
+        kind: "run_ended",
+        summary: `Consumed plan run ${firstPlanRunId} (superseded by answered questions).`,
+      });
+      store.updateOrchestration(orchestration.id, { status: "planning", lastError: null });
+
+      // The draft is replayed even though the parked turn never wrote a plan
+      // file — this is the whole point: without it the next round re-derives
+      // the same open points and asks them again.
+      const replan = stepOrchestration(store, orchestration.id, deps);
+      const prompt = prompts.get(replan.spawnedRunIds[0]!)!;
+      expect(prompt).toContain("## Your Previous Planning Draft");
+      expect(prompt).toContain("1. Parse the netlist");
+      expect(prompt).toContain("You assessed complexity as: large.");
+      expect(prompt).toContain("## Questions You Already Asked");
+      expect(prompt).toContain("Which KiCad version?");
+      expect(prompt).toContain("REVISE it");
+    });
+  });
+
+  it("replays earlier rulings and findings into the next adjudication and re-review", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const prompts = new Map<string, string>();
+      const deps = makeDeps(store, logs, prompts);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id, maxParallel: 1 });
+
+      let step = stepOrchestration(store, orchestration.id, deps);
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [{ key: "s1", title: "Implement X", acceptanceCriteria: ["done"], dependsOn: [], files: [] }],
+        reviewers: [{ key: "r1", scope: ["s1"] }],
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // -> executing
+      step = stepOrchestration(store, orchestration.id, deps); // spawn implementer
+      finishRun(store, logs, step.spawnedRunIds[0]!, "first attempt");
+      step = stepOrchestration(store, orchestration.id, deps); // subtask -> review
+
+      step = stepOrchestration(store, orchestration.id, deps); // spawn reviewer
+      const firstReviewRunId = step.spawnedRunIds[0]!;
+      // Nothing has been reviewed yet, so the first reviewer gets no history.
+      expect(prompts.get(firstReviewRunId)!).not.toContain("Your earlier reviews in this scope:");
+      finishRun(store, logs, firstReviewRunId, fenced({
+        version: 1,
+        phase: "review",
+        reviews: [
+          {
+            subtaskKey: "s1",
+            verdict: "rework",
+            summary: "Missing an edge case.",
+            findings: [{ issue: "empty netlist crashes the parser" }],
+          },
+        ],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // record review
+      step = stepOrchestration(store, orchestration.id, deps); // -> adjudicating
+
+      step = stepOrchestration(store, orchestration.id, deps); // spawn adjudicate
+      const firstAdjudicateRunId = step.spawnedRunIds[0]!;
+      expect(prompts.get(firstAdjudicateRunId)!).not.toContain("## Decision Log (previous cycles)");
+      finishRun(store, logs, firstAdjudicateRunId, fenced({
+        version: 1,
+        phase: "adjudicate",
+        decisions: [
+          {
+            subtaskKey: "s1",
+            verdict: "rework",
+            rework: { title: "Fix the edge case", goal: "Handle an empty netlist", acceptanceCriteria: ["edge case handled"] },
+          },
+        ],
+        projectComplete: false,
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // apply -> executing, cycle 2
+
+      step = stepOrchestration(store, orchestration.id, deps); // spawn rework implementer
+      finishRun(store, logs, step.spawnedRunIds[0]!, "fixed the edge case");
+      step = stepOrchestration(store, orchestration.id, deps); // rework subtask -> review
+
+      // The re-review carries the findings written against the subtask this
+      // one replaces — they live on the cancelled original, so without the
+      // ledger the second reviewer would start from nothing.
+      step = stepOrchestration(store, orchestration.id, deps);
+      const secondReviewPrompt = prompts.get(step.spawnedRunIds[0]!)!;
+      expect(secondReviewPrompt).toContain("Your earlier reviews in this scope:");
+      expect(secondReviewPrompt).toContain("[rework] Implement X: Missing an edge case.");
+      expect(secondReviewPrompt).toContain("empty netlist crashes the parser");
+      expect(secondReviewPrompt).toContain("this is a re-review");
+
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "review",
+        reviews: [{ subtaskKey: "s1-rework-1", verdict: "pass", summary: "Edge case handled." }],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // record review
+      step = stepOrchestration(store, orchestration.id, deps); // -> adjudicating
+
+      // Cycle 2's adjudication sees what cycle 1 already ruled, so it cannot
+      // re-order the same rework.
+      step = stepOrchestration(store, orchestration.id, deps);
+      const secondAdjudicatePrompt = prompts.get(step.spawnedRunIds[0]!)!;
+      expect(secondAdjudicatePrompt).toContain("## Decision Log (previous cycles)");
+      expect(secondAdjudicatePrompt).toContain("s1: rework");
+      expect(secondAdjudicatePrompt).toContain("rework ordered: Fix the edge case");
+      expect(secondAdjudicatePrompt).toContain("rework goal: Handle an empty netlist");
+      expect(secondAdjudicatePrompt).toContain("Do not re-issue a rework you already ordered");
+    });
+  });
+
+  it("replays the review findings and the previous attempt to a rework implementer", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const prompts = new Map<string, string>();
+      const deps = makeDeps(store, logs, prompts);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Ship it", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id, maxParallel: 1 });
+
+      let step = stepOrchestration(store, orchestration.id, deps);
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [{ key: "s1", title: "Implement X", acceptanceCriteria: ["done"], dependsOn: [], files: [] }],
+        reviewers: [{ key: "r1", scope: ["s1"] }],
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // -> executing
+      step = stepOrchestration(store, orchestration.id, deps); // spawn implementer
+      // A first attempt gets no rework section at all.
+      expect(prompts.get(step.spawnedRunIds[0]!)!).not.toContain("## Rework — attempt");
+      finishRun(store, logs, step.spawnedRunIds[0]!, "wired the parser into the loader");
+      step = stepOrchestration(store, orchestration.id, deps); // subtask -> review
+
+      step = stepOrchestration(store, orchestration.id, deps); // spawn reviewer
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "review",
+        reviews: [
+          {
+            subtaskKey: "s1",
+            verdict: "rework",
+            summary: "Missing an edge case.",
+            findings: [{ file: "src/parser.ts", issue: "empty netlist crashes the parser" }],
+          },
+        ],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // record review
+      step = stepOrchestration(store, orchestration.id, deps); // -> adjudicating
+      step = stepOrchestration(store, orchestration.id, deps); // spawn adjudicate
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "adjudicate",
+        decisions: [
+          {
+            subtaskKey: "s1",
+            verdict: "rework",
+            rework: { title: "Fix the edge case", goal: "Handle an empty netlist", acceptanceCriteria: ["edge case handled"] },
+          },
+        ],
+        projectComplete: false,
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // apply -> executing, cycle 2
+
+      step = stepOrchestration(store, orchestration.id, deps); // spawn rework implementer
+      const reworkPrompt = prompts.get(step.spawnedRunIds[0]!)!;
+      // The rework goal alone is a paraphrase of the review. The implementer
+      // needs the finding itself, and what the attempt it replaces already did.
+      expect(reworkPrompt).toContain("## Rework — attempt 2");
+      expect(reworkPrompt).toContain("Earlier attempt: Implement X");
+      expect(reworkPrompt).toContain("empty netlist crashes the parser");
+      expect(reworkPrompt).toContain("src/parser.ts");
+      expect(reworkPrompt).toContain("Reviewer verdict: rework — Missing an edge case.");
+      // The previous attempt's own account survives being sent back.
+      expect(reworkPrompt).toContain("wired the parser into the loader");
+      expect(reworkPrompt).toContain("Do not restart the subtask from scratch");
+
+      finishRun(store, logs, step.spawnedRunIds[0]!, "handled the empty netlist");
+      step = stepOrchestration(store, orchestration.id, deps); // rework -> review
+      step = stepOrchestration(store, orchestration.id, deps); // spawn reviewer
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "review",
+        reviews: [
+          {
+            subtaskKey: "s1-rework-1",
+            verdict: "rework",
+            summary: "Still missing an edge case.",
+            findings: [{ file: "src/parser.ts", issue: "empty netlist still crashes" }],
+          },
+        ],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps); // record review
+      step = stepOrchestration(store, orchestration.id, deps); // -> adjudicating
+
+      // The adjudicator can now see the reviewer saying the same thing twice,
+      // rather than reading cycle 2's review as the first word on the defect.
+      step = stepOrchestration(store, orchestration.id, deps);
+      const adjudicatePrompt = prompts.get(step.spawnedRunIds[0]!)!;
+      expect(adjudicatePrompt).toContain("earlier review of this work — [rework] Implement X: Missing an edge case.");
+      expect(adjudicatePrompt).toContain("empty netlist crashes the parser");
+      expect(adjudicatePrompt).toContain("if the same defect is still being reported");
+    });
+  });
+});
+
+describe("finishing with open subtasks", () => {
+  function withStore(fn: (store: SQLiteMemoryStore) => void): void {
+    const dir = mkdtempSync(join(tmpdir(), "agent-bridge-open-subtasks-"));
+    const store = new SQLiteMemoryStore(join(dir, "memories.db"));
+    try {
+      fn(store);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  // Plans one subtask and parks the orchestration in adjudication with it open.
+  function planOneOpenSubtask(store: SQLiteMemoryStore, logs: Map<string, string>, deps: OrchestratorDeps, title: string) {
+    const leader = createWorkerLeader(store, `leader-${title}`);
+    const task = store.createTask({ title, ownerAgent: "codex" });
+    const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id, maxParallel: 1 });
+    const planRunId = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
+    finishRun(store, logs, planRunId, fenced({
+      version: 1,
+      phase: "plan",
+      complexity: "small",
+      planMarkdown: "# Plan",
+      subtasks: [{ key: "s1", title: "Closeout doc", acceptanceCriteria: ["written"], dependsOn: [], files: [] }],
+      reviewers: [{ key: "r1", scope: ["s1"] }],
+      questions: [],
+    }));
+    stepOrchestration(store, orchestration.id, deps);
+    store.updateOrchestration(orchestration.id, { status: "adjudicating", cycle: 1 });
+    return { task, orchestration };
+  }
+
+  it("lets the leader drop an open subtask and finish in the same turn", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const prompts = new Map<string, string>();
+      const deps = makeDeps(store, logs, prompts);
+      const { task, orchestration } = planOneOpenSubtask(store, logs, deps, "Drop and finish");
+
+      const adjudicateRunId = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
+      // The leader is told the open subtask blocks completion, and with which verb to close it.
+      expect(prompts.get(adjudicateRunId)).toContain("`projectComplete: true` is REJECTED while any subtask is still open");
+      expect(prompts.get(adjudicateRunId)).toContain("Use `drop` to cancel a subtask outright");
+
+      finishRun(store, logs, adjudicateRunId, fenced({
+        version: 1,
+        phase: "adjudicate",
+        decisions: [{ subtaskKey: "s1", verdict: "drop" }],
+        projectComplete: true,
+        questions: [],
+      }));
+      const step = stepOrchestration(store, orchestration.id, deps);
+
+      expect(step.orchestration.status).toBe("reporting");
+      expect(store.listSubtasks({ parentTaskId: task.id })[0]?.status).toBe("cancelled");
+      // The guard must not have fired at all: no question to answer.
+      expect(store.listAgentRequests({ taskId: task.id, status: "pending" })).toHaveLength(0);
+    });
+  });
+
+  it("drops the open subtasks itself when the user picks that answer on the completion guard", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const { task, orchestration } = planOneOpenSubtask(store, logs, deps, "Guard answered");
+
+      const adjudicateRunId = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
+      finishRun(store, logs, adjudicateRunId, fenced({
+        version: 1,
+        phase: "adjudicate",
+        decisions: [],
+        projectComplete: true,
+        questions: [],
+      }));
+      let step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.orchestration.status).toBe("paused");
+
+      const guard = store
+        .listAgentRequests({ taskId: task.id, status: "pending" })
+        .find((request) => request.type === "question")!;
+      expect(guard.payload).toContain(DROP_OPEN_SUBTASKS_OPTION);
+      store.resolveAgentRequest(guard.id, "resolved", DROP_OPEN_SUBTASKS_OPTION);
+      store.updateOrchestration(orchestration.id, { status: "adjudicating" });
+
+      // Previously this spawned yet another leader turn, which marked the
+      // project complete again and landed back on the same guard forever.
+      step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.spawnedRunIds).toHaveLength(0);
+      expect(step.orchestration.status).toBe("reporting");
+      expect(store.listSubtasks({ parentTaskId: task.id })[0]?.status).toBe("cancelled");
+    });
+  });
+
+  it("leaves a free-text answer to the leader instead of dropping anything", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const { task, orchestration } = planOneOpenSubtask(store, logs, deps, "Free text answer");
+
+      const adjudicateRunId = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
+      finishRun(store, logs, adjudicateRunId, fenced({
+        version: 1,
+        phase: "adjudicate",
+        decisions: [],
+        projectComplete: true,
+        questions: [],
+      }));
+      stepOrchestration(store, orchestration.id, deps);
+      const guard = store
+        .listAgentRequests({ taskId: task.id, status: "pending" })
+        .find((request) => request.type === "question")!;
+      store.resolveAgentRequest(guard.id, "resolved", "keep going, but only the doc");
+      store.updateOrchestration(orchestration.id, { status: "adjudicating" });
+
+      const step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.orchestration.status).toBe("adjudicating");
+      expect(store.listSubtasks({ parentTaskId: task.id })[0]?.status).not.toBe("cancelled");
     });
   });
 });

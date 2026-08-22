@@ -6,7 +6,20 @@ import type {
   RegisteredAgent,
   Subtask,
 } from "@agent-bridge/memory";
-import { agentSupportsCapabilities, resolveAgentForPreference, uniqueAgentName } from "./agent-selector.js";
+import {
+  agentSupportsCapabilities,
+  resolveAgentForPreference,
+  resolveLeaderAgent,
+  uniqueAgentName,
+} from "./agent-selector.js";
+import {
+  contextKeyFor,
+  planOriginKey,
+  roundFor,
+  WORKBOARD_BOUNDARY_LINES,
+  type ContextStore,
+  type TurnKind,
+} from "./context-store.js";
 import {
   buildRetryPrompt,
   parseLeaderTurn,
@@ -16,7 +29,14 @@ import {
   type LeaderQuestion,
 } from "./leader-contract.js";
 import { renderAdjudicatePrompt, renderPlanPrompt, type PlanRevisionInput } from "./leader-prompts.js";
-import { parseReviewTurn, renderReviewerPrompt, renderReviewRetryPrompt } from "./review-contract.js";
+import { parseReviewTurn, renderReviewerPrompt, renderReviewRetryPrompt, type PriorReviewInput } from "./review-contract.js";
+import { describeInfraFailure, detectInfraFailure } from "./run-health.js";
+import {
+  readAdjudicationLedger,
+  readPlanLedger,
+  recordAdjudicationDecisions,
+  recordPlanDraft,
+} from "./turn-ledger.js";
 
 export type SpawnAgentTurnInput = {
   agent: RegisteredAgent;
@@ -41,8 +61,15 @@ export type OrchestratorDeps = {
   spawn: (input: SpawnAgentTurnInput) => AgentRun;
   // Returns the (already redacted) output of a finished run.
   readLog: (run: AgentRun) => string;
-  // Persists the leader's plan markdown and returns its path.
+  // Persists the leader's plan markdown and returns its path. Only used when
+  // `contextStoreFor` is absent — the context store files the plan itself, in
+  // the same folder as everything else the orchestration produced.
   writePlanFile: (markdown: string) => string;
+  // Opens the on-disk context store for an orchestration. Injected for the
+  // same reason writePlanFile is: core does no filesystem access. When it is
+  // absent the orchestrator falls back to inlining context into prompts, which
+  // is what it did before the store existed.
+  contextStoreFor?: (orchestrationId: string) => ContextStore;
   // Which CLI providers this machine can actually launch, with their usable
   // model ids. Injected because "is the claude CLI on PATH" is an adapters/CLI
   // concern. No longer used to widen the leader's staffing options — only
@@ -99,7 +126,19 @@ export function stepOrchestration(
       status: "failed",
       lastError: `Exceeded max_cycles (${orchestration.maxCycles}).`,
     }) ?? orchestration;
-    createQuestion(store, updated, { question: `Orchestration exceeded ${orchestration.maxCycles} cycles without completing.`, options: [] });
+    // Name what kept coming back. A bare cycle count tells the user the run
+    // gave up but not which subtask was in the loop that spent the budget.
+    const churning = store
+      .listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 })
+      .filter((subtask) => !["done", "cancelled"].includes(subtask.status))
+      .slice(0, 8)
+      .map((subtask) => `"${subtask.title}" [${subtask.status}]`);
+    createQuestion(store, updated, {
+      question: churning.length
+        ? `Orchestration hit its limit of ${orchestration.maxCycles} rework cycle(s) without completing. Still outstanding: ${churning.join(", ")}. Raise the limit, finish these yourself, or drop them.`
+        : `Orchestration exceeded ${orchestration.maxCycles} cycles without completing.`,
+      options: [],
+    });
     return noop(updated, "Exceeded max cycles; marked failed and raised a question for the user.");
   }
 
@@ -141,15 +180,20 @@ function stepPlanning(
       (run) => TERMINAL_RUN_STATUSES.has(run.status) && !isRunConsumed(store, orchestration.id, run.id),
     ),
   );
+  const ctx = deps.contextStoreFor?.(orchestration.id);
   const buildPrompt = () => {
     const task = mustGetTask(store, orchestration.taskId);
     return renderPlanPrompt({
       taskTitle: task.title,
       goal: task.goal,
       maxParallel: orchestration.maxParallel,
+      contextRoot: ctx ? { root: ctx.root, plan: ctx.planPath } : undefined,
       ...resolveProviderOptions(store, orchestration, deps),
       revision: buildPlanRevision(store, orchestration, deps),
-      answers: latestQuestionAnswers(store, orchestration.id),
+      ledger: readPlanLedger(store, orchestration.id),
+      answers: allQuestionAnswers(store, orchestration.id),
+      approvalNotes: allApprovalNotes(store, orchestration),
+      ...renderQuestionBudget(orchestration, planQuestionRounds(store, orchestration.id)),
     });
   };
 
@@ -192,6 +236,49 @@ export function resumeStatusFor(
   return "executing";
 }
 
+export type ChangeLeaderResult = {
+  orchestration: Orchestration;
+  leader: RegisteredAgent;
+  previousLeaderId: string;
+  changed: boolean;
+};
+
+// Moves a running orchestration onto another leader. The only supported repair
+// for a run whose leader row was deleted or misconfigured — before this, the
+// leader was fixed at creation and every step of such a run died with
+// "Registered agent not found".
+//
+// It always resolves a dedicated lead-only row (find-or-create), never a staff
+// agent: leader rows are plumbing and are deliberately kept out of the Agents
+// tab, so promoting an agent the user hired there would put the same trap back.
+export function changeOrchestrationLeader(
+  store: MemoryStore,
+  orchestrationId: string,
+  preference: LeaderAgentPreference,
+  defaults: { command?: string } = {},
+): ChangeLeaderResult {
+  const orchestration = store.getOrchestration(orchestrationId);
+  if (!orchestration) throw new Error(`Orchestration not found: ${orchestrationId}`);
+  const previousLeaderId = orchestration.leaderAgentId;
+  const leader = resolveLeaderAgent(store, preference, defaults);
+  if (leader.id === previousLeaderId) {
+    return { orchestration, leader, previousLeaderId, changed: false };
+  }
+  // The stored error is almost always the unresolvable leader itself; leaving
+  // it would keep the board red after the run is healthy again.
+  const updated = store.updateOrchestration(orchestrationId, { leaderAgentId: leader.id, lastError: null });
+  if (!updated) throw new Error(`Orchestration not found: ${orchestrationId}`);
+  const previous = store.getRegisteredAgent(previousLeaderId);
+  recordEvent(
+    store,
+    updated,
+    "plan",
+    "user_action",
+    `Leader changed from ${previous ? describeAgent(previous) : previousLeaderId} to ${describeAgent(leader)}.`,
+  );
+  return { orchestration: updated, leader, previousLeaderId, changed: true };
+}
+
 // The change request (and the prior plan/report text the caller captured for
 // it) is recorded as an orchestration event rather than a column: it is a
 // point-in-time user action, and core stays free of filesystem access by
@@ -231,6 +318,29 @@ export type SpawnApprovalResponse = {
   agentId?: string;
   note?: string;
 };
+
+// Every note the user typed when approving a spawn, oldest first. A note is an
+// instruction attached to a yes ("go ahead, but stop after this one"), and
+// nothing read them: only `agentId` was ever pulled out of the response, so the
+// text was accepted, stored, and silently dropped. They are standing user
+// directives, so they are carried into the leader turns the same way answers
+// are, not just into the one turn the approval unblocked.
+export function allApprovalNotes(
+  store: MemoryStore,
+  orchestration: Orchestration,
+): Array<{ approved: string; note: string }> | undefined {
+  const notes: Array<{ approved: string; note: string }> = [];
+  for (const request of store.listAgentRequests({ taskId: orchestration.taskId, limit: 500 })) {
+    if (request.type !== "approval" || request.status !== "accepted" || !request.response) continue;
+    const payload = safeParse<SpawnApprovalPayload>(request.payload ?? "");
+    if (payload?.type !== "spawn-approval" || payload.orchestrationId !== orchestration.id) continue;
+    const parsed = safeParse<SpawnApprovalResponse>(request.response);
+    const note = parsed?.type === "spawn-approval-response" ? parsed.note : request.response;
+    if (note?.trim()) notes.push({ approved: request.title, note: note.trim() });
+  }
+  if (!notes.length) return undefined;
+  return notes.reverse();
+}
 
 function approvalFor(
   store: MemoryStore,
@@ -371,17 +481,66 @@ function pendingQuestionsFor(
   return questions.filter((question) => !settled.has(question.question));
 }
 
-// The most recent batch of answers the user sent back, for the next plan turn.
-function latestQuestionAnswers(
+// Every answer the user has given across all planning rounds, for the next
+// plan turn. Only the newest batch used to be carried, so a leader that asked
+// again in round 3 never saw what it had been told in round 1 — it re-asked
+// the same thing in different words and the run looped through plan/approve
+// forever. Answers accumulate oldest-first; a question answered twice keeps
+// the newest answer.
+function allQuestionAnswers(
   store: MemoryStore,
   orchestrationId: string,
 ): Array<{ question: string; answer: string }> | undefined {
-  for (const event of store.listOrchestrationEvents({ orchestrationId, limit: 1000 })) {
+  const byQuestion = new Map<string, string>();
+  const events = store.listOrchestrationEvents({ orchestrationId, limit: 1000 });
+  for (const event of [...events].reverse()) {
     if (event.kind !== "user_action" || !event.payload) continue;
     const parsed = safeParse<QuestionAnswersPayload>(event.payload);
-    if (parsed?.type === "question-answers") return parsed.answers;
+    if (parsed?.type !== "question-answers") continue;
+    for (const entry of parsed.answers) byQuestion.set(entry.question, entry.answer);
   }
-  return undefined;
+  if (!byQuestion.size) return undefined;
+  return [...byQuestion].map(([question, answer]) => ({ question, answer }));
+}
+
+// The most times the leader may park the run on questions. A ceiling, never a
+// quota: a leader that has nothing left to ask should plan on turn one. It
+// exists only to stop the plan/answer loop a leader falls into when it re-asks
+// settled ground in new words. Set per orchestration at start; the env var is
+// the fallback for callers that do not expose the field.
+const DEFAULT_PLAN_QUESTION_ROUND_LIMIT = 4;
+const PLAN_QUESTION_EVENT_PREFIX = "Leader raised";
+
+function planQuestionRoundLimit(orchestration: Orchestration): number {
+  if (orchestration.maxQuestionRounds !== undefined && orchestration.maxQuestionRounds >= 0) {
+    return orchestration.maxQuestionRounds;
+  }
+  const raw = process.env.AGENT_BRIDGE_PLAN_QUESTION_ROUNDS;
+  if (raw === undefined) return DEFAULT_PLAN_QUESTION_ROUND_LIMIT;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_PLAN_QUESTION_ROUND_LIMIT;
+}
+
+// What the plan prompt is told about its remaining question budget: the exact
+// number left, so the leader can ration rounds instead of discovering the wall
+// only when it hits it.
+function renderQuestionBudget(
+  orchestration: Orchestration,
+  rounds: number,
+): { questionRoundsLeft: number; noMoreQuestions: boolean } {
+  const left = Math.max(0, planQuestionRoundLimit(orchestration) - rounds);
+  return { questionRoundsLeft: left, noMoreQuestions: left === 0 };
+}
+
+function planQuestionRounds(store: MemoryStore, orchestrationId: string): number {
+  return store
+    .listOrchestrationEvents({ orchestrationId, limit: 1000 })
+    .filter(
+      (event) =>
+        event.kind === "user_action" &&
+        event.phase === "plan" &&
+        event.summary?.startsWith(PLAN_QUESTION_EVENT_PREFIX),
+    ).length;
 }
 
 function buildPlanRevision(
@@ -424,27 +583,54 @@ function applyPlanTurn(
   deps: OrchestratorDeps,
   finishedRunId?: string,
 ): OrchestrationStepResult {
+  // Record the draft before anything can return early. The question branch
+  // below parks the orchestration without ever writing a plan file, so this is
+  // the only place the leader's own draft survives to the next round — and its
+  // absence is what made that round re-plan from the goal.
+  recordPlanDraft(store, orchestration, turn);
+
   // Questions from a plan turn are gating, not decorative: the leader is
   // saying it had to guess. Applying the plan anyway bakes those guesses into
   // subtasks that implementers then build. Park the orchestration until the
   // user answers (or dismisses) them, then re-plan with the answers in hand.
   const unanswered = pendingQuestionsFor(store, orchestration, turn.questions);
-  if (unanswered.length) {
+  const rounds = planQuestionRounds(store, orchestration.id);
+  if (unanswered.length && rounds < planQuestionRoundLimit(orchestration)) {
     for (const question of unanswered) createQuestion(store, orchestration, question);
     const updated = store.updateOrchestration(orchestration.id, {
       status: "paused",
       lastError: `Leader asked ${unanswered.length} question(s) before it can plan properly. Answer them to continue.`,
     }) ?? orchestration;
-    recordEvent(store, updated, "plan", "user_action", `Leader raised ${unanswered.length} planning question(s); awaiting answers.`);
+    recordEvent(store, updated, "plan", "user_action", `${PLAN_QUESTION_EVENT_PREFIX} ${unanswered.length} planning question(s); awaiting answers.`);
     return result(updated, `Leader raised ${unanswered.length} question(s); paused for your answers.`, []);
+  }
+  // Past the limit the questions are no longer gating: parking again is what
+  // produced the plan/answer/re-plan loop, since a reworded question never
+  // matches an already-settled one. Record them and plan on with whatever the
+  // leader assumed — the no-subtask branch below still stops for the user if
+  // the turn produced nothing usable.
+  if (unanswered.length) {
+    recordEvent(
+      store,
+      orchestration,
+      "plan",
+      "user_action",
+      `Leader asked ${unanswered.length} more question(s) after ${rounds} answered round(s); proceeding on its stated assumptions.`,
+    );
   }
 
   // "Nothing left to build" is a real answer on a re-plan: the change request
   // may already be satisfied by what exists. Finish instead of failing. On a
   // first plan it means the leader produced nothing usable, which is a failure
   // the user has to see.
+  const ctx = deps.contextStoreFor?.(orchestration.id);
+  const revision = buildPlanRevision(store, orchestration, deps);
+  const revisionEntry = revision
+    ? { trigger: `change request — ${revision.request}`, change: turn.planMarkdown.split("\n")[0] ?? "re-planned" }
+    : { trigger: "re-plan", change: turn.planMarkdown.split("\n")[0] ?? "re-planned" };
+
   if (!turn.subtasks.length) {
-    const planPath = deps.writePlanFile(turn.planMarkdown);
+    const planPath = writePlanDocument(orchestration, deps, ctx, turn.planMarkdown, revisionEntry);
     const existing = store.listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 });
     if (!existing.length) {
       createQuestion(store, orchestration, {
@@ -458,18 +644,36 @@ function applyPlanTurn(
       }) ?? orchestration;
       return result(updated, "Leader produced no subtasks; paused for your input.", []);
     }
+    const superseded = existing.filter((subtask) => !["done", "cancelled"].includes(subtask.status));
+    for (const subtask of superseded) {
+      store.updateSubtask(subtask.id, {
+        status: "cancelled",
+        statusReason: "Superseded when the leader found no work left in the newer plan.",
+      });
+    }
     const updated = store.updateOrchestration(orchestration.id, {
       status: "reporting",
       complexity: turn.complexity,
       planPath,
     }) ?? orchestration;
-    recordEvent(store, updated, "plan", "leader_turn", "Leader found no work left to do; going straight to reporting.");
+    recordEvent(
+      store,
+      updated,
+      "plan",
+      "leader_turn",
+      `Leader found no work left to do; cancelled ${superseded.length} open subtask(s) from the superseded plan and is going to reporting.`,
+    );
     if (finishedRunId) recordEvent(store, updated, "plan", "run_ended", `Consumed plan run ${finishedRunId}.`);
     return result(updated, "Leader found nothing left to build; ready for reporting.", []);
   }
 
   const roles = store.ensureDefaultWorkforceRoles();
   const subtaskIdByKey = new Map<string, string>();
+  // `orchestration.cycle` is a rework budget and is reset to 1 whenever a new
+  // plan is applied. It therefore cannot namespace plan keys: two replans that
+  // both happen at cycle 1 would overwrite each other's c1-s1 context folder.
+  // Use the monotonic plan application number instead.
+  const planContextCycle = nextPlanContextCycle(store, orchestration.id);
 
   for (const item of turn.subtasks) {
     const subtask = store.createSubtask({
@@ -488,6 +692,7 @@ function applyPlanTurn(
       type: "subtask",
       key: item.key,
       subtaskId: subtaskIdByKey.get(item.key)!,
+      planCycle: planContextCycle,
       role: item.role,
       parallelSafe: item.parallelSafe,
       files: item.files,
@@ -508,15 +713,22 @@ function applyPlanTurn(
   }
 
   // A re-plan supersedes the previous one — the leader is told to plan only
-  // the work that is still needed — so subtasks it did not carry over are
-  // stale. Leaving them "todo" strands them: reviewer keys are reused, so the
-  // new scope replaced the old one and nothing would ever review them, and
-  // anything depending on them could never start.
+  // the work that is still needed — so every non-terminal subtask it did not
+  // carry over is stale. This includes `review`: reviewer scopes are replaced
+  // by the new plan, so those rows otherwise wait for a reviewer forever.
   const planned = new Set(subtaskIdByKey.values());
   const superseded = store
     .listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 })
-    .filter((subtask) => subtask.status === "todo" && !planned.has(subtask.id));
-  for (const subtask of superseded) store.updateSubtask(subtask.id, { status: "cancelled" });
+    .filter((subtask) => !["done", "cancelled"].includes(subtask.status) && !planned.has(subtask.id));
+  for (const subtask of superseded) {
+    store.updateSubtask(subtask.id, {
+      status: "cancelled",
+      statusReason: "Superseded by a newer leader plan.",
+    });
+    for (const review of store.listReviews({ subtaskId: subtask.id, consumed: false })) {
+      store.markReviewConsumed(review.id);
+    }
+  }
   if (superseded.length) {
     recordEvent(
       store,
@@ -527,13 +739,14 @@ function applyPlanTurn(
     );
   }
 
-  const planPath = deps.writePlanFile(turn.planMarkdown);
+  const planPath = writePlanDocument(orchestration, deps, ctx, turn.planMarkdown, revisionEntry);
   const updated = store.updateOrchestration(orchestration.id, {
     status: "executing",
     complexity: turn.complexity,
     planPath,
     cycle: 1,
   }) ?? orchestration;
+  if (ctx) refreshContextIndex(store, updated, ctx);
   recordEvent(store, updated, "plan", "leader_turn", `Leader produced ${turn.subtasks.length} subtask(s) and ${turn.reviewers.length} reviewer group(s).`);
   // Marks this plan run consumed so a later change request re-enters planning
   // with a clean slate instead of re-applying this same plan.
@@ -551,14 +764,23 @@ function stepExecuting(
   orchestration: Orchestration,
   deps: OrchestratorDeps,
 ): OrchestrationStepResult {
-  const pendingReviews = store.listReviews({ taskId: orchestration.taskId, consumed: false });
+  const subtasks = store.listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 });
+  const reviewReadyIds = new Set(
+    subtasks.filter((subtask) => subtask.status === "review").map((subtask) => subtask.id),
+  );
+  // Reviews are task-scoped in storage, while an orchestration can be replanned
+  // many times. A review left on a superseded/cancelled subtask must not send a
+  // fresh plan directly to adjudication before any of its work is dispatched.
+  const pendingReviews = store
+    .listReviews({ taskId: orchestration.taskId, consumed: false })
+    .filter((review) => review.subtaskId && reviewReadyIds.has(review.subtaskId));
   if (pendingReviews.length) {
     const updated = store.updateOrchestration(orchestration.id, { status: "adjudicating" }) ?? orchestration;
     return result(updated, `${pendingReviews.length} review(s) pending; moving to adjudication.`, []);
   }
 
-  const subtasks = store.listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 });
   const activeRuns = store.listAgentRuns({ orchestrationId: orchestration.id, limit: 500 });
+  const ctx = deps.contextStoreFor?.(orchestration.id);
 
   // 1) Spawn implementers for anything dispatchable, up to maxParallel.
   const doneIds = new Set(subtasks.filter((subtask) => subtask.status === "done").map((subtask) => subtask.id));
@@ -600,7 +822,10 @@ function stepExecuting(
       // the orchestration, which is a very expensive way to skip one subtask.)
       if (gate.decision === "rejected") {
         rejectedCount += 1;
-        store.updateSubtask(subtask.id, { status: "blocked" });
+        store.updateSubtask(subtask.id, {
+          status: "blocked",
+          statusReason: "Assignment rejected by the user.",
+        });
         recordEvent(
           store,
           orchestration,
@@ -644,11 +869,24 @@ function stepExecuting(
 
   // 2) Reconcile implementer runs that finished since the last step.
   const finishedImplementerRuns = activeRuns.filter(
-    (run) => run.phase === "implement" && TERMINAL_RUN_STATUSES.has(run.status) && run.subtaskId,
+    (run) =>
+      run.phase === "implement"
+      && TERMINAL_RUN_STATUSES.has(run.status)
+      && run.subtaskId
+      && !isRunConsumed(store, orchestration.id, run.id),
   );
   for (const run of finishedImplementerRuns) {
     const subtask = subtasks.find((candidate) => candidate.id === run.subtaskId);
     if (!subtask || (subtask.status !== "assigned" && subtask.status !== "in_progress")) continue;
+    // A context-document retry for this subtask is still running: reconciling
+    // now would spend the gate's budget on the very file that run is writing.
+    if (activeRuns.some((other) => other.subtaskId === subtask.id && ACTIVE_STATUSES.has(other.status))) continue;
+    const log = deps.readLog(run);
+    // An agent the OS never let run a command exits 0 and signs off politely.
+    // Routed through review that is indistinguishable from bad work: the
+    // reviewer says the criteria are unmet, adjudication spends a rework
+    // cycle, and the replacement fails identically. Catch it here instead.
+    const infra = detectInfraFailure(log);
     // "detached" only means the process vanished before a clean exit event
     // reached us — with agents spawned by one process and reaped by another
     // that is routine, and the work is usually finished (observed live: a
@@ -657,9 +895,35 @@ function stepExecuting(
     // work cheaply, whereas a false "blocked" throws the work away and stalls
     // the whole orchestration. Only a real failure or a user cancellation
     // blocks.
-    const treatAsFailure = run.status === "failed" || run.status === "stopped";
+    const treatAsFailure = run.status === "failed" || run.status === "stopped" || Boolean(infra);
+    // The report is the only account of this attempt that the reviewer, the
+    // adjudicator and any later attempt will ever see, so ask for it before
+    // the subtask leaves the implementer's hands. Skipped for a failed run:
+    // there is nothing to report and the retry would only waste a spawn.
+    if (!treatAsFailure && ctx) {
+      const target = contextTargetFor(store, orchestration, subtask);
+      const check = ctx.checkTurn("report", target.contextKey, target.round);
+      if (!check.ok) {
+        const retry = retryForMissingContext(store, orchestration, deps, {
+          phase: "implement",
+          agent: store.getRegisteredAgent(run.agentId),
+          tag: `report:${target.contextKey}:${target.round}`,
+          missing: [{ path: check.path, reason: check.reason }],
+          sourceRun: run,
+          extra: { subtaskId: subtask.id, assignmentId: run.assignmentId, roleId: run.roleId },
+        });
+        if (retry) return retry;
+      }
+    }
     const nextStatus = treatAsFailure ? "blocked" : "review";
-    store.updateSubtask(subtask.id, { status: nextStatus });
+    store.updateSubtask(subtask.id, {
+      status: nextStatus,
+      statusReason: treatAsFailure
+        ? infra
+          ? describeInfraFailure(infra)
+          : `Implementer run ended with status ${run.status}.`
+        : undefined,
+    });
     if (run.assignmentId) {
       store.updateAssignment(run.assignmentId, {
         status: treatAsFailure ? "failed" : "waiting",
@@ -668,8 +932,32 @@ function stepExecuting(
         // per-subtask context that accumulates for the whole project — 2000
         // chars each measured ~2.5k tokens on a 12-assignment task. The tail of
         // an agent log is its closing summary, which fits comfortably here.
-        resultSummary: safeTail(deps.readLog(run), ASSIGNMENT_SUMMARY_CHARS),
+        // The log tail of an environment failure is the agent's own apology,
+        // which reads as "it chose not to do the work" in every prompt that
+        // replays this summary. Say what actually happened instead.
+        resultSummary: infra ? describeInfraFailure(infra) : safeTail(log, ASSIGNMENT_SUMMARY_CHARS),
       });
+    }
+    if (infra) {
+      // Only the user can fix this, so raise it once per orchestration rather
+      // than per run — but do not pause: other providers may be unaffected
+      // (observed live: every codex run was refused while every claude run on
+      // the same machine worked), and the leader can re-staff around it at
+      // adjudication once it sees the blocked subtask and this summary.
+      const agent = store.getRegisteredAgent(run.agentId);
+      const title = `Agent "${agent?.name ?? run.agentId}" cannot run commands on this machine (${infra.kind}). ${infra.detail}`;
+      const alreadyRaised = store
+        .listAgentRequests({ taskId: orchestration.taskId, limit: 500 })
+        .some((request) => request.title === title);
+      if (!alreadyRaised) createQuestion(store, orchestration, { question: title, options: [] });
+      recordEvent(
+        store,
+        orchestration,
+        "implement",
+        "error",
+        `Implementer run ${run.id} never executed a command (${infra.kind}, ${infra.occurrences} refusals); blocked "${subtask.title}" instead of sending unrun work to review.`,
+      );
+      return result(orchestration, `Implementer run ${run.id} hit an environment failure (${infra.kind}); blocked the subtask.`, []);
     }
     recordEvent(store, orchestration, "implement", "run_ended", `Implementer run ${run.id} finished (${run.status}) for ${subtask.title}.`);
     return result(orchestration, `Recorded completion of implementer run ${run.id}.`, []);
@@ -690,6 +978,9 @@ function stepExecuting(
   for (const run of finishedReviewerRuns) {
     if (!run.assignmentId) continue;
     if (isRunConsumed(store, orchestration.id, run.id)) continue;
+    // Same reason as the implementer branch: wait for a document retry on this
+    // assignment before judging whether its document is missing.
+    if (activeRuns.some((other) => other.assignmentId === run.assignmentId && ACTIVE_STATUSES.has(other.status))) continue;
     // A retry run and the run it replaced share one assignment. Once either of
     // them has delivered the verdicts, the others have nothing left to say —
     // re-parsing their truncated logs would only fail and drag the whole
@@ -708,6 +999,24 @@ function stepExecuting(
     const parsed = parseReviewTurn(deps.readLog(run));
     if (!parsed.ok) {
       return handleReviewParseFailure(store, orchestration, deps, run, reviewerMeta, parsed.error);
+    }
+    // The JSON verdict is what the orchestrator acts on; the review document is
+    // what the next attempt and the adjudicator read. Ask for it before the
+    // verdicts are recorded, while the reviewer's own turn is still the thing
+    // being retried.
+    if (ctx) {
+      const missing = missingReviewDocuments(store, orchestration, ctx, reviewerMeta, parsed.turn.reviews, subtasks);
+      if (missing.length) {
+        const retry = retryForMissingContext(store, orchestration, deps, {
+          phase: "review",
+          agent: store.getRegisteredAgent(run.agentId),
+          tag: `review:${run.assignmentId}`,
+          missing,
+          sourceRun: run,
+          extra: { assignmentId: run.assignmentId, roleId: run.roleId },
+        });
+        if (retry) return retry;
+      }
     }
     applyReviewTurn(store, orchestration, run, reviewerMeta, parsed.turn.reviews, subtasks);
     recordEvent(store, orchestration, "review", "run_ended", `Reviewer run ${run.id} produced ${parsed.turn.reviews.length} verdict(s).`);
@@ -747,7 +1056,17 @@ function stepExecuting(
       pair.subtask.status === "in_progress" ||
       (pair.subtask.status === "todo" && pair.subtask.dependsOn.every((depId) => doneIds.has(depId)));
     if (unreviewed.some((pair) => pair.subtask.status !== "review" && canStillProgress(pair))) continue;
-    const reviewKey = `review:${reviewerMeta.reviewerKey}:${ready.map((pair) => pair.entry.key).join(",")}`;
+    const reviewBaseKey = `review:${reviewerMeta.reviewerKey}:${ready.map((pair) => pair.entry.key).join(",")}`;
+    const priorReviewerRuns = activeRuns.filter(
+      (run) =>
+        run.phase === "review" &&
+        findReviewerMetaForRun(store, orchestration.id, run, reviewerMetas)?.reviewerKey === reviewerMeta.reviewerKey,
+    ).length;
+    // The first attempt keeps the historic key so an approval already pending
+    // during an upgrade is still usable. Every later spawn gets a fresh key:
+    // one accepted review approval must not authorise infinite failed retries
+    // or a later rework round for the same reviewer group.
+    const reviewKey = priorReviewerRuns ? `${reviewBaseKey}:attempt-${priorReviewerRuns + 1}` : reviewBaseKey;
     const candidate = tryResolveAgent(() => resolveReviewerAgent(store, orchestration, reviewerMeta, deps, reviewKey));
     const gated = gateSpawn(
       store,
@@ -757,7 +1076,7 @@ function stepExecuting(
       candidate?.id,
     );
     if (gated) return gated;
-    const run = spawnReviewer(store, orchestration, reviewerMeta, ready, deps);
+    const run = spawnReviewer(store, orchestration, reviewerMeta, ready, deps, reviewKey);
     return result(orchestration, `Spawned reviewer run for ${reviewerMeta.reviewerKey}.`, [run.id]);
   }
 
@@ -781,7 +1100,36 @@ function spawnImplementer(
   const meta = getSubtaskMeta(store, orchestration.id, subtask.id);
   const role = mustGetRole(store, meta?.role ?? "implementer");
   const agent = resolveImplementerAgent(store, orchestration, subtask, deps);
-  const prompt = renderImplementerPrompt(subtask, meta?.files ?? []);
+  const ctx = deps.contextStoreFor?.(orchestration.id);
+  const files = meta?.files ?? [];
+  let context: ImplementerContextPaths | undefined;
+  if (ctx) {
+    const target = contextTargetFor(store, orchestration, subtask);
+    writeAssignmentBrief(store, orchestration, ctx, subtask, files, target);
+    context = {
+      brief: ctx.briefPath(target.contextKey),
+      // Every document from the attempts this one replaces, in full. This is
+      // what the truncated rework blob in the prompt used to stand in for.
+      prior: priorRoundPaths(ctx, target, ["report", "review", "adjudication"]),
+      write: ctx.turnPath("report", target.contextKey, target.round),
+      round: target.round,
+    };
+    ctx.appendAssignment({
+      contextKey: target.contextKey,
+      round: target.round,
+      role: role.name,
+      agent: agent.name,
+      subtaskTitle: subtask.title,
+    });
+  }
+  const prompt = renderImplementerPrompt(
+    subtask,
+    files,
+    // With the documents on disk there is nothing left for the inlined rework
+    // blob to add, and it is the larger of the two by an order of magnitude.
+    context ? undefined : reworkContextFor(store, orchestration, subtask),
+    context,
+  );
   const assignment = store.createAssignment({
     taskId: orchestration.taskId,
     subtaskId: subtask.id,
@@ -819,8 +1167,8 @@ function resolveImplementerAgent(
     if (agent) return agent;
   }
   const meta = getSubtaskMeta(store, orchestration.id, subtask.id);
-  if (meta?.agentPreference) assertProviderAllowed(orchestration, meta.agentPreference.provider, "implementer");
-  return resolveStaffAgent(store, orchestration, deps, "implement", meta?.agentPreference);
+  const preference = meta?.agentPreference;
+  return resolveStaffAgent(store, orchestration, deps, "implement", preference);
 }
 
 function resolveReviewerAgent(
@@ -835,8 +1183,8 @@ function resolveReviewerAgent(
     const agent = store.getRegisteredAgent(chosen);
     if (agent) return agent;
   }
-  if (reviewerMeta.agentPreference) assertProviderAllowed(orchestration, reviewerMeta.agentPreference.provider, "reviewer");
-  return resolveStaffAgent(store, orchestration, deps, "review", reviewerMeta.agentPreference);
+  const preference = reviewerMeta.agentPreference;
+  return resolveStaffAgent(store, orchestration, deps, "review", preference);
 }
 
 function spawnReviewer(
@@ -845,6 +1193,7 @@ function spawnReviewer(
   reviewerMeta: ReviewerPlanMeta,
   scopeSubtasks: Array<{ entry: { key: string; subtaskId: string }; subtask: Subtask }>,
   deps: OrchestratorDeps,
+  approvalKey: string,
 ): AgentRun {
   const role = mustGetRole(store, reviewerMeta.role ?? "reviewer");
   const agent = resolveReviewerAgent(
@@ -852,7 +1201,10 @@ function spawnReviewer(
     orchestration,
     reviewerMeta,
     deps,
-    `review:${reviewerMeta.reviewerKey}:${scopeSubtasks.map((pair) => pair.entry.key).join(",")}`,
+    // Use the exact key that was displayed and approved. Rebuilding the base
+    // key here discarded attempt suffixes, so a retry approved as Codex still
+    // resolved the leader's original Claude preference at spawn time.
+    approvalKey,
   );
   const task = mustGetTask(store, orchestration.taskId);
   const assignmentsBySubtask = new Map(
@@ -861,15 +1213,37 @@ function spawnReviewer(
       latestByCreatedAt(store.listAssignments({ subtaskId: pair.subtask.id, limit: 20 })),
     ]),
   );
+  const titleBySubtaskId = new Map(
+    store.listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 }).map((subtask) => [subtask.id, subtask.title]),
+  );
+  const ctx = deps.contextStoreFor?.(orchestration.id);
   const prompt = renderReviewerPrompt({
     taskTitle: task.title,
-    subtasks: scopeSubtasks.map((pair) => ({
-      key: pair.entry.key,
-      title: pair.subtask.title,
-      goal: pair.subtask.goal,
-      acceptanceCriteria: pair.subtask.acceptanceCriteria,
-      resultSummary: assignmentsBySubtask.get(pair.subtask.id)?.resultSummary,
-    })),
+    subtasks: scopeSubtasks.map((pair) => {
+      const target = ctx ? contextTargetFor(store, orchestration, pair.subtask) : undefined;
+      return {
+        key: pair.entry.key,
+        title: pair.subtask.title,
+        goal: pair.subtask.goal,
+        acceptanceCriteria: pair.subtask.acceptanceCriteria,
+        // Both of these are replaced by the documents once there is a store:
+        // the 800-character log tail by the implementer's own report, and the
+        // replayed prior reviews by the files they were summarised from.
+        resultSummary: ctx ? undefined : assignmentsBySubtask.get(pair.subtask.id)?.resultSummary,
+        priorReviews: ctx
+          ? undefined
+          : priorReviewsForScopeEntry(store, reviewerMeta, pair.entry.key, titleBySubtaskId),
+        context:
+          ctx && target
+            ? {
+                brief: ctx.briefPath(target.contextKey),
+                report: ctx.turnPath("report", target.contextKey, target.round),
+                prior: priorRoundPaths(ctx, target, ["review", "adjudication"]),
+                write: ctx.turnPath("review", target.contextKey, target.round),
+              }
+            : undefined,
+      };
+    }),
   });
   const assignment = store.createAssignment({
     taskId: orchestration.taskId,
@@ -890,6 +1264,64 @@ function spawnReviewer(
     `Spawned reviewer ${reviewerMeta.reviewerKey} for ${scopeSubtasks.map((pair) => pair.entry.key).join(", ")} (${run.id}).`,
   );
   return run;
+}
+
+// Reviews already written for this scope entry — including the ones written
+// against the subtask it replaced. Adjudication cancels a reworked subtask and
+// creates a new one keyed `<origin>-rework-<cycle>`, so the reviewer of the
+// second attempt is looking at a subtask with no review history of its own
+// while the findings it must verify sit on the cancelled original. Walking the
+// suffix back gives it that history (and keeps working for a rework of a
+// rework).
+function priorReviewsForScopeEntry(
+  store: MemoryStore,
+  reviewerMeta: ReviewerPlanMeta,
+  key: string,
+  titleBySubtaskId: Map<string, string>,
+): PriorReviewInput[] | undefined {
+  const subtaskIdByKey = new Map(reviewerMeta.scope.map((entry) => [entry.key, entry.subtaskId]));
+  const chain: string[] = [];
+  let current: string | undefined = key;
+  while (current) {
+    chain.unshift(current);
+    const origin: string | undefined = current.match(/^(.+)-rework-\d+$/)?.[1];
+    current = origin && subtaskIdByKey.has(origin) ? origin : undefined;
+  }
+  const priors: PriorReviewInput[] = [];
+  for (const entryKey of chain) {
+    const subtaskId = subtaskIdByKey.get(entryKey);
+    if (!subtaskId) continue;
+    for (const review of store.listReviews({ subtaskId, limit: 20 })) {
+      priors.push({
+        subtaskTitle: titleBySubtaskId.get(subtaskId) ?? entryKey,
+        verdict: review.verdict,
+        summary: review.summary,
+        findings: review.findings,
+      });
+    }
+  }
+  return priors.length ? priors : undefined;
+}
+
+function missingReviewDocuments(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  ctx: ContextStore,
+  reviewerMeta: ReviewerPlanMeta | undefined,
+  items: Array<{ subtaskKey: string }>,
+  subtasks: Subtask[],
+): Array<{ path: string; reason: string }> {
+  const missing: Array<{ path: string; reason: string }> = [];
+  for (const item of items) {
+    const scopeEntry = reviewerMeta?.scope.find((entry) => entry.key === item.subtaskKey);
+    const subtaskId = scopeEntry?.subtaskId ?? findSubtaskMetaByKey(store, orchestration.id, item.subtaskKey)?.subtaskId;
+    const subtask = subtasks.find((candidate) => candidate.id === subtaskId);
+    if (!subtask) continue;
+    const target = contextTargetFor(store, orchestration, subtask);
+    const check = ctx.checkTurn("review", target.contextKey, target.round);
+    if (!check.ok) missing.push({ path: check.path, reason: check.reason });
+  }
+  return missing;
 }
 
 function applyReviewTurn(
@@ -924,11 +1356,66 @@ function applyReviewTurn(
 // Adjudicating phase
 // ---------------------------------------------------------------------------
 
+// The completion guard asks this when the leader calls the project done with
+// subtasks still open. The first option is carried out here, not by the leader:
+// answering it in prose only ever produced another leader turn, which marked
+// the project complete again and landed straight back on the guard.
+export const OPEN_SUBTASKS_QUESTION_KIND = "open-subtasks";
+export const DROP_OPEN_SUBTASKS_OPTION = "Drop the open subtasks and finish the orchestration";
+export const SEND_OPEN_SUBTASKS_BACK_OPTION = "Send them back to the leader to finish properly";
+
+// Cancels the still-open subtasks and moves to reporting when the user picked
+// the drop option on the newest completion guard. Returns undefined when there
+// is nothing to act on, so the caller carries on with a normal turn — a
+// free-text answer is left to the leader, which can now `drop` them itself.
+function applyOpenSubtaskDrop(
+  store: MemoryStore,
+  orchestration: Orchestration,
+): OrchestrationStepResult | undefined {
+  const guard = store
+    .listAgentRequests({ taskId: orchestration.taskId, limit: 500 })
+    .find((request) => {
+      if (request.type !== "question") return false;
+      return safeParse<{ kind?: string }>(request.payload ?? "")?.kind === OPEN_SUBTASKS_QUESTION_KIND;
+    });
+  if (!guard || guard.status === "pending" || guard.response?.trim() !== DROP_OPEN_SUBTASKS_OPTION) return undefined;
+  // Acted on once only. A later cycle that opens new subtasks must not be
+  // cleared out by an answer the user gave about a different set of them.
+  const applied = store
+    .listOrchestrationEvents({ orchestrationId: orchestration.id, kind: "user_action", limit: META_SCAN_LIMIT })
+    .some((event) => event.summary?.includes(guard.id));
+  if (applied) return undefined;
+
+  const outstanding = store
+    .listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 })
+    .filter((subtask) => !["done", "cancelled"].includes(subtask.status));
+  if (!outstanding.length) return undefined;
+
+  for (const subtask of outstanding) {
+    store.updateSubtask(subtask.id, {
+      status: "cancelled",
+      statusReason: "Dropped at your request so the orchestration could finish.",
+    });
+  }
+  recordEvent(
+    store,
+    orchestration,
+    "adjudicate",
+    "user_action",
+    `Dropped ${outstanding.length} open subtask(s) at your request (${guard.id}); finishing the orchestration.`,
+  );
+  const updated = store.updateOrchestration(orchestration.id, { status: "reporting", lastError: null }) ?? orchestration;
+  return result(updated, `Dropped ${outstanding.length} open subtask(s); ready for reporting.`, []);
+}
+
 function stepAdjudicating(
   store: MemoryStore,
   orchestration: Orchestration,
   deps: OrchestratorDeps,
 ): OrchestrationStepResult {
+  const dropped = applyOpenSubtaskDrop(store, orchestration);
+  if (dropped) return dropped;
+
   const adjudicateRuns = store
     .listAgentRuns({ orchestrationId: orchestration.id, limit: 100 })
     .filter((run) => run.phase === "adjudicate");
@@ -942,7 +1429,7 @@ function stepAdjudicating(
   );
   if (!finished) {
     const key = `adjudicate:${adjudicateRuns.length}`;
-    const adjudicator = findCapabilityAgent(store, "adjudicate", orchestration.teamProviders, orchestration.leaderAgentId);
+    const adjudicator = findCapabilityAgent(store, "adjudicate", orchestration.leaderAgentId);
     const chosen = agentForKey(store, orchestration, key);
     const agent = chosen ?? adjudicator ?? mustGetAgent(store, orchestration.leaderAgentId);
     // A user-picked agent takes the adjudicator seat regardless of who would
@@ -972,14 +1459,24 @@ function stepAdjudicating(
         maxCycles: orchestration.maxCycles,
         reviews: [],
         subtasks: [],
+        answers: allQuestionAnswers(store, orchestration.id),
+        approvalNotes: allApprovalNotes(store, orchestration),
       });
     }, finished);
   }
 
   const isLeader = finished.agentId === orchestration.leaderAgentId;
   if (!isLeader && requiresLeaderAdjudication(store, orchestration, parsed.turn)) {
-    consumeRun(store, orchestration, "adjudicate", finished, "escalated its proposal to the Leader");
     const leader = mustGetAgent(store, orchestration.leaderAgentId);
+    const gated = gateSpawn(
+      store,
+      orchestration,
+      `adjudicate:leader-confirm:${finished.id}`,
+      `Escalate adjudication to the Leader with ${describeAgent(leader)}`,
+      leader.id,
+    );
+    if (gated) return gated;
+    consumeRun(store, orchestration, "adjudicate", finished, "escalated its proposal to the Leader");
     const proposal = `\`\`\`json\n${JSON.stringify(parsed.turn, null, 2)}\n\`\`\``;
     const prompt = buildAdjudicationPrompt(store, orchestration, deps, "leader", proposal);
     const run = spawnTurn(deps, store, orchestration, leader, prompt, "adjudicate");
@@ -987,11 +1484,61 @@ function stepAdjudicating(
     return result(orchestration, "Adjudicator proposal requires Leader confirmation.", [run.id]);
   }
 
+  // The decision documents are gated before anything is applied, and the run is
+  // deliberately left unconsumed while the retry runs: the next step re-parses
+  // this same turn and applies it then, with its files in place.
+  const ctx = deps.contextStoreFor?.(orchestration.id);
+  if (ctx) {
+    const missing = missingAdjudicationDocuments(store, orchestration, ctx, parsed.turn);
+    if (missing.length) {
+      const retry = retryForMissingContext(store, orchestration, deps, {
+        phase: "adjudicate",
+        agent: store.getRegisteredAgent(finished.agentId),
+        tag: `adjudication:${finished.id}`,
+        missing,
+        sourceRun: finished,
+      });
+      if (retry) return retry;
+    }
+  }
+
   return applyAdjudicateTurn(store, orchestration, {
     turn: parsed.turn,
     finishedRunId: finished.id,
     actor: isLeader ? "Leader" : "Adjudicator",
+    contextStore: ctx,
   });
+}
+
+// A decision needs its own document, and an accepted subtask needs the
+// `summary.md` that every downstream subtask reads in place of its folder.
+// Without the summary the hand-off between subtasks is empty and the next
+// implementer rediscovers the same ground.
+function missingAdjudicationDocuments(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  ctx: ContextStore,
+  turn: LeaderAdjudicateTurn,
+): Array<{ path: string; reason: string }> {
+  const subtasks = store.listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 });
+  const missing: Array<{ path: string; reason: string }> = [];
+  for (const decision of turn.decisions) {
+    const meta = findSubtaskMetaByKey(store, orchestration.id, decision.subtaskKey);
+    const subtask = subtasks.find((candidate) => candidate.id === meta?.subtaskId);
+    if (!subtask) continue;
+    const target = contextTargetFor(store, orchestration, subtask);
+    const check = ctx.checkTurn("adjudication", target.contextKey, target.round);
+    if (!check.ok) missing.push({ path: check.path, reason: check.reason });
+    if (decision.verdict !== "accept") continue;
+    const summaryPath = ctx.summaryPath(target.contextKey);
+    if (!ctx.existingPaths([summaryPath]).length) {
+      missing.push({
+        path: summaryPath,
+        reason: `you accepted ${decision.subtaskKey} without writing its hand-off summary at ${summaryPath}; later subtasks read that file and nothing else from this one`,
+      });
+    }
+  }
+  return missing;
 }
 
 function buildAdjudicationPrompt(
@@ -1004,12 +1551,33 @@ function buildAdjudicationPrompt(
   const task = mustGetTask(store, orchestration.taskId);
   const pendingReviews = store.listReviews({ taskId: orchestration.taskId, consumed: false });
   const subtasks = store.listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 });
+  const stranded = strandedSubtaskIds(subtasks);
+  const ctx = deps.contextStoreFor?.(orchestration.id);
+  const contextFor = (subtaskId: string | undefined) => {
+    const subtask = subtasks.find((candidate) => candidate.id === subtaskId);
+    if (!ctx || !subtask) return undefined;
+    const target = contextTargetFor(store, orchestration, subtask);
+    return {
+      brief: ctx.briefPath(target.contextKey),
+      review: ctx.turnPath("review", target.contextKey, target.round),
+      // Earlier rounds in full — this is how a defect reported for the third
+      // time stops looking like a fresh one.
+      prior: priorRoundPaths(ctx, target, ["report", "review", "adjudication"]),
+      write: ctx.turnPath("adjudication", target.contextKey, target.round),
+      summary: ctx.summaryPath(target.contextKey),
+    };
+  };
   return renderAdjudicatePrompt({
     taskTitle: task.title,
     cycle: orchestration.cycle,
     maxCycles: orchestration.maxCycles,
     actor,
     adjudicatorProposal,
+    decisionLog: readAdjudicationLedger(store, orchestration.id),
+    // The user's replies belong to this turn as much as to a plan turn: the
+    // question that stopped the run was asked from here.
+    answers: allQuestionAnswers(store, orchestration.id),
+    approvalNotes: allApprovalNotes(store, orchestration),
     ...resolveProviderOptions(store, orchestration, deps),
     reviews: pendingReviews.map((review) => ({
       subtaskKey: findSubtaskKey(store, orchestration.id, review.subtaskId) ?? review.subtaskId ?? "?",
@@ -1017,15 +1585,88 @@ function buildAdjudicationPrompt(
       verdict: review.verdict,
       score: review.score,
       summary: review.summary,
-      findings: review.findings,
+      // Both give way to the files once there is a store: a findings blob is
+      // the largest thing in this prompt and it is replayed every cycle.
+      findings: ctx ? undefined : review.findings,
+      priorReviews: ctx ? undefined : priorReviewsForSubtask(store, orchestration, review.subtaskId, subtasks),
+      context: contextFor(review.subtaskId),
     })),
     subtasks: subtasks.map((subtask) => ({
       key: findSubtaskKey(store, orchestration.id, subtask.id) ?? subtask.id,
       title: subtask.title,
       status: subtask.status,
       acceptanceCriteria: subtask.acceptanceCriteria,
+      strandedBy: stranded
+        .get(subtask.id)
+        ?.map((depId) => findSubtaskKey(store, orchestration.id, depId) ?? depId),
+      blockedReason: subtask.status === "blocked" ? blockedReasonFor(store, subtask) : undefined,
     })),
   });
+}
+
+// Why a subtask is sitting in `blocked`. Two things put it there — a reviewer
+// or leader block verdict, and an implementer run that failed or was refused by
+// the machine — and both records are otherwise invisible at adjudication: the
+// review has been consumed, and the assignment summary is only ever replayed to
+// reviewers. Without the reason the leader is told to clear a blocked subtask
+// while being given no idea what stopped it.
+const BLOCK_REASON_CHARS = 600;
+
+function blockedReasonFor(store: MemoryStore, subtask: Subtask): string | undefined {
+  if (subtask.statusReason) return truncateReason(subtask.statusReason);
+  const review = latestByCreatedAt(store.listReviews({ subtaskId: subtask.id, limit: 20 }));
+  if (review?.verdict === "block") {
+    const findings = review.findings ? ` findings: ${review.findings}` : "";
+    return truncateReason(`reviewer blocked it — ${review.summary}${findings}`);
+  }
+  const assignment = latestByCreatedAt(store.listAssignments({ subtaskId: subtask.id, limit: 20 }));
+  if (assignment?.status === "failed" && assignment.resultSummary) {
+    return truncateReason(`the implementer run failed — ${assignment.resultSummary}`);
+  }
+  if (review) {
+    const findings = review.findings ? ` findings: ${review.findings}` : "";
+    return truncateReason(`last review [${review.verdict}] — ${review.summary}${findings}`);
+  }
+  return assignment?.resultSummary ? truncateReason(assignment.resultSummary) : undefined;
+}
+
+function truncateReason(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > BLOCK_REASON_CHARS ? `${flat.slice(0, BLOCK_REASON_CHARS)}…` : flat;
+}
+
+// Reviews written against the attempts this subtask replaces, so adjudication
+// can see a defect being reported for the second or third time instead of
+// treating each cycle's review as the first word on the subject.
+function priorReviewsForSubtask(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  subtaskId: string | undefined,
+  subtasks: Subtask[],
+): Array<{ subtaskTitle: string; verdict: string; summary: string; findings?: string }> | undefined {
+  const key = subtaskId ? findSubtaskKey(store, orchestration.id, subtaskId) : undefined;
+  if (!key) return undefined;
+  const priors: Array<{ subtaskTitle: string; verdict: string; summary: string; findings?: string }> = [];
+  let ancestorKey: string | undefined = key.match(/^(.+)-rework-\d+$/)?.[1];
+  const chain: string[] = [];
+  while (ancestorKey) {
+    chain.unshift(ancestorKey);
+    ancestorKey = ancestorKey.match(/^(.+)-rework-\d+$/)?.[1];
+  }
+  for (const entryKey of chain) {
+    const meta = findSubtaskMetaByKey(store, orchestration.id, entryKey);
+    if (!meta) continue;
+    const title = subtasks.find((subtask) => subtask.id === meta.subtaskId)?.title ?? entryKey;
+    for (const review of store.listReviews({ subtaskId: meta.subtaskId, limit: 20 })) {
+      priors.push({
+        subtaskTitle: title,
+        verdict: review.verdict,
+        summary: review.summary,
+        findings: review.findings,
+      });
+    }
+  }
+  return priors.length ? priors : undefined;
 }
 
 function requiresLeaderAdjudication(
@@ -1050,9 +1691,17 @@ function requiresLeaderAdjudication(
 function applyAdjudicateTurn(
   store: MemoryStore,
   orchestration: Orchestration,
-  input: { turn: LeaderAdjudicateTurn; finishedRunId: string; actor: "Leader" | "Adjudicator" },
+  input: {
+    turn: LeaderAdjudicateTurn;
+    finishedRunId: string;
+    actor: "Leader" | "Adjudicator";
+    contextStore?: ContextStore;
+  },
 ): OrchestrationStepResult {
   const { turn, finishedRunId, actor } = input;
+  // Logged before the decisions are applied, so the next cycle sees what was
+  // ruled even if applying it ends the orchestration here.
+  recordAdjudicationDecisions(store, orchestration, actor, turn);
   for (const question of turn.questions) createQuestion(store, orchestration, question);
 
   let blocked = false;
@@ -1072,11 +1721,20 @@ function applyAdjudicateTurn(
       // below, so the original is superseded, not stuck. Leaving it "blocked"
       // makes it look like unfinished work forever — enough that the leader
       // later refuses to call the project complete because of it.
-      store.updateSubtask(subtaskId, { status: "cancelled" });
+      store.updateSubtask(subtaskId, {
+        status: "cancelled",
+        statusReason: `Superseded by rework: ${decision.rework.title}.`,
+      });
       if (targetAssignment) {
+        // Prepend the rework note rather than replacing the summary: this is
+        // the only surviving record of what the previous attempt actually did,
+        // and the next attempt's prompt replays it to avoid redoing that work.
+        const previousSummary = targetAssignment.resultSummary?.trim();
         store.updateAssignment(targetAssignment.id, {
           status: "failed",
-          resultSummary: `Sent back for rework: ${decision.rework.title}`,
+          resultSummary: previousSummary
+            ? `Sent back for rework: ${decision.rework.title}\n${previousSummary}`
+            : `Sent back for rework: ${decision.rework.title}`,
         });
       }
       const reworkSubtask = store.createSubtask({
@@ -1085,11 +1743,25 @@ function applyAdjudicateTurn(
         goal: decision.rework.goal,
         acceptanceCriteria: decision.rework.acceptanceCriteria,
       });
+      // The replacement inherits the original's dependencies, and everything
+      // that depended on the original is re-pointed at it. Without this the
+      // dependents keep pointing at a subtask that is now `cancelled` — and
+      // `dispatchable` only counts a dependency satisfied when it is `done`,
+      // which a cancelled subtask never becomes. They sit in `todo` forever,
+      // execution reports no dispatchable work, and adjudication then has no
+      // pending review to decide on: exactly the deadlock that surfaces as
+      // "Leader adjudicated with no decisions and did not mark the project
+      // complete".
+      inheritAndRepointDependencies(store, orchestration, subtaskId, reworkSubtask.id);
       const reworkKey = `${decision.subtaskKey}-rework-${orchestration.cycle}`;
       recordSubtaskMeta(store, orchestration, {
         type: "subtask",
         key: reworkKey,
         subtaskId: reworkSubtask.id,
+        // The folder belongs to the work, not to the attempt: a rework raised
+        // in cycle 4 for a subtask planned in cycle 2 still writes into the
+        // cycle-2 folder, as round n+1.
+        planCycle: meta?.planCycle,
         role: meta?.role,
         parallelSafe: meta?.parallelSafe,
         files: meta?.files ?? [],
@@ -1107,8 +1779,23 @@ function applyAdjudicateTurn(
           scope: [...owningReviewer.scope, { key: reworkKey, subtaskId: reworkSubtask.id }],
         });
       }
+    } else if (decision.verdict === "drop") {
+      // The subtask is not being done, and that is the decision — not a defect
+      // to fix and not a question for the user. Cancelling is what lets the
+      // completion guard below pass: an open subtask the leader has no verb for
+      // is what kept a run the user asked to finish from ever finishing.
+      store.updateSubtask(subtaskId, {
+        status: "cancelled",
+        statusReason: "Dropped by the leader during adjudication.",
+      });
+      if (targetAssignment) store.updateAssignment(targetAssignment.id, { status: "cancelled" });
     } else if (decision.verdict === "block") {
-      store.updateSubtask(subtaskId, { status: "blocked" });
+      store.updateSubtask(subtaskId, {
+        status: "blocked",
+        statusReason: truncateReason(
+          reviews.map((review) => review.summary).filter(Boolean).join("; ") || "Blocked by the leader during adjudication.",
+        ),
+      });
       blocked = true;
     }
   }
@@ -1130,32 +1817,154 @@ function applyAdjudicateTurn(
       status: "paused",
       lastError: "One or more subtasks were blocked by the leader; see agent_requests.",
     }) ?? orchestration;
+    if (input.contextStore) refreshContextIndex(store, updated, input.contextStore);
     return result(updated, "Adjudication blocked on one or more subtasks; paused for user input.", []);
   }
   if (turn.projectComplete) {
+    const outstanding = store
+      .listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 })
+      .filter((subtask) => !["done", "cancelled"].includes(subtask.status));
+    if (outstanding.length) {
+      const listed = outstanding
+        .slice(0, 8)
+        .map((subtask) => `"${subtask.title}" [${subtask.status}]`)
+        .join(", ");
+      const more = outstanding.length > 8 ? `, and ${outstanding.length - 8} more` : "";
+      // The old wording ("resolve or explicitly drop them") described an action
+      // nothing could carry out: the leader had no verb for dropping a subtask
+      // and the answer was only ever replayed to it as prose. A run the user
+      // had told to finish came back here every turn. Now the first option is
+      // executed by the orchestrator itself.
+      createQuestion(
+        store,
+        orchestration,
+        {
+          question: `${actor} marked the project complete, but ${outstanding.length} subtask(s) are still open: ${listed}${more}. Drop them and finish, or send them back to the leader?`,
+          // The safe answer goes first: the dashboard pre-selects option one,
+          // and that must never be the one that cancels work.
+          options: [SEND_OPEN_SUBTASKS_BACK_OPTION, DROP_OPEN_SUBTASKS_OPTION],
+        },
+        OPEN_SUBTASKS_QUESTION_KIND,
+      );
+      const updated = store.updateOrchestration(orchestration.id, {
+        status: "paused",
+        lastError: `${actor} marked the project complete while subtasks were still open.`,
+      }) ?? orchestration;
+      if (input.contextStore) refreshContextIndex(store, updated, input.contextStore);
+      return result(updated, `${actor} tried to finish with open subtasks; paused for user input.`, []);
+    }
     const updated = store.updateOrchestration(orchestration.id, { status: "reporting" }) ?? orchestration;
+    if (input.contextStore) refreshContextIndex(store, updated, input.contextStore);
     return result(updated, `${actor} marked the project complete; ready for reporting.`, []);
   }
   // Nothing decided and not complete: execution already reported no
   // dispatchable work, so bumping the cycle would just spawn the same empty
   // adjudicate turn until max_cycles. Stop and ask the user instead.
   if (!turn.decisions.length) {
+    // Name what is actually outstanding. "It needs direction on what remains"
+    // asks the user to work out the answer from the dashboard; the subtasks
+    // that stalled the run are known here, so say them.
+    const outstanding = store
+      .listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 })
+      .filter((subtask) => !["done", "cancelled"].includes(subtask.status));
+    const listed = outstanding
+      .slice(0, 8)
+      .map((subtask) => {
+        // The status alone ("[blocked]") asks the user to go dig the reason out
+        // of the dashboard. It is known right here, so say it.
+        const reason = subtask.status === "blocked" ? blockedReasonFor(store, subtask) : undefined;
+        return `"${subtask.title}" [${subtask.status}]${reason ? ` — ${reason}` : ""}`;
+      })
+      .join(", ");
+    const more = outstanding.length > 8 ? `, and ${outstanding.length - 8} more` : "";
     createQuestion(store, orchestration, {
-      question:
-        "Leader adjudicated with no decisions and did not mark the project complete, and there is no dispatchable work left. It needs direction on what remains.",
+      question: outstanding.length
+        ? `The leader returned no decisions and would not mark the project complete, but ${outstanding.length} subtask(s) are still open: ${listed}${more}. Nothing can be dispatched — should these be dropped, or do they need something from you?`
+        : "The leader returned no decisions and did not mark the project complete, yet every subtask is finished or cancelled. Confirm whether this project is done.",
       options: [],
     });
     const updated = store.updateOrchestration(orchestration.id, {
       status: "paused",
       lastError: "Leader returned no decisions and did not mark the project complete.",
     }) ?? orchestration;
+    if (input.contextStore) refreshContextIndex(store, updated, input.contextStore);
     return result(updated, "Leader had nothing to decide and would not finish; paused for user input.", []);
   }
+  // A cycle is a round of work that had to be REDONE, which is what max_cycles
+  // is there to bound. Charging one for an accept-only adjudication makes the
+  // budget a cap on how many reviewer groups a project may have: each group's
+  // reviews land separately, each lands its own adjudication, and a five-group
+  // plan burned five cycles making perfect forward progress — then failed with
+  // "Exceeded max_cycles" having never reworked anything. Accepts strictly
+  // reduce outstanding work, so they cannot loop; only rework can.
+  const reworked = turn.decisions.some((decision) => decision.verdict === "rework" && decision.rework);
   const updated = store.updateOrchestration(orchestration.id, {
     status: "executing",
-    cycle: orchestration.cycle + 1,
+    ...(reworked ? { cycle: orchestration.cycle + 1 } : {}),
   }) ?? orchestration;
-  return result(updated, "Applied adjudication decisions; resuming execution.", []);
+  if (input.contextStore) refreshContextIndex(store, updated, input.contextStore);
+  return result(
+    updated,
+    reworked
+      ? `Applied adjudication decisions; starting rework cycle ${updated.cycle}.`
+      : "Applied adjudication decisions; resuming execution.",
+    [],
+  );
+}
+
+function inheritAndRepointDependencies(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  supersededId: string,
+  replacementId: string,
+): void {
+  const subtasks = store.listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 });
+  const byId = new Map(subtasks.map((subtask) => [subtask.id, subtask]));
+  const superseded = byId.get(supersededId);
+  // Dead dependencies are dropped rather than inherited: reworking a stranded
+  // subtask is how the leader clears the strand, so carrying the dependency
+  // that stranded it onto the replacement would strand that one too.
+  const inherited = (superseded?.dependsOn ?? []).filter((id) => {
+    const dep = byId.get(id);
+    return dep && dep.status !== "cancelled" && dep.status !== "blocked";
+  });
+  if (inherited.length) store.updateSubtask(replacementId, { dependsOn: inherited });
+  for (const subtask of subtasks) {
+    if (subtask.id === replacementId || !subtask.dependsOn.includes(supersededId)) continue;
+    store.updateSubtask(subtask.id, {
+      dependsOn: subtask.dependsOn.map((id) => (id === supersededId ? replacementId : id)),
+    });
+  }
+}
+
+// Subtasks that can never be dispatched because something they depend on will
+// never be `done` — cancelled by a re-plan, blocked, or itself stranded. They
+// are invisible to the leader otherwise: adjudication only shows pending
+// reviews, and a stranded subtask has none and never will. Surfacing them is
+// what turns "there is nothing I can decide" into a decision the leader can
+// actually make.
+function strandedSubtaskIds(subtasks: Subtask[]): Map<string, string[]> {
+  const byId = new Map(subtasks.map((subtask) => [subtask.id, subtask]));
+  const unreachable = new Set(
+    subtasks.filter((subtask) => subtask.status === "cancelled" || subtask.status === "blocked").map((s) => s.id),
+  );
+  const stranded = new Map<string, string[]>();
+  // Fixpoint: stranding propagates down the dependency chain, so one pass over
+  // the list is not enough — a subtask two hops from a cancelled one only
+  // becomes visible once its own dependency has been marked.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const subtask of subtasks) {
+      if (subtask.status !== "todo" || stranded.has(subtask.id)) continue;
+      const culprits = subtask.dependsOn.filter((id) => unreachable.has(id) || !byId.has(id));
+      if (!culprits.length) continue;
+      stranded.set(subtask.id, culprits);
+      unreachable.add(subtask.id);
+      changed = true;
+    }
+  }
+  return stranded;
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,6 +1975,10 @@ type SubtaskPlanMeta = {
   type: "subtask";
   key: string;
   subtaskId: string;
+  // The cycle this key was planned in — the folder the work owns. A rework
+  // inherits its origin's value so every attempt keeps sharing one folder.
+  // Absent on metas recorded before context folders were cycle-scoped.
+  planCycle?: number;
   role?: string;
   parallelSafe?: boolean;
   files: string[];
@@ -1202,9 +2015,26 @@ function recordReviewerMeta(store: MemoryStore, orchestration: Orchestration, me
   });
 }
 
+const SUBTASK_META_PREFIX = "subtask-meta:";
+const REVIEWER_META_PREFIX = "reviewer-meta:";
+// Plan metas are the join between the database and the context folders, so the
+// lookup has to be total: an orchestration that ran for cycles accumulates
+// thousands of events, and a plain newest-N window silently drops the oldest
+// keys, which sends their reworks into a brand-new empty folder.
+const META_SCAN_LIMIT = 20000;
+
+function listPlanMetaEvents(store: MemoryStore, orchestrationId: string, prefix: string) {
+  return store.listOrchestrationEvents({
+    orchestrationId,
+    kind: "leader_turn",
+    summaryPrefix: prefix,
+    limit: META_SCAN_LIMIT,
+  });
+}
+
 function getSubtaskMeta(store: MemoryStore, orchestrationId: string, subtaskId: string): SubtaskPlanMeta | undefined {
-  for (const event of store.listOrchestrationEvents({ orchestrationId, limit: 1000 })) {
-    if (event.kind !== "leader_turn" || !event.payload) continue;
+  for (const event of listPlanMetaEvents(store, orchestrationId, SUBTASK_META_PREFIX)) {
+    if (!event.payload) continue;
     const parsed = safeParse<SubtaskPlanMeta>(event.payload);
     if (parsed?.type === "subtask" && parsed.subtaskId === subtaskId) return parsed;
   }
@@ -1216,8 +2046,8 @@ function findSubtaskMetaByKey(
   orchestrationId: string,
   key: string,
 ): SubtaskPlanMeta | undefined {
-  for (const event of store.listOrchestrationEvents({ orchestrationId, limit: 1000 })) {
-    if (event.kind !== "leader_turn" || !event.payload) continue;
+  for (const event of listPlanMetaEvents(store, orchestrationId, SUBTASK_META_PREFIX)) {
+    if (!event.payload) continue;
     const parsed = safeParse<SubtaskPlanMeta>(event.payload);
     if (parsed?.type === "subtask" && parsed.key === key) return parsed;
   }
@@ -1232,8 +2062,8 @@ function findSubtaskKey(store: MemoryStore, orchestrationId: string, subtaskId: 
 function listReviewerMetas(store: MemoryStore, orchestrationId: string): ReviewerPlanMeta[] {
   const seen = new Set<string>();
   const metas: ReviewerPlanMeta[] = [];
-  for (const event of store.listOrchestrationEvents({ orchestrationId, limit: 1000 })) {
-    if (event.kind !== "leader_turn" || !event.payload) continue;
+  for (const event of listPlanMetaEvents(store, orchestrationId, REVIEWER_META_PREFIX)) {
+    if (!event.payload) continue;
     const parsed = safeParse<ReviewerPlanMeta>(event.payload);
     if (parsed?.type === "reviewer" && !seen.has(parsed.reviewerKey)) {
       seen.add(parsed.reviewerKey);
@@ -1249,7 +2079,7 @@ function findReviewerMetaForRun(
   run: AgentRun,
   metas: ReviewerPlanMeta[],
 ): ReviewerPlanMeta | undefined {
-  const events = store.listOrchestrationEvents({ orchestrationId, limit: 1000 });
+  const events = store.listOrchestrationEvents({ orchestrationId, kind: "spawn", limit: META_SCAN_LIMIT });
   const keyForRun = (runId: string): string | undefined =>
     events
       .find((event) => event.kind === "spawn" && event.phase === "review" && event.summary?.includes(`(${runId})`))
@@ -1271,10 +2101,127 @@ function findReviewerMetaForRun(
   return key ? metas.find((meta) => meta.reviewerKey === key) : undefined;
 }
 
+/** Plan label for a run: the leader's key ("s1", "r1") plus what it is about. */
+export type RunPlanLabel = { key: string; title: string };
+
+/**
+ * Maps runs to the plan entry they came from so a board card can say
+ * "s1: Build the parser" instead of only naming the agent. Reads the plan meta
+ * events once for the whole batch — this runs on every dashboard poll.
+ */
+export function describeRunPlanLabels(
+  store: MemoryStore,
+  orchestrationId: string,
+  runs: AgentRun[],
+  subtasks: Subtask[],
+): Record<string, RunPlanLabel> {
+  const labels: Record<string, RunPlanLabel> = {};
+  if (!runs.length) return labels;
+  const titleBySubtaskId = new Map(subtasks.map((subtask) => [subtask.id, subtask.title]));
+
+  // Events come newest first, so the first meta for a key is the current plan's.
+  const metaBySubtaskId = new Map<string, SubtaskPlanMeta>();
+  const scopeByReviewerKey = new Map<string, Array<{ key: string; subtaskId: string }>>();
+  for (const event of listPlanMetaEvents(store, orchestrationId, SUBTASK_META_PREFIX)) {
+    if (!event.payload) continue;
+    const parsed = safeParse<SubtaskPlanMeta>(event.payload);
+    if (parsed?.type === "subtask" && !metaBySubtaskId.has(parsed.subtaskId)) {
+      metaBySubtaskId.set(parsed.subtaskId, parsed);
+    }
+  }
+  for (const event of listPlanMetaEvents(store, orchestrationId, REVIEWER_META_PREFIX)) {
+    if (!event.payload) continue;
+    const parsed = safeParse<ReviewerPlanMeta>(event.payload);
+    if (parsed?.type === "reviewer" && !scopeByReviewerKey.has(parsed.reviewerKey)) {
+      scopeByReviewerKey.set(parsed.reviewerKey, parsed.scope);
+    }
+  }
+
+  // A reviewer run carries no subtaskId; its key lives in the spawn event.
+  const reviewerKeyByRunId = new Map<string, string>();
+  for (const event of store.listOrchestrationEvents({ orchestrationId, kind: "spawn", limit: META_SCAN_LIMIT })) {
+    if (event.phase !== "review" || !event.summary) continue;
+    const key = event.summary.match(/Spawned reviewer (\S+) for/)?.[1];
+    const runId = event.summary.match(/\(([^()]+)\)\.?\s*$/)?.[1];
+    if (key && runId && !reviewerKeyByRunId.has(runId)) reviewerKeyByRunId.set(runId, key);
+  }
+
+  const needsSibling = runs.some(
+    (run) => run.phase === "review" && !reviewerKeyByRunId.has(run.id) && run.assignmentId,
+  );
+  // Retry runs have no spawn event of their own but inherit the assignment of
+  // the run they replace, which does.
+  if (needsSibling) {
+    for (const sibling of store.listAgentRuns({ orchestrationId, limit: 500 })) {
+      const key = sibling.assignmentId && reviewerKeyByRunId.get(sibling.id);
+      if (!key) continue;
+      for (const run of runs) {
+        if (run.assignmentId === sibling.assignmentId && !reviewerKeyByRunId.has(run.id)) {
+          reviewerKeyByRunId.set(run.id, key);
+        }
+      }
+    }
+  }
+
+  for (const run of runs) {
+    if (run.phase === "review") {
+      const reviewerKey = reviewerKeyByRunId.get(run.id);
+      if (!reviewerKey) continue;
+      // Named after the work being reviewed, not after the reviewer: on a board
+      // the useful question is "which subtask is this about", and `r1` answers
+      // it for nobody. A reviewer of c1-s1's second attempt reads
+      // `c1-s1-round2`, lining
+      // the card up with the implementer card it follows.
+      //
+      // A rework is folded into the scope of the reviewer that covered the
+      // original, so the scope holds every attempt at the same work. One entry
+      // per piece of work, at its latest round — otherwise the card would read
+      // "c1-s1-round1, c1-s1-round2" and name the superseded attempt too.
+      const latest = new Map<string, { round: number; subtaskId: string }>();
+      for (const entry of scopeByReviewerKey.get(reviewerKey) ?? []) {
+        const origin = planOriginKey(entry.key);
+        const round = roundFor(entry.key);
+        const previous = latest.get(origin);
+        if (!previous || round > previous.round) latest.set(origin, { round, subtaskId: entry.subtaskId });
+      }
+      const keys: string[] = [];
+      const titles: string[] = [];
+      for (const [origin, entry] of latest) {
+        const meta = metaBySubtaskId.get(entry.subtaskId);
+        keys.push(folderRoundLabel(contextKeyFor(meta?.key ?? origin, entry.subtaskId, meta?.planCycle), entry.round));
+        titles.push(titleBySubtaskId.get(entry.subtaskId) ?? origin);
+      }
+      labels[run.id] = {
+        key: keys.join(", ") || reviewerKey,
+        title: titles.length ? `review ${titles.join(", ")}` : "review",
+      };
+      continue;
+    }
+    if (!run.subtaskId) continue;
+    const meta = metaBySubtaskId.get(run.subtaskId);
+    const title = titleBySubtaskId.get(run.subtaskId);
+    if (meta || title) {
+      labels[run.id] = {
+        key: meta
+          ? folderRoundLabel(contextKeyFor(meta.key, run.subtaskId, meta.planCycle), roundFor(meta.key))
+          : "",
+        title: title ?? "",
+      };
+    }
+  }
+  return labels;
+}
+
+// Mirrors the on-disk task folder and spells out the attempt so a Runs card can
+// be matched directly to `.agent-memory/context/<orchestration>/tasks/<key>`.
+function folderRoundLabel(contextKey: string, round: number): string {
+  return `${contextKey}-round${round}`;
+}
+
 function isRunConsumed(store: MemoryStore, orchestrationId: string, runId: string): boolean {
   return store
-    .listOrchestrationEvents({ orchestrationId, limit: 1000 })
-    .some((event) => event.kind === "run_ended" && event.summary?.includes(runId));
+    .listOrchestrationEvents({ orchestrationId, kind: "run_ended", limit: META_SCAN_LIMIT })
+    .some((event) => event.summary?.includes(runId));
 }
 
 function handleLeaderParseFailure(
@@ -1286,21 +2233,40 @@ function handleLeaderParseFailure(
   buildOriginalPrompt: () => string,
   failedRun?: AgentRun,
 ): OrchestrationStepResult {
-  recordEvent(store, orchestration, phase, "error", `Leader ${phase} output could not be parsed: ${error}`);
-  // Consume the run that failed to parse. Without this it stays the newest
-  // unconsumed terminal run forever, so the very next step re-parses it, fails
-  // again, and spawns yet another retry — the orchestration burns agents while
-  // standing still.
-  if (failedRun) consumeRun(store, orchestration, phase, failedRun, `could not be parsed (${error})`);
-  const priorAttempts = store
-    .listAgentRuns({ orchestrationId: orchestration.id, limit: 100 })
-    .filter((run) => run.phase === phase && TERMINAL_RUN_STATUSES.has(run.status));
-  if (priorAttempts.length >= 2) {
+  // Retry budget belongs to this phase in this cycle. Counting every historic
+  // terminal leader run made the first malformed reply after a successful
+  // replan look like a second failure, so the advertised retry never ran.
+  const priorParseFailures = store
+    .listOrchestrationEvents({ orchestrationId: orchestration.id, limit: 1000 })
+    .filter((event) =>
+      event.cycle === orchestration.cycle
+      && event.phase === phase
+      && event.kind === "error"
+      && event.summary?.startsWith(`Leader ${phase} output could not be parsed:`),
+    );
+  if (priorParseFailures.length >= 1) {
+    recordEvent(store, orchestration, phase, "error", `Leader ${phase} output could not be parsed: ${error}`);
+    if (failedRun) consumeRun(store, orchestration, phase, failedRun, `could not be parsed (${error})`);
     createQuestion(store, orchestration, { question: `Leader ${phase} output could not be parsed after retrying: ${error}`, options: [] });
     const updated = store.updateOrchestration(orchestration.id, { status: "paused", lastError: error }) ?? orchestration;
+    const ctx = deps.contextStoreFor?.(orchestration.id);
+    if (ctx) refreshContextIndex(store, updated, ctx);
     return result(updated, `Leader ${phase} parsing failed twice; paused for user input.`, []);
   }
   const leaderAgent = mustGetAgent(store, orchestration.leaderAgentId);
+  const gated = gateSpawn(
+    store,
+    orchestration,
+    `${phase}:parse-retry:${failedRun?.id ?? priorParseFailures.length}`,
+    `Retry the leader ${phase} turn with ${describeAgent(leaderAgent)} after an invalid response`,
+    leaderAgent.id,
+  );
+  if (gated) return gated;
+  recordEvent(store, orchestration, phase, "error", `Leader ${phase} output could not be parsed: ${error}`);
+  // Consume only when the retry is actually authorised. Consuming it while an
+  // approval is pending makes the next step forget this was a parse retry and
+  // launch an ordinary fresh turn under a different key.
+  if (failedRun) consumeRun(store, orchestration, phase, failedRun, `could not be parsed (${error})`);
   const prompt = `${buildOriginalPrompt()}\n\n${buildRetryPrompt(error)}`;
   const run = spawnTurn(deps, store, orchestration, leaderAgent, prompt, phase);
   return result(orchestration, `Retrying leader ${phase} turn after a parse failure.`, [run.id]);
@@ -1321,29 +2287,23 @@ function handleReviewParseFailure(
   // never fired and the loop retried forever (observed live: 20+ identical
   // parse errors, 5 seconds apart, until the user killed the tool).
   const assignmentId = run.assignmentId;
-  recordEvent(
-    store,
-    orchestration,
-    "review",
-    "error",
-    `Reviewer output could not be parsed${assignmentId ? ` (assignment ${assignmentId})` : ""}: ${error}`,
-  );
-  // Always consume the failed run, on every path out of here: an unconsumed
-  // terminal run is re-processed by the next step, which is what turned one bad
-  // reviewer reply into an unbounded retry loop.
-  consumeRun(store, orchestration, "review", run, `could not be parsed (${error})`);
-
   const priorAttempts = assignmentId
     ? store
         .listOrchestrationEvents({ orchestrationId: orchestration.id, limit: 500 })
         .filter((event) => event.kind === "error" && event.phase === "review" && event.summary?.includes(assignmentId))
     : [];
-  // The event above is already in the list, so >= 2 means one retry has already
-  // been spent on this assignment.
   const original = assignmentId
     ? store.listAssignments({ taskId: orchestration.taskId, limit: 500 }).find((item) => item.id === assignmentId)
     : undefined;
-  if (priorAttempts.length >= 2 || !original || !run.roleId) {
+  if (priorAttempts.length >= 1 || !original || !run.roleId) {
+    recordEvent(
+      store,
+      orchestration,
+      "review",
+      "error",
+      `Reviewer output could not be parsed${assignmentId ? ` (assignment ${assignmentId})` : ""}: ${error}`,
+    );
+    consumeRun(store, orchestration, "review", run, `could not be parsed (${error})`);
     const reason = original && run.roleId ? `after retrying: ${error}` : `and could not be retried (missing context): ${error}`;
     createQuestion(store, orchestration, { question: `Reviewer output could not be parsed ${reason}`, options: [] });
     if (assignmentId) store.updateAssignment(assignmentId, { status: "failed", resultSummary: error });
@@ -1354,6 +2314,22 @@ function handleReviewParseFailure(
     return result(updated, "Reviewer parsing failed; paused for user input.", []);
   }
   const agent = mustGetAgent(store, run.agentId);
+  const gated = gateSpawn(
+    store,
+    orchestration,
+    `review:parse-retry:${run.id}`,
+    `Retry the reviewer turn with ${describeAgent(agent)} after an invalid response`,
+    agent.id,
+  );
+  if (gated) return gated;
+  recordEvent(
+    store,
+    orchestration,
+    "review",
+    "error",
+    `Reviewer output could not be parsed${assignmentId ? ` (assignment ${assignmentId})` : ""}: ${error}`,
+  );
+  consumeRun(store, orchestration, "review", run, `could not be parsed (${error})`);
   // The original prompt has to be replayed. Every turn is a fresh CLI process
   // with no memory of the last one, so a bare "your previous reply did not
   // parse" retry asked the agent to fix something it had never seen — observed
@@ -1403,7 +2379,32 @@ function spawnTurn(
   });
 }
 
-function renderImplementerPrompt(subtask: Subtask, files: string[]): string {
+// What a rework implementer needs that the rework goal alone cannot carry: the
+// reviewer's actual findings, and what the previous attempt says it did.
+export type ReworkContext = {
+  attempt: number;
+  previous: Array<{
+    title: string;
+    resultSummary?: string;
+    reviews: Array<{ verdict: string; summary: string; findings?: string }>;
+  }>;
+};
+
+// Where this implementer reads its context from and writes its own account to,
+// when the orchestration has a context store.
+export type ImplementerContextPaths = {
+  brief: string;
+  prior: string[];
+  write: string;
+  round: number;
+};
+
+function renderImplementerPrompt(
+  subtask: Subtask,
+  files: string[],
+  rework?: ReworkContext,
+  context?: ImplementerContextPaths,
+): string {
   const lines = [`Subtask: ${subtask.title}`];
   if (subtask.goal) lines.push(`Goal: ${subtask.goal}`);
   if (subtask.acceptanceCriteria.length) {
@@ -1414,7 +2415,331 @@ function renderImplementerPrompt(subtask: Subtask, files: string[]): string {
     lines.push("Likely files:");
     for (const file of files) lines.push(`- ${file}`);
   }
+  if (context) {
+    lines.push(
+      "",
+      "## Context",
+      `Assignment brief: \`${context.brief}\` — read it first; it names the dependencies whose`,
+      "`summary.md` you may read. Read no other subtask's folder.",
+    );
+    if (context.prior.length) {
+      lines.push(
+        "",
+        `This is attempt ${context.round}. The earlier attempt(s) and why they were sent back:`,
+        ...context.prior.map((path) => `- \`${path}\``),
+        "",
+        "Read those before you touch anything. Fix exactly what the reviews name; the",
+        "earlier attempt's work is still in the tree and most of it is already correct.",
+      );
+    }
+    lines.push(
+      "",
+      "Every file above opens with `## Summary`. Read that first and go on to",
+      "`## Detail` only when you need it.",
+      "",
+      `## Before you finish, write \`${context.write}\``,
+      "",
+      "```markdown",
+      `# ${subtask.title} — attempt ${context.round}`,
+      "",
+      "## Summary",
+      "<up to 10 lines: what you changed, which files, and anything still open>",
+      "",
+      "## Detail",
+      "<how each acceptance criterion is met; decisions you made and why; what you",
+      "deliberately left alone; anything the reviewer would otherwise have to guess>",
+      "```",
+      "",
+      "This file is what the reviewer, the adjudicator and any later attempt read.",
+      "Nothing else you say survives this turn. A turn that leaves it unwritten is",
+      "sent back for it.",
+      "",
+      ...WORKBOARD_BOUNDARY_LINES,
+    );
+  }
+  // Adjudication compresses a whole review into one `rework.goal` sentence, and
+  // the replacement subtask is a fresh CLI process with no memory of attempt
+  // one. Without this the implementer re-derives the defect from a paraphrase,
+  // guesses at what was already right, and comes back failing the same finding
+  // — which is what turns one rework into a chain of them.
+  if (rework?.previous.length) {
+    lines.push(
+      "",
+      `## Rework — attempt ${rework.attempt}`,
+      "This subtask replaces an earlier attempt that was sent back. What follows is that attempt and why it was rejected.",
+    );
+    for (const previous of rework.previous) {
+      lines.push("", `### Earlier attempt: ${previous.title}`);
+      if (previous.resultSummary) lines.push(`What it reported doing: ${previous.resultSummary}`);
+      for (const review of previous.reviews) {
+        lines.push(`- Reviewer verdict: ${review.verdict} — ${review.summary}`);
+        if (review.findings) lines.push(`  findings: ${review.findings}`);
+      }
+    }
+    lines.push(
+      "",
+      "Rules for this attempt:",
+      "- Fix exactly the findings above. Do not restart the subtask from scratch and do not rewrite parts no finding complains about.",
+      "- Read the current state of the files first: the earlier attempt's work is still in the tree, so some of it is already correct.",
+      "- Before you finish, walk the findings one by one and state in your closing summary how each was addressed. A finding you cannot fix must be named as still open, not left silent.",
+    );
+  }
   return lines.join("\n");
+}
+
+// Walks the `<origin>-rework-<cycle>` key chain back to the original subtask,
+// collecting each earlier attempt's own account and the reviews against it.
+function reworkContextFor(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  subtask: Subtask,
+): ReworkContext | undefined {
+  const key = findSubtaskKey(store, orchestration.id, subtask.id);
+  if (!key) return undefined;
+  const ancestors: string[] = [];
+  let current: string | undefined = key.match(/^(.+)-rework-\d+$/)?.[1];
+  while (current) {
+    ancestors.unshift(current);
+    current = current.match(/^(.+)-rework-\d+$/)?.[1];
+  }
+  if (!ancestors.length) return undefined;
+  const titleById = new Map(
+    store.listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 }).map((entry) => [entry.id, entry.title]),
+  );
+  const previous: ReworkContext["previous"] = [];
+  for (const ancestorKey of ancestors) {
+    const meta = findSubtaskMetaByKey(store, orchestration.id, ancestorKey);
+    if (!meta) continue;
+    const assignment = latestByCreatedAt(store.listAssignments({ subtaskId: meta.subtaskId, limit: 20 }));
+    const reviews = store.listReviews({ subtaskId: meta.subtaskId, limit: 20 });
+    previous.push({
+      title: titleById.get(meta.subtaskId) ?? ancestorKey,
+      resultSummary: assignment?.resultSummary ?? undefined,
+      reviews: reviews.map((review) => ({
+        verdict: review.verdict,
+        summary: review.summary,
+        findings: review.findings,
+      })),
+    });
+  }
+  return previous.length ? { attempt: ancestors.length + 1, previous } : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Context store wiring
+// ---------------------------------------------------------------------------
+
+// A turn that finished without writing its context document gets exactly one
+// short, code-free retry that asks only for the file. Then the orchestration
+// moves on regardless: the file is how the *next* turn avoids re-deriving what
+// this one learnt, and losing that is a real cost — but stalling the whole run
+// on a document is a worse one, and an agent that ignored the instruction twice
+// will ignore it a third time.
+const CONTEXT_RETRY_EVENT_PREFIX = "context-file-retry:";
+const CONTEXT_FILE_RETRY_BUDGET = 1;
+
+type ContextTarget = { contextKey: string; round: number };
+
+// Which folder and which round a subtask's documents belong to. Both come from
+// the plan key rather than the subtask id, so a rework lands as round 2 inside
+// the original's folder instead of opening a fresh folder that knows nothing.
+function contextTargetFor(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  subtask: Subtask,
+): ContextTarget {
+  const meta = getSubtaskMeta(store, orchestration.id, subtask.id);
+  return {
+    contextKey: contextKeyFor(meta?.key, subtask.id, meta?.planCycle),
+    round: roundFor(meta?.key),
+  };
+}
+
+// Documents from earlier attempts at this same work — the chain that used to be
+// rebuilt and truncated into every prompt.
+function priorRoundPaths(ctx: ContextStore, target: ContextTarget, kinds: TurnKind[]): string[] {
+  const paths: string[] = [];
+  for (let round = 1; round < target.round; round += 1) {
+    for (const kind of kinds) paths.push(ctx.turnPath(kind, target.contextKey, round));
+  }
+  return ctx.existingPaths(paths);
+}
+
+function writeAssignmentBrief(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  ctx: ContextStore,
+  subtask: Subtask,
+  files: string[],
+  target: ContextTarget,
+): void {
+  const byId = new Map(
+    store.listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 }).map((entry) => [entry.id, entry]),
+  );
+  // A dependency is handed over as its summary and nothing else. Widening this
+  // to its reports and reviews is what would make reading cost grow with
+  // rounds × tasks instead of with tasks.
+  const dependencies = subtask.dependsOn
+    .map((depId) => byId.get(depId))
+    .filter((dep): dep is Subtask => Boolean(dep))
+    .map((dep) => ({
+      title: dep.title,
+      summaryPath: ctx.summaryPath(contextTargetFor(store, orchestration, dep).contextKey),
+    }))
+    .filter((dep) => ctx.existingPaths([dep.summaryPath]).length > 0);
+  ctx.writeBrief({
+    contextKey: target.contextKey,
+    title: subtask.title,
+    goal: subtask.goal,
+    acceptanceCriteria: subtask.acceptanceCriteria,
+    files,
+    dependencies,
+  });
+}
+
+// The map from plan keys to folders. Rewritten rather than appended because it
+// is derived: the database owns these statuses, this is only a way in for a
+// human reading the folder.
+function refreshContextIndex(store: MemoryStore, orchestration: Orchestration, ctx: ContextStore): void {
+  const task = store.getTask(orchestration.taskId);
+  const tasks: IndexTaskRow[] = [];
+  // Attempts share a folder, so one row per folder — and the row to show is
+  // the *latest* attempt. Picking it explicitly rather than letting the query
+  // order decide: `listSubtasks` sorts by priority then updated_at, which puts
+  // a long-finished attempt after the one running right now, so the index used
+  // to advertise stale work as the current state of every folder.
+  const byKey = new Map<string, { subtask: Subtask; index: number }>();
+  for (const subtask of store.listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 })) {
+    const { contextKey } = contextTargetFor(store, orchestration, subtask);
+    const previous = byKey.get(contextKey);
+    if (previous && !supersedesForIndex(subtask, previous.subtask)) continue;
+    const index = previous ? previous.index : tasks.length;
+    byKey.set(contextKey, { subtask, index });
+    const row = { contextKey, title: subtask.title, status: subtask.status };
+    if (previous) tasks[index] = row;
+    else tasks.push(row);
+  }
+  ctx.writeIndex({
+    taskTitle: task?.title ?? orchestration.taskId,
+    goal: task?.goal,
+    status: orchestration.status,
+    cycle: orchestration.cycle,
+    maxCycles: orchestration.maxCycles,
+    tasks,
+  });
+}
+
+type IndexTaskRow = { contextKey: string; title: string; status: string };
+
+// Which of two attempts at the same folder the index should name. A live
+// attempt always beats a cancelled one; otherwise the newest wins.
+function supersedesForIndex(candidate: Subtask, current: Subtask): boolean {
+  const candidateCancelled = candidate.status === "cancelled";
+  const currentCancelled = current.status === "cancelled";
+  if (candidateCancelled !== currentCancelled) return currentCancelled;
+  return candidate.createdAt > current.createdAt;
+}
+
+// Spawns the one file-only retry, or returns undefined to let the caller carry
+// on. `tag` identifies what is being retried so the budget is per document, not
+// per orchestration.
+function retryForMissingContext(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  deps: OrchestratorDeps,
+  input: {
+    phase: AgentRunPhase;
+    agent: RegisteredAgent | undefined;
+    tag: string;
+    missing: Array<{ path: string; reason: string }>;
+    sourceRun?: AgentRun;
+    extra?: { subtaskId?: string; assignmentId?: string; roleId?: string };
+  },
+): OrchestrationStepResult | undefined {
+  if (!input.missing.length || !input.agent) return undefined;
+  const spent = store
+    .listOrchestrationEvents({ orchestrationId: orchestration.id, limit: 1000 })
+    .filter((event) => event.summary?.startsWith(`${CONTEXT_RETRY_EVENT_PREFIX}${input.tag}`)).length;
+  if (spent >= CONTEXT_FILE_RETRY_BUDGET) {
+    recordEvent(
+      store,
+      orchestration,
+      input.phase,
+      "error",
+      `Gave up asking for ${input.missing.map((entry) => entry.path).join(", ")}; continuing without it. The next turn on this work will have less context than it should.`,
+    );
+    return undefined;
+  }
+  const gated = gateSpawn(
+    store,
+    orchestration,
+    `context-retry:${input.tag}:${spent}`,
+    `Ask ${describeAgent(input.agent)} to repair missing ${input.phase} context documents`,
+    input.agent.id,
+  );
+  if (gated) return gated;
+  const prompt = [
+    "# Missing context document",
+    "",
+    "Your previous turn finished without leaving the record the next turn depends on:",
+    ...input.missing.map((entry) => `- ${entry.reason}`),
+    "",
+    ...(input.sourceRun?.logPath
+      ? [
+          `Read the completed turn transcript at \`${input.sourceRun.logPath}\` before writing.`,
+          "Do not reconstruct the report from git status alone or claim work absent from that transcript.",
+          "",
+        ]
+      : []),
+    "Write those file(s) now from what you already did. Do not change any code, do not",
+    "redo the work, and do not reply with anything else. Each file must be:",
+    "",
+    "```markdown",
+    "# <what this is>",
+    "",
+    "## Summary",
+    "<up to 10 lines — what you did or found, and anything the next turn must know>",
+    "",
+    "## Detail",
+    "<the rest>",
+    "```",
+  ].join("\n");
+  const run = spawnTurn(deps, store, orchestration, input.agent, prompt, input.phase, input.extra ?? {});
+  recordEvent(
+    store,
+    orchestration,
+    input.phase,
+    "spawn",
+    `${CONTEXT_RETRY_EVENT_PREFIX}${input.tag} asked ${describeAgent(input.agent)} to write ${input.missing.map((entry) => entry.path).join(", ")} (${run.id}).`,
+  );
+  // Consumed the moment it is spawned. It shares a phase with the turn it is
+  // repairing, and its reply is prose — parsing it as a leader or reviewer turn
+  // would fail and drag the orchestration into the parse-failure path. The
+  // file it writes is the entire product of this run.
+  consumeRun(store, orchestration, input.phase, run, "was a context-document retry; its log is never parsed");
+  return result(orchestration, `Asked for the missing context document(s) before continuing.`, [run.id]);
+}
+
+function nextPlanContextCycle(store: MemoryStore, orchestrationId: string): number {
+  const appliedPlans = store
+    .listOrchestrationEvents({ orchestrationId, kind: "leader_turn", limit: 1000 })
+    .filter((event) => event.phase === "plan" && event.summary?.startsWith("Leader produced "));
+  return appliedPlans.length + 1;
+}
+
+// Files the plan in the context store when there is one, and records why it
+// changed. The revision log is the only place the *reason* for a re-plan
+// survives; without it the next revision can undo this one and the two take
+// turns forever.
+function writePlanDocument(
+  orchestration: Orchestration,
+  deps: OrchestratorDeps,
+  ctx: ContextStore | undefined,
+  markdown: string,
+  revision?: { trigger: string; change: string },
+): string {
+  if (!ctx) return deps.writePlanFile(markdown);
+  return ctx.writePlan(markdown, orchestration.planPath ? revision : undefined);
 }
 
 function mustGetTask(store: MemoryStore, taskId: string) {
@@ -1453,15 +2778,10 @@ function describeAgent(agent: RegisteredAgent | undefined): string {
     : "an agent that still has to be staffed";
 }
 
-function findDefaultAgent(
-  store: MemoryStore,
-  capability: string,
-  allowedProviders?: string[],
-): RegisteredAgent | undefined {
-  const allowed = allowedProviders?.length ? new Set(allowedProviders) : undefined;
+function findDefaultAgent(store: MemoryStore, capability: string): RegisteredAgent | undefined {
   return store
     .listRegisteredAgents({ enabled: true, limit: 500 })
-    .find((candidate) => (!allowed || allowed.has(candidate.provider)) && agentSupportsCapabilities(candidate, [capability]));
+    .find((candidate) => agentSupportsCapabilities(candidate, [capability]));
 }
 
 // The single door every implementer/reviewer spawn goes through.
@@ -1472,8 +2792,8 @@ function findDefaultAgent(
 // registered agent available", and the orchestration died with nothing to show.
 // Rather than fail, register the agent the plan calls for and say so in the
 // timeline; it lands in the Agents tab where the user can retune or disable it.
-// teamProviders still bounds what may be created, so an explicit allowlist is
-// never widened behind the user's back.
+// Which providers may be staffed is decided in the Agents tab: an agent (or a
+// whole provider) the user disabled there is simply not in the roster.
 function resolveStaffAgent(
   store: MemoryStore,
   orchestration: Orchestration,
@@ -1493,7 +2813,7 @@ function resolveStaffAgent(
       return created;
     }
   }
-  const existing = findDefaultAgent(store, capability, orchestration.teamProviders);
+  const existing = findDefaultAgent(store, capability);
   if (existing) return existing;
   const created = autoStaffAgent(store, orchestration, deps, capability);
   if (created) return created;
@@ -1513,12 +2833,10 @@ function autoStaffAgent(
   capability: "implement" | "review",
   preference?: LeaderAgentPreference,
 ): RegisteredAgent | undefined {
-  const allowed = orchestration.teamProviders?.length ? new Set<string>(orchestration.teamProviders) : undefined;
   const installed = deps.listProviders?.().map((option) => option.provider) ?? [];
   const leaderProvider = store.getRegisteredAgent(orchestration.leaderAgentId)?.provider;
-  const candidates = [preference?.provider, ...(orchestration.teamProviders ?? []), ...installed, leaderProvider]
-    .filter((provider): provider is string => Boolean(provider))
-    .filter((provider) => !allowed || allowed.has(provider));
+  const candidates = [preference?.provider, ...installed, leaderProvider]
+    .filter((provider): provider is string => Boolean(provider));
 
   for (const provider of [...new Set(candidates)]) {
     // No known command means nothing to launch; skipping is better than
@@ -1559,29 +2877,17 @@ function autoStaffAgent(
 function findCapabilityAgent(
   store: MemoryStore,
   capability: string,
-  allowedProviders?: string[],
   excludeAgentId?: string,
 ): RegisteredAgent | undefined {
-  const allowed = allowedProviders?.length ? new Set(allowedProviders) : undefined;
   return store
     .listRegisteredAgents({ enabled: true, limit: 500 })
     .find((candidate) =>
-      candidate.id !== excludeAgentId &&
-      (!allowed || allowed.has(candidate.provider)) &&
-      agentSupportsCapabilities(candidate, [capability]),
+      candidate.id !== excludeAgentId && agentSupportsCapabilities(candidate, [capability]),
     );
 }
 
-function assertProviderAllowed(orchestration: Orchestration, provider: string, role: string): void {
-  if (!orchestration.teamProviders?.length || orchestration.teamProviders.includes(provider as RegisteredAgent["provider"])) return;
-  throw new Error(
-    `Provider "${provider}" is not allowed for ${role} staffing. Allowed team providers: ${orchestration.teamProviders.join(", ")}.`,
-  );
-}
-
 // What the leader is told it can staff from: the enabled agents in the Agents
-// tab, narrowed further by the orchestration's teamProviders allowlist when the
-// user set one. Installed-but-unregistered CLIs are offered ONLY when that
+// tab. Installed-but-unregistered CLIs are offered ONLY when that
 // roster comes back empty — otherwise the leader would plan around agents the
 // user chose not to enable. When it is empty, naming the installed providers is
 // the only way to get a usable plan at all, and the spawn path registers
@@ -1596,7 +2902,6 @@ function resolveProviderOptions(
   agentRoster: Array<{ name: string; description?: string; provider: string; model?: string; capabilities: string[] }>;
   autoStaff: boolean;
 } {
-  const allowed = orchestration.teamProviders?.length ? new Set(orchestration.teamProviders) : undefined;
   const agents = store
     .listRegisteredAgents({ enabled: true, limit: 500 })
     .filter((agent) => agentSupportsCapabilities(agent, ["implement"]) || agentSupportsCapabilities(agent, ["review"]));
@@ -1622,10 +2927,9 @@ function resolveProviderOptions(
       autoStaff: false,
     };
   };
-  // Installed CLIs, used only as the empty-roster fallback. The allowlist still
-  // applies: it bounds what auto-staffing is allowed to register.
+  // Installed CLIs, used only as the empty-roster fallback.
   const fromInstalled = () => {
-    const catalogs = (_deps.listProviders?.() ?? []).filter((option) => !allowed || allowed.has(option.provider as RegisteredAgent["provider"]));
+    const catalogs = _deps.listProviders?.() ?? [];
     const providerModels: Record<string, string[]> = {};
     for (const option of catalogs) providerModels[option.provider] = option.models;
     return {
@@ -1635,11 +2939,22 @@ function resolveProviderOptions(
       autoStaff: catalogs.length > 0,
     };
   };
-  const narrowed = allowed ? agents.filter((agent) => allowed.has(agent.provider)) : agents;
-  return narrowed.length ? collect(narrowed) : fromInstalled();
+  return agents.length ? collect(agents) : fromInstalled();
 }
 
-function createQuestion(store: MemoryStore, orchestration: Orchestration, question: LeaderQuestion): void {
+function createQuestion(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  question: LeaderQuestion,
+  // Set when the orchestrator itself acts on the answer rather than only
+  // replaying it to the leader, so the row can be found again by machine
+  // instead of by matching its prose.
+  kind?: string,
+): void {
+  const payload = {
+    ...(question.options.length ? { options: question.options } : {}),
+    ...(kind ? { kind } : {}),
+  };
   store.createAgentRequest({
     taskId: orchestration.taskId,
     type: "question",
@@ -1647,7 +2962,7 @@ function createQuestion(store: MemoryStore, orchestration: Orchestration, questi
     // Options ride in the payload so the dashboard can offer them as choices
     // instead of a blank box; the title stays the plain question text, which
     // is what the answered/settled bookkeeping matches on.
-    payload: question.options.length ? JSON.stringify({ options: question.options }) : undefined,
+    payload: Object.keys(payload).length ? JSON.stringify(payload) : undefined,
   });
 }
 

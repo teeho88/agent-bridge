@@ -119,8 +119,6 @@ export function paths(cwd = process.cwd()) {
     config: join(cwd, memoryDir, "config.json"),
     currentTask: join(cwd, memoryDir, "current-task.md"),
     compiledContext: join(cwd, memoryDir, "compiled-context.md"),
-    handoffJson: join(cwd, memoryDir, "handoff.json"),
-    handoffMd: join(cwd, memoryDir, "handoff.md"),
     tokenPolicy: join(cwd, memoryDir, "token-policy.yaml"),
     logs: join(cwd, memoryDir, "logs"),
     artifacts: join(cwd, memoryDir, "artifacts"),
@@ -205,12 +203,6 @@ export function ensureWorkspace(cwd = process.cwd()): void {
     writeFileSync(
       p.compiledContext,
       "# Agent Task Brief\n\nNo compiled context yet.\n",
-      "utf8",
-    );
-  if (!existsSync(p.handoffMd))
-    writeFileSync(
-      p.handoffMd,
-      "# Handoff\n\nNo handoff has been created yet.\n",
       "utf8",
     );
   if (!existsSync(p.tokenPolicy)) {

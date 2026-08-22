@@ -74,7 +74,10 @@ export function registerRun(program: Command): void {
           });
         }
         if (options.cancelSubtask && before.subtaskId) {
-          store.updateSubtask(before.subtaskId, { status: "cancelled" });
+          store.updateSubtask(before.subtaskId, {
+            status: "cancelled",
+            statusReason: options.reason ?? "Stopped by user.",
+          });
         }
         if (before.orchestrationId) {
           store.recordOrchestrationEvent({

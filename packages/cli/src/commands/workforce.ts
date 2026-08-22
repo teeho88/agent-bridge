@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Command } from "commander";
 import {
@@ -11,10 +11,12 @@ import {
   stopAgentRun,
 } from "@agent-bridge/adapters";
 import {
-  ensureAgentsForProviders,
-  resolveAgentForPreference,
+  CONTEXT_ROOT,
+  createContextStore,
+  resolveLeaderAgent,
   resumeStatusFor,
   stepOrchestration,
+  type ContextStoreIO,
   type OrchestratorDeps,
 } from "@agent-bridge/core";
 import type { Orchestration, OrchestrationAutonomy } from "@agent-bridge/memory";
@@ -41,10 +43,6 @@ export function registerOrchestration(program: Command): void {
     .option("--autonomy <autonomy>", "manual | approve-each | auto", "approve-each")
     .option("--max-parallel <n>", "max concurrent implementers", "3")
     .option("--max-cycles <n>", "max plan/execute/review/adjudicate cycles", "8")
-    .option(
-      "--team-providers <list>",
-      "comma-separated providers the leader may staff from (default: every installed CLI provider)",
-    )
     .action(
       (
         prompt: string,
@@ -57,13 +55,12 @@ export function registerOrchestration(program: Command): void {
           autonomy: string;
           maxParallel: string;
           maxCycles: string;
-          teamProviders?: string;
         },
       ) => {
         const store = openStore();
         try {
           const autonomy = parseAutonomy(options.autonomy);
-          const leaderAgent = resolveAgentForPreference(
+          const leaderAgent = resolveLeaderAgent(
             store,
             {
               provider: options.leaderProvider,
@@ -75,21 +72,12 @@ export function registerOrchestration(program: Command): void {
           );
           const task = store.createTask({ title: prompt, goal: prompt, ownerAgent: "codex" });
 
-          // Same rule as the dashboard: the leader staffs only registered,
-          // enabled agents, so a --team-providers entry has to be in the roster
-          // before planning starts.
-          const requestedProviders = parseTeamProviders(options.teamProviders);
-          const teamProviders = requestedProviders
-            ? ensureAgentsForProviders(store, requestedProviders, defaultCommandForProvider)
-            : undefined;
-
           const orchestration = store.createOrchestration({
             taskId: task.id,
             leaderAgentId: leaderAgent.id,
             autonomy,
             maxParallel: Number(options.maxParallel),
             maxCycles: Number(options.maxCycles),
-            teamProviders: teamProviders?.length ? teamProviders : undefined,
           });
 
           const stepResult = stepOrchestration(store, orchestration.id, makeOrchestratorDeps(store));
@@ -307,7 +295,51 @@ export function makeOrchestratorDeps(store: Store, cwd: string = paths().cwd): O
       writeFileSync(planPath, markdown, "utf8");
       return planPath;
     },
+    contextStoreFor: (orchestrationId) => {
+      ensureContextIgnored(projectPaths.cwd);
+      return createContextStore(contextStoreIO(projectPaths.cwd), orchestrationId);
+    },
   };
+}
+
+// Core builds workspace-relative paths — they go straight into prompts, and the
+// agents run with the workspace as their working directory — so resolving them
+// is this side's job.
+function contextStoreIO(cwd: string): ContextStoreIO {
+  const resolve = (path: string) => join(cwd, path);
+  const ensureDir = (path: string) => {
+    const dir = path.slice(0, Math.max(0, path.lastIndexOf("/")));
+    if (dir) mkdirSync(join(cwd, dir), { recursive: true });
+  };
+  return {
+    exists: (path) => existsSync(resolve(path)),
+    read: (path) => (existsSync(resolve(path)) ? readFileSync(resolve(path), "utf8") : undefined),
+    write: (path, content) => {
+      ensureDir(path);
+      writeFileSync(resolve(path), content, "utf8");
+    },
+    append: (path, content) => {
+      ensureDir(path);
+      appendFileSync(resolve(path), content, "utf8");
+    },
+  };
+}
+
+// The orchestration runs in the *user's* project, which has no reason to ignore
+// `.agent-memory/` already. Left unignored the context store shows up as
+// hundreds of untracked files in their diff, and the implementer agents start
+// committing the orchestrator's own notes alongside the work.
+function ensureContextIgnored(cwd: string): void {
+  if (!existsSync(join(cwd, ".git"))) return;
+  const gitignorePath = join(cwd, ".gitignore");
+  const existing = existsSync(gitignorePath) ? readFileSync(gitignorePath, "utf8") : "";
+  if (/^\s*\.agent-memory\/?\s*$/m.test(existing) || existing.includes(CONTEXT_ROOT)) return;
+  const prefix = existing && !existing.endsWith("\n") ? "\n" : "";
+  appendFileSync(
+    gitignorePath,
+    `${prefix}\n# Agent Bridge orchestration context and run data\n.agent-memory/\n`,
+    "utf8",
+  );
 }
 
 function mustGetOrchestrationByTask(store: Store, taskId: string): Orchestration {
@@ -320,15 +352,6 @@ function parseAutonomy(value: string): OrchestrationAutonomy {
   const allowed: OrchestrationAutonomy[] = ["manual", "approve-each", "auto"];
   if (allowed.includes(value as OrchestrationAutonomy)) return value as OrchestrationAutonomy;
   throw new Error(`Invalid autonomy "${value}". Use one of: ${allowed.join(", ")}.`);
-}
-
-function parseTeamProviders(value: string | undefined): string[] | undefined {
-  if (!value) return undefined;
-  const providers = value
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-  return providers.length ? providers : undefined;
 }
 
 function delay(ms: number): Promise<void> {

@@ -55,7 +55,12 @@ export function resolveAgentForPreference(
     );
   }
 
-  const name = uniqueAgentName(store, agentNameFor(provider, preference.model, preference.reasoningEffort));
+  // A leader row is named "<provider>-<model>-lead" so it is recognisable in the
+  // database next to the staff agents for the same provider.
+  const base =
+    agentNameFor(provider, preference.model, preference.reasoningEffort) +
+    (requiredCapabilities.length === 1 && requiredCapabilities[0] === LEADER_CAPABILITY ? "-lead" : "");
+  const name = uniqueAgentName(store, base);
   return store.createRegisteredAgent({
     name,
     provider,
@@ -64,6 +69,34 @@ export function resolveAgentForPreference(
     model: preference.model,
     reasoningEffort: preference.reasoningEffort,
     capabilities: defaults.capabilities ?? (requiredCapabilities.length ? requiredCapabilities : ["implement"]),
+  });
+}
+
+// The capability that marks an agent as an orchestration leader. A leader row
+// exists only so the plan/adjudicate turns have something to spawn — it is not
+// staff. Keeping "lead" as its ONLY capability is what keeps it out of every
+// implement/review/adjudicate lookup (they all go through
+// agentSupportsCapabilities) and out of the Agents tab roster.
+export const LEADER_CAPABILITY = "lead";
+
+// True for a row that can only lead: no implement/review/adjudicate work.
+export function isLeaderOnlyAgent(agent: RegisteredAgent): boolean {
+  const capabilities = new Set(normalizeCapabilities(agent.capabilities));
+  return capabilities.has(LEADER_CAPABILITY) && capabilities.size === 1;
+}
+
+// Find-or-create the dedicated leader row for a preference. Never reuses a
+// staff agent (and never lends the leader out as staff): the row it returns
+// carries "lead" and nothing else.
+export function resolveLeaderAgent(
+  store: MemoryStore,
+  preference: LeaderAgentPreference,
+  defaults: Omit<ResolveAgentDefaults, "capabilities" | "requiredCapabilities"> = {},
+): RegisteredAgent {
+  return resolveAgentForPreference(store, preference, {
+    ...defaults,
+    capabilities: [LEADER_CAPABILITY],
+    requiredCapabilities: [LEADER_CAPABILITY],
   });
 }
 
@@ -92,7 +125,11 @@ export function ensureAgentsForProviders(
 ): string[] {
   const staffed: string[] = [];
   for (const provider of [...new Set(providers)]) {
-    const existing = store.listRegisteredAgents({ provider: provider as AgentProvider, enabled: true, limit: 1 });
+    // Leader rows do not count as staff: a provider whose only enabled agent
+    // is the leader still needs a real implement/review agent registered.
+    const existing = store
+      .listRegisteredAgents({ provider: provider as AgentProvider, enabled: true, limit: 50 })
+      .filter((agent) => !isLeaderOnlyAgent(agent));
     if (existing.length) {
       staffed.push(provider);
       continue;

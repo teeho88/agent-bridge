@@ -387,7 +387,7 @@ export function handleClaudeHook(
           const handoff = store.upsertAutoHandoff(
             buildAutoHandoffInput(store, cwd, taskId, summary),
           );
-          writeHandoffArtifacts(cwd, handoff);
+          writeHandoffArtifacts(cwd, handoff, { task: store.getTask(taskId) });
         }
       }
       writeCompiledContext(store, cwd, taskId);
@@ -672,9 +672,7 @@ function captureRepoMemory(
     .slice(0, 3);
   for (const content of candidates) {
     const type = /decision|architecture|quyết định|kiến trúc/i.test(content) ? "decision" : "constraint";
-    store.createMemoryCandidate({
-      taskId,
-      sessionEventId,
+    store.addMemory({
       type,
       content,
       importance: 4,

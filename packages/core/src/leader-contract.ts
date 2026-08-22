@@ -50,7 +50,11 @@ export type LeaderPlanTurn = {
   questions: LeaderQuestion[];
 };
 
-export type LeaderAdjudicateVerdict = "accept" | "rework" | "block";
+// "drop" cancels a subtask outright. Without it the leader had no way to close
+// an open subtask it did not want done: it could only accept work that was
+// never carried out, rework it forever, or block it — so a run the user had
+// told to stop bounced off the open-subtask guard on every turn.
+export type LeaderAdjudicateVerdict = "accept" | "rework" | "block" | "drop";
 
 export type LeaderAdjudicateRework = {
   title: string;
@@ -356,8 +360,8 @@ function validateDecision(raw: unknown, index: number): LeaderAdjudicateDecision
     return `decisions[${index}].subtaskKey must be a non-empty string.`;
   }
   const verdict = obj.verdict;
-  if (verdict !== "accept" && verdict !== "rework" && verdict !== "block") {
-    return `decisions[${index}].verdict must be "accept" | "rework" | "block".`;
+  if (verdict !== "accept" && verdict !== "rework" && verdict !== "block" && verdict !== "drop") {
+    return `decisions[${index}].verdict must be "accept" | "rework" | "block" | "drop".`;
   }
   if (verdict !== "rework") {
     return { subtaskKey: obj.subtaskKey, verdict };

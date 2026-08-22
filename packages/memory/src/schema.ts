@@ -42,7 +42,6 @@ export const schemaStatements = [
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
     from_agent TEXT,
-    to_agent TEXT,
     summary TEXT NOT NULL,
     done TEXT,
     next TEXT,
@@ -139,6 +138,11 @@ export const embeddingColumnStatements = [`ALTER TABLE memories ADD COLUMN embed
 // v6: distinguish auto-generated (Stop-hook) handoffs from manually authored
 // ones, so a manual handoff is never clobbered by the auto refresh.
 export const autoHandoffColumnStatements = [`ALTER TABLE handoffs ADD COLUMN auto INTEGER NOT NULL DEFAULT 0`];
+
+// v28: handoffs belong to a task, not to an intended recipient. Any agent that
+// takes over the task reads the same packet, so a target-agent column creates a
+// misleading filter without representing real state.
+export const removeHandoffTargetColumnStatements = [`ALTER TABLE handoffs DROP COLUMN to_agent`];
 
 // v7: repository knowledge graph. `graph_nodes` holds files and the symbols they
 // define; `graph_edges` holds import relationships (src/dst are node ids; an
@@ -356,6 +360,7 @@ export const workforceSchemaStatements = [
     title TEXT NOT NULL,
     goal TEXT,
     status TEXT NOT NULL DEFAULT 'todo',
+    status_reason TEXT,
     priority INTEGER NOT NULL DEFAULT 3,
     depends_on TEXT,
     acceptance_criteria TEXT,
@@ -570,4 +575,41 @@ export const agentPresetColumnStatements = [
 // the removal has to be recorded on the row instead of deleting it.
 export const agentPresetHiddenColumnStatements = [
   `ALTER TABLE agents ADD COLUMN preset_hidden INTEGER NOT NULL DEFAULT 0`
+];
+
+// v26: how many times the leader may stop planning to ask the user. A ceiling,
+// not a quota: it exists because a leader that re-asks settled ground turns
+// planning into an endless plan/answer loop. NULL means "use the default".
+export const orchestrationMaxQuestionRoundsColumnStatements = [
+  `ALTER TABLE orchestrations ADD COLUMN max_question_rounds INTEGER`
+];
+
+// v27: leader rows created before the "lead" capability existed were written
+// with staff capabilities, so they showed up in the Agents tab as if they were
+// hireable agents — and deleting one there left its orchestration pointing at a
+// row that no lookup can resolve ("Registered agent not found"). Mark them
+// lead-only so the tab hides them and the delete guard recognises them.
+//
+// Only auto-generated rows are touched: their name is the synthesized
+// "<provider>[-<model>][-<effort>][-lead]" shape. An agent the user named and
+// wired up themselves keeps its capabilities even if it happens to lead.
+export const leaderCapabilityBackfillStatements = [
+  `UPDATE agents SET capabilities = '["lead"]',
+     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+     WHERE id IN (SELECT leader_agent_id FROM orchestrations)
+       AND deleted_at IS NULL
+       AND (capabilities IS NULL OR capabilities NOT LIKE '%"lead"%')
+       AND (name = provider OR name LIKE provider || '-%')`
+];
+
+// v29: blocked/cancelled cards must explain why they are terminal. Backfill a
+// truthful marker for legacy rows whose original transition predated reasons.
+export const subtaskStatusReasonColumnStatements = [
+  `ALTER TABLE subtasks ADD COLUMN status_reason TEXT`,
+  `UPDATE subtasks
+     SET status_reason = CASE status
+       WHEN 'blocked' THEN 'Legacy blocked task; no reason was recorded.'
+       WHEN 'cancelled' THEN 'Legacy cancelled task; no reason was recorded.'
+     END
+     WHERE status IN ('blocked', 'cancelled') AND status_reason IS NULL`
 ];

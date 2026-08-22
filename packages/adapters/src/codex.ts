@@ -1,3 +1,5 @@
+import { orchestratedRunSection } from "./managed-section.js";
+
 export function codexManagedSection(): string {
   return `<!-- agent-bridge:start -->
 
@@ -46,8 +48,8 @@ Within one task, keep working from what you already read.
 The \`## Latest Handoff\` section of \`.agent-memory/compiled-context.md\` carries the
 current handoff of the task you are on, whichever agent wrote it. When a prompt
 continues work someone else started, re-read that section — it is the context to
-work from. Rewrite it for the next agent with \`agent-bridge handoff create\` — one
-handoff per task, so your packet replaces the previous one.
+work from. Rewrite it with \`agent-bridge handoff create\` when leaving the task;
+the packet is task-scoped and available to whichever agent continues it.
 
 ## Work-Git Rules
 - Before editing any source/config/test/doc file for task work, acquire a write lease:
@@ -88,13 +90,15 @@ Before finishing:
    \`\`\`
 4. Create or update handoff notes:
    \`\`\`bash
-   agent-bridge handoff create --from codex --to claude --summary "<summary>" --next "<next action>"
+   agent-bridge handoff create --from codex --summary "<summary>" --next "<next action>"
    \`\`\`
    For non-ASCII summaries, pipe via stdin:
    \`\`\`bash
-   echo "<tóm tắt>" | agent-bridge handoff create --stdin --from codex --to claude
+   echo "<tóm tắt>" | agent-bridge handoff create --stdin --from codex
    \`\`\`
 5. Avoid including unnecessary full file contents.
+
+${orchestratedRunSection()}
 
 <!-- agent-bridge:end -->`;
 }

@@ -117,7 +117,6 @@ export function renderPromptPack(
       "",
       "## Latest Handoff",
       `- From: ${pack.handoff.fromAgent ?? "unknown"}`,
-      `- To: ${pack.handoff.toAgent ?? "unknown"}`,
       `- Summary: ${toSingleLine(pack.handoff.summary)}`,
       "",
       "### Done",

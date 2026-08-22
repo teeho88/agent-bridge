@@ -36,6 +36,54 @@ describe("renderAdjudicatePrompt", () => {
     expect(prompt).toContain("Return an empty `decisions` array");
   });
 
+  it("demands a decision on stranded subtasks instead of telling the leader to return nothing", () => {
+    // A subtask whose dependency was cancelled produces no review and can
+    // never be dispatched, so it never reaches the leader on its own. Left
+    // invisible it deadlocks the run: nothing to decide, and not complete
+    // either.
+    const prompt = renderAdjudicatePrompt({
+      ...base,
+      subtasks: [
+        ...base.subtasks,
+        { key: "s3", title: "Wire the UI", status: "todo", acceptanceCriteria: ["renders"], strandedBy: ["s1"] },
+      ],
+    });
+
+    expect(prompt).toContain("[todo] s3: Wire the UI (STRANDED — depends on s1");
+    expect(prompt).toContain("1 subtask(s) above are STRANDED or BLOCKED");
+    // The empty-reviews shortcut is exactly what must NOT fire here.
+    expect(prompt).not.toContain("Return an empty `decisions` array");
+    expect(prompt).toContain("MANDATORY: give a decision for every STRANDED or BLOCKED subtask this turn (s3)");
+  });
+
+  it("demands a decision on a blocked subtask and says why it is blocked", () => {
+    // A blocked subtask is undispatchable and reviewless exactly like a
+    // stranded one, but nothing depends on it and nothing it depends on died —
+    // so the stranding pass never sees it. Left out, the leader has nothing it
+    // is allowed to decide and the run pauses on "should these be dropped?".
+    const prompt = renderAdjudicatePrompt({
+      ...base,
+      subtasks: [
+        ...base.subtasks,
+        {
+          key: "s3",
+          title: "Make the router use its budget",
+          status: "blocked",
+          acceptanceCriteria: ["retries failed nets"],
+          blockedReason: "reviewer blocked it — needs a decision on the rip-up strategy",
+        },
+      ],
+    });
+
+    expect(prompt).toContain("[blocked] s3: Make the router use its budget (BLOCKED");
+    expect(prompt).toContain("blocked because: reviewer blocked it — needs a decision on the rip-up strategy");
+    expect(prompt).toContain("1 subtask(s) above are STRANDED or BLOCKED");
+    expect(prompt).not.toContain("Return an empty `decisions` array");
+    expect(prompt).toContain("MANDATORY: give a decision for every STRANDED or BLOCKED subtask this turn (s3)");
+    // Re-blocking with no question returns the run to this same prompt.
+    expect(prompt).toContain("a `block` MUST come with a specific question");
+  });
+
   it("still lists pending reviews normally", () => {
     const prompt = renderAdjudicatePrompt({
       ...base,
@@ -138,5 +186,48 @@ describe("renderPlanPrompt", () => {
     expect(prompt).not.toContain("Staff from the roster above.");
     // The provider list is still a boundary, even when the roster is empty.
     expect(prompt).toContain("Stay within that provider list.");
+  });
+});
+
+describe("user directives in the adjudicate prompt", () => {
+  const base = {
+    taskTitle: "Ship the game",
+    cycle: 2,
+    maxCycles: 8,
+    reviews: [],
+    subtasks: [{ key: "s1", title: "Build the game", status: "review", acceptanceCriteria: ["renders"] }],
+  };
+
+  it("carries the user's answers into the turn that asked them", () => {
+    // The answers only ever reached the plan prompt, so a leader that stopped
+    // adjudication to ask something came back here having never been told.
+    const prompt = renderAdjudicatePrompt({
+      ...base,
+      answers: [{ question: "Three defects survived two reworks — what now?", answer: "finish now, record them in the report" }],
+    });
+
+    expect(prompt).toContain("## Answers To Your Questions");
+    expect(prompt).toContain("A: finish now, record them in the report");
+    expect(prompt).toContain("outrank your reading of the reviews");
+    expect(prompt).toContain("set `projectComplete` to true");
+  });
+
+  it("carries the note the user attached to an approval", () => {
+    const prompt = renderAdjudicatePrompt({
+      ...base,
+      approvalNotes: [{ approved: "Escalate adjudication to the Leader", note: "accept what is left and stop" }],
+    });
+
+    expect(prompt).toContain("## Instructions You Were Given When Approving");
+    expect(prompt).toContain('on "Escalate adjudication to the Leader": accept what is left and stop');
+    expect(prompt).toContain("outrank your reading of the reviews");
+  });
+
+  it("says nothing about user instructions when there are none", () => {
+    const prompt = renderAdjudicatePrompt(base);
+
+    expect(prompt).not.toContain("## Answers To Your Questions");
+    expect(prompt).not.toContain("## Instructions You Were Given When Approving");
+    expect(prompt).not.toContain("outrank your reading of the reviews");
   });
 });

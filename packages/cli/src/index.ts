@@ -24,6 +24,7 @@ import { registerTask } from "./commands/task.js";
 import { registerUi } from "./commands/ui.js";
 import { registerWatch } from "./commands/watch.js";
 import { registerOrchestration } from "./commands/workforce.js";
+import { installSpawnedRunGuard } from "./spawned-guard.js";
 
 const program = new Command();
 
@@ -53,6 +54,8 @@ registerRepair(program);
 registerReport(program);
 registerWatch(program);
 registerOrchestration(program);
+
+installSpawnedRunGuard(program);
 
 program.parseAsync(process.argv).catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);

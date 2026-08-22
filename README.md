@@ -95,7 +95,7 @@ For Vietnamese, other non-ASCII text, or multi-line input, prefer `--stdin`:
 agent-bridge context compile --agent codex --budget 4000
 agent-bridge context compile --agent claude --budget 4000 --precise
 agent-bridge context compile --agent codex --assignment <assignmentId>
-agent-bridge handoff create --from codex --to claude `
+agent-bridge handoff create --from codex `
   --summary "Session restoration is fixed" `
   --done "Patched cookie parsing" `
   --next "Run the integration suite" `
@@ -164,7 +164,6 @@ agent-bridge orchestration start "Build a settings page with tests" `
   --leader-mode cli `
   --leader-model gpt-5.6-sol `
   --autonomy approve-each `
-  --team-providers codex,claude `
   --max-parallel 3 `
   --max-cycles 8
 ```
@@ -276,12 +275,20 @@ Initialization creates local runtime state such as:
   token-policy.yaml
   current-task.md
   compiled-context.md
-  handoff.md
-  handoff.json
   tasks/
   reports/
   artifacts/
   logs/
+```
+
+Cross-agent handoffs use portable project files instead of `.agent-memory`
+artifacts:
+
+```text
+.handoff/
+  CURRENT.md
+  INDEX.md
+  history/
 ```
 
 It may also create managed agent files and hooks:

@@ -13,13 +13,17 @@ import {
   ftsFoldStatements,
   ftsStatements,
   graphSchemaStatements,
+  leaderCapabilityBackfillStatements,
   legacyFileImportanceRemovalStatements,
   manualFilePriorityColumnStatements,
+  orchestrationMaxQuestionRoundsColumnStatements,
   orchestrationSchemaStatements,
   orchestrationTeamProvidersColumnStatements,
   reviewSchemaStatements,
+  removeHandoffTargetColumnStatements,
   schemaStatements,
   supersededColumnStatements,
+  subtaskStatusReasonColumnStatements,
   taskOrchestrationSchemaStatements,
   workspaceEventSchemaStatements,
   workforceSchemaStatements,
@@ -61,7 +65,11 @@ const migrations: Migration[] = [
   { version: 22, statements: antigravityCommandRepointStatements },
   { version: 23, statements: agentDescriptionColumnStatements },
   { version: 24, statements: agentPresetColumnStatements },
-  { version: 25, statements: agentPresetHiddenColumnStatements }
+  { version: 25, statements: agentPresetHiddenColumnStatements },
+  { version: 26, statements: orchestrationMaxQuestionRoundsColumnStatements },
+  { version: 27, statements: leaderCapabilityBackfillStatements },
+  { version: 28, statements: removeHandoffTargetColumnStatements },
+  { version: 29, statements: subtaskStatusReasonColumnStatements }
 ];
 
 // Register custom SQL functions on a connection. The `fold` function is called
@@ -98,7 +106,12 @@ export function runMigrations(db: Database.Database): void {
           // user_version (repaired files, rewound versions), and re-running the
           // ALTER would otherwise abort the whole upgrade.
           const message = error instanceof Error ? error.message : String(error);
-          if (!/duplicate column name/i.test(message)) throw error;
+          const targetColumnAlreadyAbsent =
+            statement === removeHandoffTargetColumnStatements[0] &&
+            /no such column.*to_agent/i.test(message);
+          if (!/duplicate column name/i.test(message) && !targetColumnAlreadyAbsent) {
+            throw error;
+          }
         }
       }
       db.pragma(`user_version = ${migration.version}`);

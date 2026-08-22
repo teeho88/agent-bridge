@@ -36,8 +36,7 @@ export function compileContext(
   const decisions = store.listDecisions(task.id);
   const files = input.includeFiles === false ? [] : store.listFileSummaries();
   // A handoff belongs to the task, not to one agent: whoever picks the task up
-  // next needs it, and that is rarely the agent named in `toAgent` (which is
-  // only an advisory hint about who was expected to continue).
+  // next receives the same packet.
   const handoff = store.getLatestHandoff(task.id);
   const currentAssignment = resolveCurrentAssignment(store, task.id, input);
 

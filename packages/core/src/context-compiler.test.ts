@@ -175,7 +175,6 @@ describe("compileContext", () => {
       id: "handoff-1",
       taskId: "task-1",
       fromAgent: "claude",
-      toAgent: "codex",
       summary: "Compiler work is underway.",
       done: ["Added repo-map injection"],
       next: ["Wire compact handoff context into prompt pack"],
@@ -199,14 +198,13 @@ describe("compileContext", () => {
     expect(pack.renderedMarkdown).toContain("## Shared Memory");
     expect(pack.renderedMarkdown).toContain("### Files Changed");
   });
-  it("keeps the task handoff even when it names another agent", () => {
+  it("gives the task handoff to whichever agent continues the task", () => {
     const store = baseStore([]);
     store.getLatestHandoff = () => ({
       id: "handoff-other-agent",
       taskId: "task-1",
       fromAgent: "codex",
-      toAgent: "claude",
-      summary: "Claude was expected next, but any agent may continue.",
+      summary: "Any agent may continue this task.",
       done: [],
       next: ["Finish the compiler wiring"],
       risks: [],
@@ -222,7 +220,8 @@ describe("compileContext", () => {
     });
 
     expect(pack.handoff?.id).toBe("handoff-other-agent");
-    expect(pack.renderedMarkdown).toContain("but any agent may continue");
+    expect(pack.renderedMarkdown).toContain("Any agent may continue");
+    expect(pack.renderedMarkdown).not.toContain("- To:");
     expect(pack.nextActions).toContain("Finish the compiler wiring");
   });
 
@@ -232,7 +231,6 @@ describe("compileContext", () => {
       id: "handoff-for-codex",
       taskId: "task-1",
       fromAgent: "claude",
-      toAgent: "codex",
       summary: "Continue compiler work.",
       done: [],
       next: [],
@@ -265,7 +263,6 @@ describe("compileContext", () => {
       id: "handoff-long",
       taskId: "task-1",
       fromAgent: "claude",
-      toAgent: "codex",
       summary: "Continue compiler work.",
       done: Array.from({ length: 40 }, (_, index) => `Done step ${index}`),
       next: ["Wire the budget through"],
@@ -509,6 +506,12 @@ function baseStore(
     },
     addMemory() {
       throw new Error("unused");
+    },
+    updateRepoMemory() {
+      return undefined;
+    },
+    deleteRepoMemory() {
+      return false;
     },
     searchMemories() {
       return [];

@@ -11,6 +11,7 @@ export function registerSubtask(program: Command): void {
     .option("--task <taskId>", "parent task id (defaults to active task)")
     .option("--goal <goal>", "subtask goal")
     .option("--status <status>", "todo | assigned | in_progress | testing | review | blocked | done | cancelled")
+    .option("--reason <text>", "short reason for blocked or cancelled status")
     .option("--priority <priority>", "priority 1-5", "3")
     .option("--depends-on <ids>", "comma-separated dependency subtask ids")
     .option("--criteria <items>", "comma-separated acceptance criteria")
@@ -52,13 +53,14 @@ export function registerSubtask(program: Command): void {
     .option("--priority <priority>", "priority 1-5")
     .option("--depends-on <ids>", "comma-separated dependency subtask ids")
     .option("--criteria <items>", "comma-separated acceptance criteria")
-    .action((subtaskId: string, options: { title?: string; goal?: string; status?: string; priority?: string; dependsOn?: string; criteria?: string }) => {
+    .action((subtaskId: string, options: { title?: string; goal?: string; status?: string; reason?: string; priority?: string; dependsOn?: string; criteria?: string }) => {
       const store = openStore();
       try {
         const updated = store.updateSubtask(subtaskId, {
           title: options.title,
           goal: options.goal,
           status: options.status ? parseSubtaskStatus(options.status) : undefined,
+          statusReason: options.reason,
           priority: options.priority ? Number(options.priority) : undefined,
           dependsOn: options.dependsOn ? parseList(options.dependsOn) : undefined,
           acceptanceCriteria: options.criteria ? parseList(options.criteria) : undefined,

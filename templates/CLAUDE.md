@@ -10,6 +10,6 @@
 - Prefer summaries over raw dumps.
 - Use `.agent-memory/current-task.md` as current task context.
 - Use `.agent-memory/compiled-context.md` before starting work.
-- Update `.agent-memory/handoff.md` after meaningful progress.
+- Create a portable handoff after meaningful progress with `agent-bridge handoff create`; read `.handoff/CURRENT.md` when resuming.
 
 <!-- agent-bridge:end -->

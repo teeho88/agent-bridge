@@ -4,10 +4,12 @@ import type { Command } from "commander";
 import { buildSpawnPreview, spawnAgentRun } from "@agent-bridge/adapters";
 import {
   agentSupportsCapabilities,
+  approvedAgentOverride,
   CHANGE_REQUEST_EVENT_PREFIX,
   renderFallbackReport,
   renderReporterPrompt,
   type ReportContext,
+  type SpawnApprovalPayload,
 } from "@agent-bridge/core";
 import type { RegisteredAgent } from "@agent-bridge/memory";
 import { getActiveTaskId, openStore, paths } from "../workspace.js";
@@ -38,7 +40,9 @@ export function registerReport(program: Command): void {
 
 export type GenerateReportResult =
   | { status: "written"; source: string; reportPath: string; note?: string }
-  | { status: "pending" | "spawned"; runId: string; message: string };
+  | { status: "pending"; requestId?: string; runId?: string; message: string }
+  | { status: "rejected"; requestId: string; message: string }
+  | { status: "spawned"; runId: string; message: string };
 
 // Shared by the CLI's `report generate` and the UI's Report button. An
 // orchestration parks in `reporting` until this runs, and stepOrchestration
@@ -99,7 +103,7 @@ export function generateReport(
     );
   }
 
-  const reporterAgent = resolveReporterAgent(store, taskId, options.reporter);
+  let reporterAgent = resolveReporterAgent(store, taskId, options.reporter);
   if (!reporterAgent) {
     return finalizeReport(
       store,
@@ -110,6 +114,51 @@ export function generateReport(
       "No enabled agent with capability `report` is available inside Team providers; used the deterministic report instead.",
       projectPaths.memoryDir,
     );
+  }
+  const approvalKey = `report:${reopenedAt ?? "initial"}`;
+  if (context.orchestration?.autonomy === "approve-each") {
+    const approval = reportSpawnApproval(store, context.orchestration.id, taskId, approvalKey);
+    if (!approval) {
+      const request = store.createAgentRequest({
+        taskId,
+        type: "approval",
+        title: `Spawn reporter "${reporterAgent.name}" to generate the final project report.`,
+        payload: JSON.stringify({
+          type: "spawn-approval",
+          key: approvalKey,
+          orchestrationId: context.orchestration.id,
+          agentId: reporterAgent.id,
+        } satisfies SpawnApprovalPayload),
+      });
+      store.recordOrchestrationEvent({
+        orchestrationId: context.orchestration.id,
+        cycle: context.orchestration.cycle,
+        phase: "report",
+        kind: "user_action",
+        summary: `Approval requested: spawn reporter "${reporterAgent.name}" for the final project report.`,
+      });
+      return {
+        status: "pending",
+        requestId: request.id,
+        message: `Reporter ${reporterAgent.name} is waiting for your approval.`,
+      };
+    }
+    if (approval.status === "pending") {
+      return {
+        status: "pending",
+        requestId: approval.id,
+        message: `Reporter ${reporterAgent.name} is waiting for your approval.`,
+      };
+    }
+    if (approval.status === "rejected") {
+      return {
+        status: "rejected",
+        requestId: approval.id,
+        message: "Reporter spawn was rejected. Use deterministic fallback explicitly if no agent report is wanted.",
+      };
+    }
+    const approvedAgentId = approvedAgentOverride(store, context.orchestration, approvalKey);
+    if (approvedAgentId) reporterAgent = resolveReporterAgent(store, taskId, approvedAgentId)!;
   }
   const prompt = renderReporterPrompt(context);
   const runsDir = join(projectPaths.artifacts, "runs");
@@ -133,6 +182,7 @@ export function generateReport(
     orchestrationId: context.orchestration?.id,
     agentId: reporterAgent.id,
     phase: "report",
+    cycle: context.orchestration?.cycle,
     runsDir,
     preview,
   }, {
@@ -140,11 +190,37 @@ export function generateReport(
     // reporter's exit code is dropped and the run is reaped as "detached".
     reopenStore: () => openStore(projectPaths.cwd),
   });
+  if (context.orchestration) {
+    store.recordOrchestrationEvent({
+      orchestrationId: context.orchestration.id,
+      cycle: context.orchestration.cycle,
+      phase: "report",
+      kind: "spawn",
+      summary: `Spawned reporter "${reporterAgent.name}" (${run.id}).`,
+    });
+  }
   return {
     status: "spawned",
     runId: run.id,
     message: "Reporter turn spawned; call `report generate` again once it finishes.",
   };
+}
+
+function reportSpawnApproval(
+  store: Store,
+  orchestrationId: string,
+  taskId: string,
+  key: string,
+): { id: string; status: string } | undefined {
+  return store.listAgentRequests({ taskId, limit: 500 }).find((request) => {
+    if (request.type !== "approval" || !request.payload) return false;
+    try {
+      const payload = JSON.parse(request.payload) as SpawnApprovalPayload;
+      return payload.type === "spawn-approval" && payload.orchestrationId === orchestrationId && payload.key === key;
+    } catch {
+      return false;
+    }
+  });
 }
 
 // A run log is the whole CLI session, not the answer: codex prints a banner,
@@ -208,29 +284,26 @@ export function finalizeReport(
   const reportPath = join(reportsDir, `${taskId}-report.md`);
   writeFileSync(reportPath, content.endsWith("\n") ? content : `${content}\n`, "utf8");
   if (context.orchestration) {
-    store.updateOrchestration(context.orchestration.id, { status: "done", reportPath });
+    const updated = store.updateOrchestration(context.orchestration.id, { status: "done", reportPath })
+      ?? context.orchestration;
+    store.recordOrchestrationEvent({
+      orchestrationId: updated.id,
+      cycle: updated.cycle,
+      phase: "report",
+      kind: "run_ended",
+      summary: `Final project report written from ${source === "reporter" ? "the reporter turn" : "the deterministic fallback"}.`,
+    });
   }
   return { status: "written", source, reportPath, note };
 }
 
 export function resolveReporterAgent(store: Store, taskId: string, explicitAgentId: string | undefined): RegisteredAgent | undefined {
-  const orchestration = store.getOrchestrationByTask(taskId);
-  const allowed = orchestration?.teamProviders?.length ? new Set(orchestration.teamProviders) : undefined;
   const eligible = (agent: RegisteredAgent | undefined): agent is RegisteredAgent =>
-    Boolean(
-      agent?.enabled &&
-      (!allowed || allowed.has(agent.provider)) &&
-      agentSupportsCapabilities(agent, ["report"]),
-    );
+    Boolean(agent?.enabled && agentSupportsCapabilities(agent, ["report"]));
   if (explicitAgentId) {
     const found = store.getRegisteredAgent(explicitAgentId);
     if (!found) throw new Error(`Agent not found: ${explicitAgentId}`);
     if (!found.enabled) throw new Error(`Reporter agent ${found.name} is disabled.`);
-    if (allowed && !allowed.has(found.provider)) {
-      throw new Error(
-        `Reporter provider "${found.provider}" is outside Team providers: ${orchestration?.teamProviders?.join(", ")}.`,
-      );
-    }
     if (!agentSupportsCapabilities(found, ["report"])) {
       throw new Error(`Reporter agent ${found.name} does not have capability \`report\`.`);
     }

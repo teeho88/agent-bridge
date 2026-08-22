@@ -176,11 +176,14 @@ describe("initializeWorkspace", () => {
       });
 
       const store = openStore(dir);
-      const repoMemory = store.listRepoMemories();
-      expect(repoMemory).toHaveLength(1);
-      expect(repoMemory[0]?.content).toContain("never edit generated SDK files");
-      expect(repoMemory[0]?.tags).toContain("auto-captured");
-      store.close();
+      try {
+        const repoMemory = store.listRepoMemories();
+        expect(repoMemory).toHaveLength(1);
+        expect(repoMemory[0]?.content).toContain("never edit generated SDK files");
+        expect(repoMemory[0]?.tags).toContain("auto-captured");
+      } finally {
+        store.close();
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -437,7 +440,7 @@ describe("initializeWorkspace", () => {
       });
 
       const handoff = readFileSync(
-        join(dir, ".agent-memory", "handoff.md"),
+        join(dir, ".handoff", "CURRENT.md"),
         "utf8",
       );
       expect(handoff).not.toContain("No handoff has been created yet.");
@@ -491,7 +494,7 @@ describe("initializeWorkspace", () => {
       expect(compiled).toContain("- Title: Knowledge graph scan scoping");
       expect(compiled).toContain("- Task: in_progress");
       expect(
-        readFileSync(join(dir, ".agent-memory", "handoff.md"), "utf8"),
+        readFileSync(join(dir, ".handoff", "CURRENT.md"), "utf8"),
       ).toContain("Knowledge graph work completed.");
 
       handleClaudeHook({ cwd: dir, hook_event_name: "TaskCompleted" });

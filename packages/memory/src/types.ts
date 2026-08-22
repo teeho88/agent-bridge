@@ -165,6 +165,7 @@ export type Subtask = {
   title: string;
   goal?: string;
   status: SubtaskStatus;
+  statusReason?: string;
   priority: number;
   dependsOn: string[];
   acceptanceCriteria: string[];
@@ -178,6 +179,7 @@ export type CreateSubtaskInput = {
   title: string;
   goal?: string;
   status?: SubtaskStatus;
+  statusReason?: string;
   priority?: number;
   dependsOn?: string[];
   acceptanceCriteria?: string[];
@@ -261,7 +263,6 @@ export type Handoff = {
   id: string;
   taskId: string;
   fromAgent?: AgentKind;
-  toAgent?: AgentKind;
   summary: string;
   done: string[];
   next: string[];
@@ -362,10 +363,13 @@ export type AddMemoryInput = {
   dedupe?: boolean;
 };
 
+export type UpdateMemoryInput = Partial<
+  Pick<AddMemoryInput, "type" | "content" | "summary" | "importance" | "tags">
+>;
+
 export type CreateHandoffInput = {
   taskId: string;
   fromAgent?: AgentKind;
-  toAgent?: AgentKind;
   summary: string;
   done?: string[];
   next?: string[];
@@ -378,7 +382,6 @@ export type UpdateHandoffInput = {
   id: string;
   taskId: string;
   fromAgent?: AgentKind;
-  toAgent?: AgentKind;
   summary: string;
   done?: string[];
   next?: string[];
@@ -676,6 +679,14 @@ export type OrchestrationStatus =
   | "failed"
   | "paused";
 
+// Statuses an orchestration never steps out of on its own. Everything else —
+// "paused" included — can still spawn another turn, so it still needs a leader
+// that resolves.
+export const FINISHED_ORCHESTRATION_STATUSES: ReadonlySet<OrchestrationStatus> = new Set<OrchestrationStatus>([
+  "done",
+  "failed",
+]);
+
 export type OrchestrationAutonomy = "manual" | "approve-each" | "auto";
 
 export type Orchestration = {
@@ -688,13 +699,13 @@ export type Orchestration = {
   cycle: number;
   maxCycles: number;
   maxParallel: number;
+  // Ceiling on how many times the leader may pause planning to ask the user.
+  // Absent means the orchestrator's default applies.
+  maxQuestionRounds?: number;
   complexity?: string;
   planPath?: string;
   reportPath?: string;
   lastError?: string;
-  // Providers the leader is allowed to staff implementers/reviewers from.
-  // Empty/absent means "no restriction" — the caller decides what is installed.
-  teamProviders?: string[];
   createdAt: string;
   updatedAt: string;
 };
@@ -707,12 +718,17 @@ export type CreateOrchestrationInput = {
   autonomy?: OrchestrationAutonomy;
   maxCycles?: number;
   maxParallel?: number;
-  teamProviders?: string[];
+  maxQuestionRounds?: number;
 };
 
 export type UpdateOrchestrationInput = Partial<
   Omit<CreateOrchestrationInput, "taskId" | "leaderAgentId">
 > & {
+  // Re-pointing the leader is the supported repair for an orchestration whose
+  // leader row was deleted or is otherwise unusable. Creating one is still the
+  // job of createOrchestration; this only moves an existing run onto another
+  // registered agent.
+  leaderAgentId?: string;
   status?: OrchestrationStatus;
   cycle?: number;
   complexity?: string;

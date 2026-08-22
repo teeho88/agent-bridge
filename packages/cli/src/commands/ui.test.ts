@@ -1,6 +1,7 @@
 import {
   existsSync,
   mkdirSync,
+  readFileSync,
   mkdtempSync,
   rmSync,
   utimesSync,
@@ -8,24 +9,35 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  answeredQuestionRouting,
   assertUiPageFreshness,
   filterWorkBoardSessionEvents,
   inferContextAgent,
   isAutoRunning,
   parseUiPort,
   prepareUiWorkspace,
-  parseTeamProviders,
-  readLogTail,
+  readPortableHandoffState,
   recordDirectSubtaskRunOutcome,
   resumeAutoRuns,
   startAutoRun,
   stopAutoRun,
   taskChangesWithWriteLeases,
 } from "./ui.js";
+import { readLogTail } from "./routes/files.js";
 import { openStore } from "../workspace.js";
 import { renderDashboardHtml } from "../ui-page.js";
+
+// The dashboard script is served from /ui-client/main.js, not inlined in the
+// page, so behaviour assertions read the client source directly.
+const clientJs = readFileSync(new URL("../ui-client/main.ts", import.meta.url), "utf8");
+
+// Tests that mix markup and behaviour assertions read the pair the dashboard
+// actually ships: the page shell plus that client module.
+function renderDashboardPage(workspace?: string): string {
+  return renderDashboardHtml(workspace) + clientJs;
+}
 
 function createUiPackage(): string {
   const root = mkdtempSync(join(tmpdir(), "agent-bridge-ui-"));
@@ -96,6 +108,41 @@ describe("assertUiPageFreshness", () => {
       expect(() => assertUiPageFreshness(root)).toThrow(
         "pnpm --filter @agent-bridge/cli build",
       );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("readPortableHandoffState", () => {
+  it("returns only archived handoffs for the selected task", () => {
+    const root = mkdtempSync(join(tmpdir(), "agent-bridge-handoff-state-"));
+    const history = join(root, ".handoff", "history");
+    mkdirSync(history, { recursive: true });
+    try {
+      writeFileSync(join(history, "new.md"), [
+        "# Handoff — New packet",
+        "",
+        "Date: 2026-08-20T16:00:00.000Z",
+        "Task: task-a",
+        "State: in_progress",
+        "",
+        "## Current state",
+        "Ready for the next action.",
+        "",
+        "## Completed",
+        "- Core flow",
+      ].join("\n"));
+      writeFileSync(join(history, "other.md"), "# Handoff — Other\n\nTask: task-b\n");
+
+      expect(readPortableHandoffState(root, "task-a").history).toEqual([
+        expect.objectContaining({
+          path: ".handoff/history/new.md",
+          title: "New packet",
+          state: "in_progress",
+          summary: "Ready for the next action.",
+        }),
+      ]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -257,16 +304,41 @@ describe("auto-run loop", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
-});
 
-describe("parseTeamProviders", () => {
-  it("keeps a validated, de-duplicated allowlist and treats an empty one as no restriction", () => {
-    expect(parseTeamProviders(["codex", "claude", "codex"])).toEqual(["codex", "claude"]);
-    expect(parseTeamProviders([])).toBeUndefined();
-    expect(parseTeamProviders(undefined)).toBeUndefined();
-    // A typo has to fail at start time; an unknown provider in the allowlist
-    // would otherwise become a plan the orchestrator cannot staff.
-    expect(() => parseTeamProviders(["codex", "clade"])).toThrow(/Invalid provider/);
+  it("keeps approve-each auto-run armed while an approval waits longer than 15 minutes", () => {
+    vi.useFakeTimers();
+    const root = mkdtempSync(join(tmpdir(), "agent-bridge-autorun-approval-"));
+    let orchestrationId = "";
+    try {
+      const store = openStore(root);
+      try {
+        const leader = store.createRegisteredAgent({ name: "leader", provider: "codex", mode: "manual" });
+        const task = store.createTask({ title: "Wait for my approval", ownerAgent: "codex" });
+        orchestrationId = store.createOrchestration({
+          taskId: task.id,
+          leaderAgentId: leader.id,
+          autonomy: "approve-each",
+        }).id;
+      } finally {
+        store.close();
+      }
+
+      startAutoRun(root, orchestrationId);
+      vi.advanceTimersByTime(16 * 60 * 1000);
+
+      expect(isAutoRunning(orchestrationId)).toBe(true);
+      const check = openStore(root);
+      try {
+        expect(check.getOrchestration(orchestrationId)?.autonomy).toBe("approve-each");
+        expect(check.listAgentRequests({ status: "pending" }).filter((request) => request.type === "approval")).toHaveLength(1);
+      } finally {
+        check.close();
+      }
+    } finally {
+      if (orchestrationId) stopAutoRun(orchestrationId);
+      vi.useRealTimers();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -343,7 +415,9 @@ describe("recordDirectSubtaskRunOutcome", () => {
         recordDirectSubtaskRunOutcome(store, run);
 
         expect(store.listAssignments({ subtaskId: subtask.id })[0]?.status).toBe(expectedAssignment);
-        expect(store.listSubtasks({ parentTaskId: task.id }).find((item) => item.id === subtask.id)?.status).toBe(expectedSubtask);
+        const updatedSubtask = store.listSubtasks({ parentTaskId: task.id }).find((item) => item.id === subtask.id);
+        expect(updatedSubtask?.status).toBe(expectedSubtask);
+        expect(updatedSubtask?.statusReason).toBe(status === "failed" ? "Agent process failed with exit code 1." : undefined);
         expect(store.listOrchestrationEvents({ orchestrationId: orchestration.id })[0]?.kind).toBe(expectedEvent);
       }
     } finally {
@@ -384,7 +458,7 @@ describe("inferContextAgent", () => {
 
 describe("dashboard overview", () => {
   it("renders a compact live-task dashboard with active-task styling", () => {
-    const html = renderDashboardHtml();
+    const html = renderDashboardPage();
     expect(html).not.toContain("Selected Live Task");
     expect(renderDashboardHtml("D:\\repo")).toContain("D:\\repo");
     expect(html).toContain("join('\\n')");
@@ -392,6 +466,46 @@ describe("dashboard overview", () => {
     expect(html).toContain("Live Task Board");
     expect(html).not.toContain("Target agent");
     expect(html).toContain("Agent Terminals");
+    expect(html).toContain('data-view="skills"');
+    expect(html).toContain('id="view-skills"');
+    expect(html).toContain('id="skillDropZone"');
+    expect(html).toContain('id="skillFile"');
+    expect(html).toContain("/api/skills/save");
+    expect(html).toContain("/api/skills/delete");
+    expect(html).toContain('id="githubSkillSearchForm"');
+    expect(html).toContain('id="githubSkillScope"');
+    expect(html).toContain("/api/skills/github/search");
+    expect(html).toContain("/api/skills/github/install");
+    expect(html).toContain("result.repositoryUrl");
+    expect(html).toContain("result.description || 'No repository description.'");
+    expect(html).toContain("★ ' + escapeHtml(stars) + ' stars · updated ");
+    expect(html).not.toContain("const directory = String(result.path || '')");
+    expect(html).not.toContain("'<strong>$' + escapeHtml(directory)");
+    expect(html).toContain('class="modal-backdrop" id="githubTokenHelpModal" hidden');
+    expect(html).toContain('aria-labelledby="githubTokenHelpTitle"');
+    expect(html).toContain('$env:GITHUB_TOKEN = Read-Host "GitHub token" -MaskInput');
+    expect(html).toContain('Read-Host "GitHub token" -AsSecureString');
+    expect(html).toContain("set /p GITHUB_TOKEN=GitHub token:");
+    expect(html).toContain('[Environment]::GetEnvironmentVariable("GITHUB_TOKEN", "User")');
+    expect(html).toContain("An existing terminal and UI process cannot see variables added later.");
+    expect(html).toContain("Do not add angle brackets around a token in CMD");
+    expect(html).toContain("GitHub token is not visible to the running Agent Bridge process.");
+    expect(html).toContain("if (isGitHubTokenMissing(error)) openGitHubTokenHelp(error)");
+    expect(html).toContain("if (event.target === els.githubTokenHelpModal) closeGitHubTokenHelp()");
+    expect(html).not.toContain('data-tip="Searches public GitHub code for SKILL.md files.');
+    expect(html).toContain("Replace the existing skill?");
+    expect(html).toContain("populateSkillFromFile");
+    expect(html).toContain("dataTransfer && event.dataTransfer.files[0]");
+    // The client is no longer inlined: the page loads it as a module and tsc
+    // checks its syntax at build time. Guard the wiring, and parse the
+    // compiled output when a build is present.
+    expect(html).toContain('<script type="module" src="/ui-client/main.js"></script>');
+    expect(html).not.toMatch(/<script>[\s\S]*?<\/script>/);
+    const builtClient = new URL("../../dist/ui-client/main.js", import.meta.url);
+    if (existsSync(builtClient)) {
+      const compiled = readFileSync(builtClient, "utf8");
+      expect(() => new Function(compiled)).not.toThrow();
+    }
     expect(html).toContain('class="secondary open-agent-terminal" data-agent="claude"');
     expect(html).toContain('class="secondary open-agent-terminal" data-agent="codex"');
     expect(html).toContain('class="secondary open-agent-terminal" data-agent="antigravity"');
@@ -433,6 +547,11 @@ describe("dashboard overview", () => {
     expect(html).not.toContain('/api/workforce/team-task');
     expect(html).toContain('data-orch-tab="agents"');
     expect(html).toContain('id="workforceAgentForm"');
+    expect(html).toContain('class="modal-backdrop" id="workforceAgentModal" hidden');
+    expect(html).toContain('id="workforceAgentOpen"');
+    expect(html).toContain('aria-labelledby="workforceAgentModalTitle"');
+    expect(html).toContain("els.workforceAgentModal.hidden = false");
+    expect(html).toContain("if (event.target === els.workforceAgentModal) closeAgentEditor()");
     expect(html).toContain('id="defaultAgentPresets"');
     expect(html).toContain('id="defaultAgentPresetsModal" hidden');
     expect(html).toContain('id="defaultAgentPresetsOpen"');
@@ -440,7 +559,7 @@ describe("dashboard overview", () => {
     expect(html).toContain('id="defaultAgentSelectAll"');
     expect(html).toContain('class="default-agent-select-all"');
     expect(html).toContain('els.defaultAgentSelectAll.indeterminate = selectedPresetCount > 0');
-    expect(html).toContain("querySelectorAll('.default-agent-preset')");
+    expect(html).toContain("qsa(els.defaultAgentPresets, '.default-agent-preset')");
     expect(html).toContain('class="default-agent-preset"');
     expect(html).toContain('class="card default-agent-option"');
     expect(html).toContain('.default-agent-option input[type="checkbox"]');
@@ -472,13 +591,15 @@ describe("dashboard overview", () => {
     expect(html).toContain("read/write leases");
     expect(html).toContain("line changes");
     expect(html).toContain("git-diff");
-    expect(html).toContain("latestHandoffEditForm");
-    expect(html).toContain("latestHandoffId");
-    expect(html).toContain('id="latestHandoffEditButton"');
-    expect(html).toContain('id="latestHandoffEditPanel" class="panel-section" hidden');
-    expect(html).toContain(".panel-section[hidden] { display: none; }");
-    expect(html).toContain("els.latestHandoffEditPanel.hidden = false");
-    expect(html).toContain("/api/handoff/update");
+    expect(html).toContain("Save Current Handoff");
+    expect(html).toContain("Save Current &amp; Archive");
+    expect(html).toContain("Created by");
+    expect(html).not.toContain('name="to"');
+    expect(html).toContain('id="handoffHistory"');
+    expect(html).toContain(".handoff/CURRENT.md");
+    expect(html).toContain("/api/handoff/save");
+    expect(html).not.toContain("latestHandoffEditForm");
+    expect(html).not.toContain("/api/handoff/update");
     expect(html).toContain("populateTaskSelects(state.tasks || [], current?.id)");
     expect(html).toContain("bindForm('compileForm', '/api/context/compile', { reset: false");
     expect(html).toContain("selectedLiveTaskId = data.pack.task.id");
@@ -490,6 +611,15 @@ describe("dashboard overview", () => {
     expect(html).toContain('id="tokenSavings"');
     expect(html).not.toContain("Compiled brief tokens");
     expect(html).toContain("Repository Memory Inbox");
+    expect(html).toContain('id="repoMemoryEditForm"');
+    expect(html).toContain('class="modal-backdrop" id="repoMemoryEditModal" hidden');
+    expect(html).toContain('aria-labelledby="repoMemoryEditTitle"');
+    expect(html).toContain("els.repoMemoryEditModal.hidden = false");
+    expect(html).toContain("if (event.target === els.repoMemoryEditModal) closeRepoMemoryEditor()");
+    expect(html).toContain("edit-repo-memory");
+    expect(html).toContain("delete-repo-memory");
+    expect(html).toContain("/api/repo-memory/update");
+    expect(html).toContain("/api/repo-memory/delete");
     expect(html).toContain("review-candidate");
     expect(html).toContain("data-request-id");
     expect(html).toContain("/api/session/focus");
@@ -497,7 +627,7 @@ describe("dashboard overview", () => {
   });
 
   it("renders the Team Board (Orchestrator) view wired to the workforce API", () => {
-    const html = renderDashboardHtml();
+    const html = renderDashboardPage();
     expect(html).toContain('data-view="orchestrator"');
     expect(html).toContain('id="view-orchestrator"');
     expect(html).toContain('id="orchestratorStartForm"');
@@ -515,22 +645,16 @@ describe("dashboard overview", () => {
     expect(html.match(/id="orchestratorSubtaskForm"/g)).toHaveLength(1);
     expect(html).not.toContain('<label>Role <input name="role"');
     expect(html).not.toContain("role: form.role.value");
-    // Team providers: without this the leader only ever hears about providers
-    // that already have an agent, so a codex leader staffs an all-codex team.
     // The removed Workforce feature must not leak back into orchestration.
     expect(html).not.toContain('name="workforceName"');
     expect(html).not.toContain("Workforce name");
-    expect(html).toContain('id="orchestratorTeamProviders"');
-    // label is a grid, so the help bubble needs its own inline row or it drops
-    // to a second line under the caption.
-    expect(html).toContain('<label><span class="label-row">Team providers <span class="help"');
     expect(html).toContain(".label-row { display: flex; align-items: center; gap: 6px; }");
-    expect(html).toContain("function renderTeamProviders(installed)");
-    expect(html).toContain("function selectedTeamProviders(form)");
-    expect(html).toContain("agent-bridge:team-providers:start");
-    expect(html).toContain("agent-bridge:team-providers:change:");
-    expect(html).toContain("localStorage.setItem(key, JSON.stringify(providers))");
-    expect(html).toContain("savedChangeProviders ?? currentOrchestrationTeamProviders");
+    // Providers moved into the Agents tab as a bulk enable/disable of every
+    // agent of one provider; the start form no longer carries an allowlist.
+    expect(html).not.toContain('id="orchestratorTeamProviders"');
+    expect(clientJs).not.toContain("function renderTeamProviders(installed)");
+    expect(clientJs).toContain("function renderProviderToggles()");
+    expect(clientJs).toContain("class=\"provider-toggle\"");
     expect(html).toContain('id="orchestratorRuns"');
     expect(html).toContain('id="orchestratorAdoptable"');
     // Picker + Remove: the board must be reachable even when the active task
@@ -546,8 +670,6 @@ describe("dashboard overview", () => {
     // project could only be revised by starting a second task.
     expect(html).toContain('id="orchestratorRequestChangesButton"');
     expect(html).toContain('id="orchestratorChangeForm"');
-    expect(html).toContain('id="orchestratorChangeTeamProviders"');
-    expect(html).toContain("teamProviders: checkedTeamProviders(form)");
     expect(html).toContain("/api/workforce/orchestration/request-changes");
     // Auto-run is no longer its own button: Autonomy decides whether the server
     // steps (auto/approve-each) or the user does (manual), so the old toggle was
@@ -567,6 +689,13 @@ describe("dashboard overview", () => {
     expect(html).toContain('id="orchestratorDismissQuestionsButton"');
     expect(html).toContain("/api/workforce/orchestration/answer-questions");
     expect(html).toContain("renderLeaderQuestions(data.questions || [])");
+    // Inbox requests can be resolved without deleting their audit history. An
+    // orchestration request also resumes through resumeStatusFor, so an
+    // adjudicate failure returns to adjudicating rather than planning.
+    expect(html).toContain('class="ghost request-resolve"');
+    expect(html).toContain("Resolve &amp; Resume");
+    expect(html).toContain("'/api/orchestration/request/' + encodeURIComponent(requestResolve.dataset.requestId) + '/resolve'");
+    expect(html).toContain("response: resume ? 'Resolved and resumed from dashboard.'");
     // Pause/Resume is one button whose direction follows the orchestration's
     // own status, and long agent text is clamped so it can't crowd out the UI.
     expect(html).toContain('id="orchestratorPauseToggle"');
@@ -589,6 +718,11 @@ describe("dashboard overview", () => {
     // can only set at launch — and it is the only switch now.
     expect(html).toContain('id="orchestratorAutonomy"');
     expect(html).toContain("/api/workforce/orchestration/autonomy");
+    // Providers are enabled/disabled per agent in the Agents tab now; the
+    // per-orchestration Team providers allowlist is gone.
+    expect(clientJs).not.toContain("/api/workforce/orchestration/team-providers");
+    expect(html).toContain('id="workforceProviderToggles"');
+    expect(clientJs).toContain("/api/workforce/agents/provider-enabled");
     expect(html).toContain('<option value="auto">Auto');
     expect(html).toContain('<option value="manual">Manual');
     // approve-each is a real mode: it gates every agent spawn.
@@ -659,6 +793,8 @@ describe("dashboard overview", () => {
     expect(html).toContain("Finished — open Full log to read it.");
     expect(html).toContain("function syncRunCompletionToasts(runs, agentsById)");
     expect(html).toContain("Process exited successfully; subtask is awaiting review.");
+    expect(html).toContain("subtask.statusReason");
+    expect(html).toContain("<strong>Reason:</strong>");
     expect(html).toContain(".run-toast.is-success");
     expect(html).toContain(".run-toast.is-failure");
     expect(html).toContain("run-stop");
@@ -679,3 +815,48 @@ describe("dashboard overview", () => {
 
 
 
+
+describe("answeredQuestionRouting", () => {
+  it("routes answers back to the phase that asked instead of always to planning", () => {
+    // Observed live: answering "finish now, write the defects into the report"
+    // during adjudication consumed every plan run and re-planned the project.
+    const root = mkdtempSync(join(tmpdir(), "agent-bridge-answer-routing-"));
+    const store = openStore(root);
+    try {
+      const agent = store.createRegisteredAgent({ name: "leader", provider: "codex", mode: "manual" });
+      const task = store.createTask({ title: "Route the board", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: agent.id });
+      const record = (phase: string) =>
+        store.recordOrchestrationEvent({
+          orchestrationId: orchestration.id,
+          cycle: orchestration.cycle,
+          phase,
+          kind: "leader_turn",
+          summary: `${phase} turn`,
+        });
+
+      record("plan");
+      expect(answeredQuestionRouting(store, orchestration.id)).toMatchObject({
+        phase: "plan",
+        resumeStatus: "planning",
+        stalePhase: "plan",
+      });
+
+      record("adjudicate");
+      expect(answeredQuestionRouting(store, orchestration.id)).toMatchObject({
+        phase: "adjudicate",
+        resumeStatus: "adjudicating",
+        stalePhase: "adjudicate",
+      });
+
+      // A reviewer's question has no leader turn to redo, so nothing is consumed.
+      record("review");
+      const routing = answeredQuestionRouting(store, orchestration.id);
+      expect(routing).toMatchObject({ phase: "review", resumeStatus: "executing" });
+      expect(routing.stalePhase).toBeUndefined();
+    } finally {
+      store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

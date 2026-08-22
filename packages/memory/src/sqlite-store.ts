@@ -23,6 +23,7 @@ import type { ExtractedGraph, GraphNode, RepoMapFile } from "./graph.js";
 import type { MemoryStore } from "./memory-store.js";
 import type {
   AddMemoryInput,
+  UpdateMemoryInput,
   AgentRun,
   AgentRunStatus,
   CreateAgentRunInput,
@@ -32,6 +33,7 @@ import type {
   CreateOrchestrationInput,
   UpdateOrchestrationInput,
   OrchestrationEvent,
+  OrchestrationEventKind,
   RecordOrchestrationEventInput,
   Review,
   CreateReviewInput,
@@ -85,6 +87,7 @@ import type {
   UpsertTaskChangeInput,
   UpsertTaskLaneInput,
 } from "./types.js";
+import { FINISHED_ORCHESTRATION_STATUSES } from "./types.js";
 
 type Row = Record<string, unknown>;
 
@@ -386,6 +389,7 @@ function toSubtask(row: Row): Subtask {
     title: String(row.title),
     goal: row.goal ? String(row.goal) : undefined,
     status: String(row.status) as Subtask["status"],
+    statusReason: row.status_reason ? String(row.status_reason) : undefined,
     priority: Number(row.priority ?? 3),
     dependsOn: parseList(row.depends_on),
     acceptanceCriteria: parseList(row.acceptance_criteria),
@@ -395,6 +399,13 @@ function toSubtask(row: Row): Subtask {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
+}
+
+function normalizeSubtaskStatusReason(status: SubtaskStatus, reason?: string): string | undefined {
+  if (status !== "blocked" && status !== "cancelled") return undefined;
+  const fallback = status === "blocked" ? "Blocked without a recorded reason." : "Cancelled without a recorded reason.";
+  const flat = (reason?.trim() || fallback).replace(/\s+/g, " ");
+  return flat.length > 240 ? `${flat.slice(0, 239)}…` : flat;
 }
 
 function toAssignment(row: Row): Assignment {
@@ -473,11 +484,14 @@ function toOrchestration(row: Row): Orchestration {
     cycle: Number(row.cycle ?? 0),
     maxCycles: Number(row.max_cycles ?? 8),
     maxParallel: Number(row.max_parallel ?? 3),
+    // 0 is a real setting ("never stop to ask"), so only NULL falls back.
+    maxQuestionRounds: row.max_question_rounds === null || row.max_question_rounds === undefined
+      ? undefined
+      : Number(row.max_question_rounds),
     complexity: row.complexity ? String(row.complexity) : undefined,
     planPath: row.plan_path ? String(row.plan_path) : undefined,
     reportPath: row.report_path ? String(row.report_path) : undefined,
     lastError: row.last_error ? String(row.last_error) : undefined,
-    teamProviders: parseStringArray(row.team_providers),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
@@ -496,6 +510,11 @@ function parseStringArray(value: unknown): string[] | undefined {
   } catch {
     return undefined;
   }
+}
+
+// `_` and `%` in a caller-supplied prefix are literal, not wildcards.
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (match) => "\\" + match);
 }
 
 function toOrchestrationEvent(row: Row): OrchestrationEvent {
@@ -532,9 +551,6 @@ function toHandoff(row: Row): Handoff {
     taskId: String(row.task_id),
     fromAgent: row.from_agent
       ? (String(row.from_agent) as Handoff["fromAgent"])
-      : undefined,
-    toAgent: row.to_agent
-      ? (String(row.to_agent) as Handoff["toAgent"])
       : undefined,
     summary: String(row.summary),
     done: parseList(row.done),
@@ -732,6 +748,43 @@ export class SQLiteMemoryStore implements MemoryStore {
       )
       .run({ ...memory, tags: JSON.stringify(memory.tags) });
     return memory;
+  }
+
+  updateRepoMemory(id: string, input: UpdateMemoryInput): Memory | undefined {
+    const current = this.db
+      .prepare("SELECT * FROM memories WHERE id = ? AND task_id IS NULL")
+      .get(id) as Row | undefined;
+    if (!current) return undefined;
+
+    const memory = toMemory(current);
+    const updated: Memory = {
+      ...memory,
+      type: input.type ?? memory.type,
+      content: input.content ?? memory.content,
+      summary: input.summary ?? memory.summary,
+      importance: input.importance ?? memory.importance,
+      tags: input.tags ?? memory.tags,
+      updatedAt: now(),
+    };
+    this.db
+      .prepare(
+        `UPDATE memories
+         SET type = @type, content = @content, summary = @summary,
+             importance = @importance, tags = @tags, updated_at = @updatedAt
+         WHERE id = @id AND task_id IS NULL`,
+      )
+      .run({
+        ...updated,
+        summary: updated.summary ?? null,
+        tags: JSON.stringify(updated.tags),
+      });
+    return updated;
+  }
+
+  deleteRepoMemory(id: string): boolean {
+    return this.db
+      .prepare("DELETE FROM memories WHERE id = ? AND task_id IS NULL")
+      .run(id).changes > 0;
   }
 
   // Maintain one visible "latest state" memory per task/source/type. Existing
@@ -1505,6 +1558,19 @@ export class SQLiteMemoryStore implements MemoryStore {
   deleteRegisteredAgent(id: string): boolean {
     const agent = this.getRegisteredAgent(id);
     if (!agent) return false;
+    // Archiving the leader of a run that is still going leaves every step
+    // throwing "Registered agent not found", and nothing in the UI could undo
+    // it. Point the orchestration at another leader first.
+    const leading = this.listOrchestrations({ leaderAgentId: id, limit: 50 }).filter(
+      (orchestration) => !FINISHED_ORCHESTRATION_STATUSES.has(orchestration.status),
+    );
+    if (leading.length) {
+      throw new Error(
+        `Agent "${agent.name}" is leading ${leading.length} unfinished orchestration(s): ` +
+          `${leading.map((orchestration) => orchestration.id).join(", ")}. ` +
+          `Change the leader on those orchestrations (or stop them) before deleting this agent.`,
+      );
+    }
     const timestamp = now();
     const tx = this.db.transaction(() => {
       this.db.prepare("DELETE FROM workforce_members WHERE agent_id = ?").run(id);
@@ -1782,12 +1848,14 @@ export class SQLiteMemoryStore implements MemoryStore {
 
   createSubtask(input: CreateSubtaskInput): Subtask {
     const timestamp = now();
+    const status = input.status ?? "todo";
     const subtask: Subtask = {
       id: `subtask-${randomUUID()}`,
       parentTaskId: input.parentTaskId,
       title: input.title,
       goal: input.goal,
-      status: input.status ?? "todo",
+      status,
+      statusReason: normalizeSubtaskStatusReason(status, input.statusReason),
       priority: input.priority ?? 3,
       dependsOn: input.dependsOn ?? [],
       acceptanceCriteria: input.acceptanceCriteria ?? [],
@@ -1798,12 +1866,13 @@ export class SQLiteMemoryStore implements MemoryStore {
     this.db
       .prepare(
         `INSERT INTO subtasks
-         (id, parent_task_id, title, goal, status, priority, depends_on, acceptance_criteria, created_by_assignment_id, created_at, updated_at)
-         VALUES (@id, @parentTaskId, @title, @goal, @status, @priority, @dependsOn, @acceptanceCriteria, @createdByAssignmentId, @createdAt, @updatedAt)`,
+         (id, parent_task_id, title, goal, status, status_reason, priority, depends_on, acceptance_criteria, created_by_assignment_id, created_at, updated_at)
+         VALUES (@id, @parentTaskId, @title, @goal, @status, @statusReason, @priority, @dependsOn, @acceptanceCriteria, @createdByAssignmentId, @createdAt, @updatedAt)`,
       )
       .run({
         ...subtask,
         goal: subtask.goal ?? null,
+        statusReason: subtask.statusReason ?? null,
         dependsOn: JSON.stringify(subtask.dependsOn),
         acceptanceCriteria: JSON.stringify(subtask.acceptanceCriteria),
         createdByAssignmentId: subtask.createdByAssignmentId ?? null,
@@ -1818,11 +1887,17 @@ export class SQLiteMemoryStore implements MemoryStore {
     // `input` directly — a caller that includes a key with an explicit
     // `undefined` value (e.g. `subtask update <id> --status done` without
     // --title) must not null out title and violate its NOT NULL constraint.
+    const nextStatus = input.status ?? current.status;
+    const reasonInput = input.status && input.status !== current.status
+      ? input.statusReason
+      : input.statusReason ?? current.statusReason;
+    const statusReason = normalizeSubtaskStatusReason(nextStatus, reasonInput);
     const next: Subtask = {
       ...current,
       title: input.title ?? current.title,
       goal: input.goal ?? current.goal,
-      status: input.status ?? current.status,
+      status: nextStatus,
+      statusReason,
       priority: input.priority ?? current.priority,
       createdByAssignmentId: input.createdByAssignmentId ?? current.createdByAssignmentId,
       dependsOn: input.dependsOn ?? current.dependsOn,
@@ -1832,7 +1907,7 @@ export class SQLiteMemoryStore implements MemoryStore {
     this.db
       .prepare(
         `UPDATE subtasks
-         SET title = @title, goal = @goal, status = @status, priority = @priority,
+         SET title = @title, goal = @goal, status = @status, status_reason = @statusReason, priority = @priority,
              depends_on = @dependsOn, acceptance_criteria = @acceptanceCriteria,
              created_by_assignment_id = @createdByAssignmentId, updated_at = @updatedAt
          WHERE id = @id`,
@@ -1840,6 +1915,7 @@ export class SQLiteMemoryStore implements MemoryStore {
       .run({
         ...next,
         goal: next.goal ?? null,
+        statusReason: next.statusReason ?? null,
         dependsOn: JSON.stringify(next.dependsOn),
         acceptanceCriteria: JSON.stringify(next.acceptanceCriteria),
         createdByAssignmentId: next.createdByAssignmentId ?? null,
@@ -2273,20 +2349,20 @@ export class SQLiteMemoryStore implements MemoryStore {
       cycle: 0,
       maxCycles: input.maxCycles ?? 8,
       maxParallel: input.maxParallel ?? 3,
-      teamProviders: input.teamProviders?.length ? input.teamProviders : undefined,
+      maxQuestionRounds: input.maxQuestionRounds,
       createdAt: timestamp,
       updatedAt: timestamp,
     };
     this.db
       .prepare(
         `INSERT INTO orchestrations
-         (id, task_id, workforce_id, leader_agent_id, status, autonomy, cycle, max_cycles, max_parallel, team_providers, created_at, updated_at)
-         VALUES (@id, @taskId, @workforceId, @leaderAgentId, @status, @autonomy, @cycle, @maxCycles, @maxParallel, @teamProviders, @createdAt, @updatedAt)`,
+         (id, task_id, workforce_id, leader_agent_id, status, autonomy, cycle, max_cycles, max_parallel, max_question_rounds, created_at, updated_at)
+         VALUES (@id, @taskId, @workforceId, @leaderAgentId, @status, @autonomy, @cycle, @maxCycles, @maxParallel, @maxQuestionRounds, @createdAt, @updatedAt)`,
       )
       .run({
         ...orchestration,
         workforceId: orchestration.workforceId ?? null,
-        teamProviders: orchestration.teamProviders ? JSON.stringify(orchestration.teamProviders) : null,
+        maxQuestionRounds: orchestration.maxQuestionRounds ?? null,
       });
     return orchestration;
   }
@@ -2308,50 +2384,64 @@ export class SQLiteMemoryStore implements MemoryStore {
   updateOrchestration(id: string, input: UpdateOrchestrationInput): Orchestration | undefined {
     const current = this.getOrchestration(id);
     if (!current) return undefined;
+    if (input.leaderAgentId && input.leaderAgentId !== current.leaderAgentId) {
+      // A leader the roster cannot resolve is exactly the state this setter
+      // exists to repair, so refuse to write another one.
+      if (!this.getRegisteredAgent(input.leaderAgentId)) {
+        throw new Error(`Registered agent not found: ${input.leaderAgentId}`);
+      }
+    }
     const next: Orchestration = {
       ...current,
+      leaderAgentId: input.leaderAgentId ?? current.leaderAgentId,
       workforceId: input.workforceId ?? current.workforceId,
       status: input.status ?? current.status,
       autonomy: input.autonomy ?? current.autonomy,
       cycle: input.cycle ?? current.cycle,
       maxCycles: input.maxCycles ?? current.maxCycles,
       maxParallel: input.maxParallel ?? current.maxParallel,
+      maxQuestionRounds: input.maxQuestionRounds ?? current.maxQuestionRounds,
       complexity: input.complexity ?? current.complexity,
       planPath: input.planPath ?? current.planPath,
       reportPath: input.reportPath ?? current.reportPath,
       lastError: input.lastError === undefined ? current.lastError : (input.lastError ?? undefined),
-      teamProviders: input.teamProviders ?? current.teamProviders,
       updatedAt: now(),
     };
     this.db
       .prepare(
         `UPDATE orchestrations
-         SET workforce_id = @workforceId, status = @status, autonomy = @autonomy, cycle = @cycle,
-             max_cycles = @maxCycles, max_parallel = @maxParallel, complexity = @complexity,
+         SET leader_agent_id = @leaderAgentId,
+             workforce_id = @workforceId, status = @status, autonomy = @autonomy, cycle = @cycle,
+             max_cycles = @maxCycles, max_parallel = @maxParallel,
+             max_question_rounds = @maxQuestionRounds, complexity = @complexity,
              plan_path = @planPath, report_path = @reportPath, last_error = @lastError,
-             team_providers = @teamProviders, updated_at = @updatedAt
+             updated_at = @updatedAt
          WHERE id = @id`,
       )
       .run({
         ...next,
         workforceId: next.workforceId ?? null,
+        maxQuestionRounds: next.maxQuestionRounds ?? null,
         complexity: next.complexity ?? null,
         planPath: next.planPath ?? null,
         reportPath: next.reportPath ?? null,
         lastError: next.lastError ?? null,
-        teamProviders: next.teamProviders?.length ? JSON.stringify(next.teamProviders) : null,
       });
     return this.getOrchestration(id);
   }
 
   listOrchestrations(
-    options: { status?: OrchestrationStatus; limit?: number } = {},
+    options: { status?: OrchestrationStatus; leaderAgentId?: string; limit?: number } = {},
   ): Orchestration[] {
     const filters: string[] = [];
     const params: Record<string, unknown> = { limit: options.limit ?? 100 };
     if (options.status) {
       filters.push("status = @status");
       params.status = options.status;
+    }
+    if (options.leaderAgentId) {
+      filters.push("leader_agent_id = @leaderAgentId");
+      params.leaderAgentId = options.leaderAgentId;
     }
     const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
     return (
@@ -2383,15 +2473,27 @@ export class SQLiteMemoryStore implements MemoryStore {
   }
 
   listOrchestrationEvents(
-    options: { orchestrationId: string; limit?: number },
+    options: { orchestrationId: string; limit?: number; kind?: OrchestrationEventKind; summaryPrefix?: string },
   ): OrchestrationEvent[] {
+    // Filtering in SQL rather than after the fact: an orchestration that ran
+    // for a few cycles accumulates thousands of events, and a caller looking
+    // for the handful of plan-meta rows among them would otherwise have to
+    // guess a limit big enough to still contain the oldest one.
+    const filters = ["orchestration_id = @orchestrationId"];
+    if (options.kind) filters.push("kind = @kind");
+    if (options.summaryPrefix) filters.push("summary LIKE @summaryPrefix ESCAPE '\\'");
     return (
       this.db
         .prepare(
-          `SELECT * FROM orchestration_events WHERE orchestration_id = @orchestrationId
+          `SELECT * FROM orchestration_events WHERE ${filters.join(" AND ")}
            ORDER BY created_at DESC LIMIT @limit`,
         )
-        .all({ orchestrationId: options.orchestrationId, limit: options.limit ?? 200 }) as Row[]
+        .all({
+          orchestrationId: options.orchestrationId,
+          limit: options.limit ?? 200,
+          kind: options.kind ?? null,
+          summaryPrefix: options.summaryPrefix ? `${escapeLike(options.summaryPrefix)}%` : null,
+        }) as Row[]
     ).map(toOrchestrationEvent);
   }
 
@@ -2834,7 +2936,6 @@ export class SQLiteMemoryStore implements MemoryStore {
       id: `handoff-${randomUUID()}`,
       taskId: input.taskId,
       fromAgent: input.fromAgent,
-      toAgent: input.toAgent,
       summary: input.summary,
       done: input.done ?? [],
       next: input.next ?? [],
@@ -2846,8 +2947,8 @@ export class SQLiteMemoryStore implements MemoryStore {
     this.db
       .prepare(
         `INSERT INTO handoffs
-         (id, task_id, from_agent, to_agent, summary, done, next, risks, files_changed, created_at, auto)
-         VALUES (@id, @taskId, @fromAgent, @toAgent, @summary, @done, @next, @risks, @filesChanged, @createdAt, @auto)`,
+         (id, task_id, from_agent, summary, done, next, risks, files_changed, created_at, auto)
+         VALUES (@id, @taskId, @fromAgent, @summary, @done, @next, @risks, @filesChanged, @createdAt, @auto)`,
       )
       .run({
         ...handoff,
@@ -2871,7 +2972,6 @@ export class SQLiteMemoryStore implements MemoryStore {
       id: String(existing.id),
       taskId: input.taskId,
       fromAgent: input.fromAgent,
-      toAgent: input.toAgent,
       summary: input.summary,
       done: input.done ?? [],
       next: input.next ?? [],
@@ -2885,7 +2985,6 @@ export class SQLiteMemoryStore implements MemoryStore {
         `UPDATE handoffs
          SET task_id = @taskId,
              from_agent = @fromAgent,
-             to_agent = @toAgent,
              summary = @summary,
              done = @done,
              next = @next,

@@ -1,5 +1,6 @@
 import type { PromptPack } from "@agent-bridge/core";
 import type { CreateRegisteredAgentInput } from "@agent-bridge/memory";
+import { orchestratedRunSection } from "./managed-section.js";
 
 // Replaces the deprecated gemini CLI (whose geminiAgentDefaults this supersedes).
 // The command is `agy`, not `antigravity`: the latter only launches the IDE,
@@ -109,13 +110,15 @@ Before finishing:
    \`\`\`
 4. Create or update handoff notes:
    \`\`\`bash
-   agent-bridge handoff create --from antigravity --to codex --summary "<summary>" --next "<next action>"
+   agent-bridge handoff create --from antigravity --summary "<summary>" --next "<next action>"
    \`\`\`
    For non-ASCII summaries, pipe via stdin:
    \`\`\`bash
-   echo "<tóm tắt>" | agent-bridge handoff create --stdin --from antigravity --to codex
+   echo "<tóm tắt>" | agent-bridge handoff create --stdin --from antigravity
    \`\`\`
 5. Avoid including unnecessary full file contents.
+
+${orchestratedRunSection()}
 
 <!-- agent-bridge:end -->`;
 }
@@ -147,8 +150,8 @@ export function antigravityArtifact(pack: PromptPack): Record<string, unknown> {
     completion_rules: [
       "Run: agent-bridge memory add \"<important fact or decision>\" --type note --agent antigravity",
       "For non-ASCII (e.g. Vietnamese) or multi-line text, pipe via stdin: echo \"<nội dung>\" | agent-bridge memory add --stdin --type note --agent antigravity",
-      "Run: agent-bridge handoff create --from antigravity --to codex --summary \"<summary>\" --next \"<next action>\"",
-      "For non-ASCII summaries: echo \"<tóm tắt>\" | agent-bridge handoff create --stdin --from antigravity --to codex"
+      "Run: agent-bridge handoff create --from antigravity --summary \"<summary>\" --next \"<next action>\"",
+      "For non-ASCII summaries: echo \"<tóm tắt>\" | agent-bridge handoff create --stdin --from antigravity"
     ]
   };
 }

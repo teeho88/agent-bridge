@@ -131,7 +131,6 @@ describe("Codex hooks", () => {
         seed.upsertTaskHandoff({
           taskId: task.id,
           fromAgent: "claude",
-          toAgent: "claude",
           summary: "Invoice export streaming is half done.",
           next: ["Stream the invoice rows instead of buffering them"],
         });
@@ -151,8 +150,8 @@ describe("Codex hooks", () => {
         expect(store.listTasks(10)[0]?.id).toBe(taskId);
       } finally { store.close(); }
 
-      // A handoff addressed to Claude still reaches Codex, through the file
-      // Codex is told to read.
+      // The task-scoped handoff reaches Codex regardless of which agent worked
+      // on the task before it.
       const compiled = readFileSync(join(cwd, ".agent-memory", "compiled-context.md"), "utf8");
       expect(compiled).toContain("Invoice export streaming is half done.");
       expect(compiled).toContain("Stream the invoice rows instead of buffering them");
