@@ -19,6 +19,7 @@ type SuggestionStore = {
 };
 
 const promptSuggestionTag = "task-label-source";
+const omittedGoalTag = "task-goal-omitted";
 const provisionalTitles = new Set([
   "Untitled task",
   "Codex session",
@@ -82,6 +83,30 @@ export function firstTaskLabelSource(store: SuggestionStore, taskId: string): st
     ?.content.trim();
 }
 
+export function markTaskGoalOmitted(
+  store: SuggestionStore,
+  taskId: string,
+  agent: AgentKind,
+): Task | undefined {
+  const task = store.updateTask(taskId, { goal: "" });
+  if (!task) return undefined;
+  const exists = store
+    .listMemoriesForTask(taskId, 100)
+    .some((memory) => memory.tags.includes(omittedGoalTag));
+  if (!exists) {
+    store.addMemory({
+      taskId,
+      type: "note",
+      content: "Task intentionally has no runtime goal.",
+      importance: 2,
+      tags: [agent, omittedGoalTag],
+      sourceAgent: agent,
+      dedupe: false,
+    });
+  }
+  return task;
+}
+
 export function applyTaskLabelSuggestion(
   store: SuggestionStore,
   taskId: string,
@@ -94,7 +119,10 @@ export function applyTaskLabelSuggestion(
   const title = shouldSeedTitle(task, input.replaceAutoTitle === true)
     ? titleFromSuggestion(titleText || goalText || "")
     : undefined;
-  const goal = (!task.goal || provisionalGoals.has(task.goal.trim())) && goalText
+  const goalWasOmitted = store
+    .listMemoriesForTask(taskId, 100)
+    .some((memory) => memory.tags.includes(omittedGoalTag));
+  const goal = !goalWasOmitted && (!task.goal || provisionalGoals.has(task.goal.trim())) && goalText
     ? goalText
     : undefined;
   if (!title && !goal && !input.status) return task;

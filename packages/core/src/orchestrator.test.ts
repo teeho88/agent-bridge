@@ -125,7 +125,8 @@ describe("orchestrator", () => {
   it("drives plan -> execute -> review -> accept through to reporting", () => {
     withStore((store) => {
       const logs = new Map<string, string>();
-      const deps = makeDeps(store, logs);
+      const prompts = new Map<string, string>();
+      const deps = makeDeps(store, logs, prompts);
       const leader = store.createRegisteredAgent({ name: "leader", provider: "codex", mode: "cli", command: "codex" });
       // The leader may only staff agents that are registered and enabled, so
       // the roster it plans against has to exist up front.
@@ -181,6 +182,10 @@ describe("orchestrator", () => {
       expect(step.orchestration.complexity).toBe("small");
       const subtask = store.listSubtasks({ parentTaskId: task.id })[0]!;
       expect(subtask.title).toBe("Implement the thing");
+      expect(subtask.goal).toContain("TASK\nImplement the thing");
+      expect(subtask.goal).toContain("GOAL\nComplete Implement the thing");
+      expect(subtask.goal).toContain("CONSTRAINTS\n-");
+      expect(subtask.goal).toContain("SUCCESS CRITERIA\n- tests pass");
 
       // executing: spawn the implementer
       step = stepOrchestration(store, orchestration.id, deps);
@@ -188,6 +193,7 @@ describe("orchestrator", () => {
       const implementRunId = step.spawnedRunIds[0]!;
       const implementerRun = store.getAgentRun(implementRunId)!;
       expect(implementerRun.phase).toBe("implement");
+      expect(prompts.get(implementRunId)).toContain(subtask.goal);
       const implementerAgent = store.getRegisteredAgent(implementerRun.agentId)!;
       expect(implementerAgent.provider).toBe("codex");
       expect(implementerAgent.model).toBe("gpt-5.6");
@@ -2186,7 +2192,9 @@ describe("orchestrator", () => {
       expect(secondAdjudicatePrompt).toContain("## Decision Log (previous cycles)");
       expect(secondAdjudicatePrompt).toContain("s1: rework");
       expect(secondAdjudicatePrompt).toContain("rework ordered: Fix the edge case");
-      expect(secondAdjudicatePrompt).toContain("rework goal: Handle an empty netlist");
+      expect(secondAdjudicatePrompt).toContain("rework goal: TASK\nFix the edge case");
+      expect(secondAdjudicatePrompt).toContain("GOAL\nHandle an empty netlist");
+      expect(secondAdjudicatePrompt).toContain("SUCCESS CRITERIA\n- edge case handled");
       expect(secondAdjudicatePrompt).toContain("Do not re-issue a rework you already ordered");
     });
   });

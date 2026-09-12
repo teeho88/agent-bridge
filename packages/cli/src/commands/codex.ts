@@ -103,9 +103,34 @@ export async function handleCodexHook(input: CodexHookInput, forcedEvent?: strin
     if (event === "SessionStart") {
       if (!terminalSessionId && !nativeSessionId) return undefined;
       if (terminalSessionId && nativeSessionId) {
+        const resumedTask = resolveRememberedCodexThread(store, cwd, nativeSessionId);
         const transition = syncTerminalNativeSession(terminalSessionId, nativeSessionId, cwd);
         if (transition === "changed") {
           const previousTaskId = resolveCodexSessionTask(store, cwd, sessionId);
+          if (resumedTask) {
+            if (previousTaskId && previousTaskId !== resumedTask.id) {
+              store.recordSessionEvent({
+                sessionId,
+                taskId: previousTaskId,
+                agent: "codex",
+                kind: "session_ended",
+                summary: "Codex switched away from this task with /resume.",
+              });
+            }
+            const task = store.updateTask(resumedTask.id, { status: "in_progress" }) ?? resumedTask;
+            startAgentSession(sessionId, task.id, cwd, "codex");
+            rememberSessionTask(nativeSessionId, task.id, cwd);
+            rememberSessionWindowHandle(sessionId, task.id, "codex", cwd);
+            store.recordSessionEvent({
+              sessionId,
+              taskId: task.id,
+              agent: "codex",
+              kind: "session_resumed",
+              summary: "Codex resumed this task's native thread.",
+            });
+            writeCurrentTaskArtifact(task, cwd);
+            return undefined;
+          }
           if (previousTaskId) {
             const source = firstTaskLabelSource(store, previousTaskId);
             if (source) {
@@ -127,6 +152,7 @@ export async function handleCodexHook(input: CodexHookInput, forcedEvent?: strin
           }
           const task = store.createTask({ title: placeholderTaskTitle("codex"), ownerAgent: "codex" });
           startAgentSession(sessionId, task.id, cwd, "codex");
+          rememberSessionTask(nativeSessionId, task.id, cwd);
           rememberSessionWindowHandle(sessionId, task.id, "codex", cwd);
           store.recordSessionEvent({
             sessionId,
@@ -142,6 +168,7 @@ export async function handleCodexHook(input: CodexHookInput, forcedEvent?: strin
       const needsTask = syncAgentSession(sessionId, cwd, "codex", store);
       const existingTaskId = resolveCodexSessionTask(store, cwd, sessionId);
       if (!needsTask && existingTaskId) {
+        if (nativeSessionId) rememberSessionTask(nativeSessionId, existingTaskId, cwd);
         rememberSessionWindowHandle(sessionId, existingTaskId, "codex", cwd);
         store.recordSessionEvent({ sessionId, taskId: existingTaskId, agent: "codex", kind: "session_resumed", summary: "Codex session resumed." });
         return undefined;
@@ -150,13 +177,22 @@ export async function handleCodexHook(input: CodexHookInput, forcedEvent?: strin
       // Codex has a chance to run the task-start command from AGENTS.md.
       const task = store.createTask({ title: placeholderTaskTitle("codex"), ownerAgent: "codex" });
       startAgentSession(sessionId, task.id, cwd, "codex");
+      if (nativeSessionId) rememberSessionTask(nativeSessionId, task.id, cwd);
       rememberSessionWindowHandle(sessionId, task.id, "codex", cwd);
       store.recordSessionEvent({ sessionId, taskId: task.id, agent: "codex", kind: "session_started", summary: "Codex session started." });
       writeCurrentTaskArtifact(task, cwd);
       return undefined;
     }
 
-    let taskId = resolveCodexSessionTask(store, cwd, sessionId) ?? resolveActiveTaskId(store, cwd, undefined, "codex");
+    let taskId = resolveCodexSessionTask(store, cwd, sessionId);
+    // A native thread without a remembered mapping is a new Codex session,
+    // even when SessionStart was missed. Falling back to the workspace's
+    // active task here attached manually launched Codex threads to unrelated
+    // work (including tasks owned by Claude). Only id-less legacy events may
+    // use that workspace fallback.
+    if (!taskId && !terminalSessionId && !nativeSessionId) {
+      taskId = resolveActiveTaskId(store, cwd, undefined, "codex");
+    }
 
     if (event === "UserPromptSubmit") {
       const prompt = (input.prompt || input.user_prompt || "").trim();
@@ -181,6 +217,9 @@ export async function handleCodexHook(input: CodexHookInput, forcedEvent?: strin
       if (prompt) rememberTaskLabelSource(store, taskId, redactIfEnabled(prompt, cwd), "codex");
       const task = store.updateTask(taskId, { status: "in_progress" });
       rememberSessionTask(sessionId, taskId, cwd);
+      if (nativeSessionId && nativeSessionId !== sessionId) {
+        rememberSessionTask(nativeSessionId, taskId, cwd);
+      }
       rememberSessionWindowHandle(sessionId, taskId, "codex", cwd);
       setCurrentTask(taskId, cwd, "codex");
       store.recordSessionEvent({ sessionId, taskId, agent: "codex", kind: "prompt_submitted", summary: "Codex received a prompt." });
@@ -224,6 +263,17 @@ function resolveCodexSessionTask(
   const taskId = readConfig(cwd).sessionTasks?.[sessionId];
   const task = taskId ? store.getTask(taskId) : undefined;
   return task && task.status !== "done" && task.status !== "cancelled" ? task.id : null;
+}
+
+function resolveRememberedCodexThread(
+  store: ReturnType<typeof openStore>,
+  cwd: string,
+  nativeSessionId: string,
+) {
+  const taskId = readConfig(cwd).sessionTasks?.[nativeSessionId];
+  const task = taskId ? store.getTask(taskId) : undefined;
+  // /clear marks the previous task done, but /resume is allowed to reopen it.
+  return task?.status === "cancelled" ? undefined : task;
 }
 
 function createRequestFromCodexNotification(

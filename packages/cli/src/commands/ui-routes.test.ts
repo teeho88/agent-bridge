@@ -12,6 +12,10 @@ import { openStore } from "../workspace.js";
 // in ui.test.ts cannot detect. Handlers report failure by throwing; the 500 is
 // produced by that wrapper, so an error case must be asserted through it.
 let root: string;
+// Default-agent presets live in a user-level file, so the routes get a fake
+// home instead of rewriting the developer's real ~/.agent-bridge roster.
+let presetHome: string;
+const previousPresetHome = process.env.AGENT_BRIDGE_HOME;
 
 function call(method: string, path: string, body?: unknown) {
   return callRoute(serveRequest, method, path, body);
@@ -19,10 +23,15 @@ function call(method: string, path: string, body?: unknown) {
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "agent-bridge-routes-"));
+  presetHome = mkdtempSync(join(tmpdir(), "agent-bridge-routes-home-"));
+  process.env.AGENT_BRIDGE_HOME = presetHome;
   prepareUiWorkspace(root);
 });
 
 afterEach(() => {
+  if (previousPresetHome === undefined) delete process.env.AGENT_BRIDGE_HOME;
+  else process.env.AGENT_BRIDGE_HOME = previousPresetHome;
+  rmSync(presetHome, { recursive: true, force: true });
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -230,6 +239,7 @@ const SWEEPABLE_ROUTES: Array<[string, string]> = [
   ["POST", "/api/orchestration/lane"],
   ["POST", "/api/orchestration/lease/acquire"],
   ["POST", "/api/orchestration/lease/release"],
+  ["POST", "/api/repo-memory/candidates/review"],
   ["POST", "/api/repo-memory/delete"],
   ["POST", "/api/repo-memory/update"],
   ["POST", "/api/request/clear"],

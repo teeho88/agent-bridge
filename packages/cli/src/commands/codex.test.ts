@@ -12,7 +12,20 @@ describe("Codex hooks", () => {
     try {
       const store = openStore(cwd);
       let taskId = "";
+      let oldTaskId = "";
       try {
+        const oldTask = store.createTask({
+          title: "Fix the work board card",
+          goal: "Fix the work board card without creating a duplicate",
+          ownerAgent: "claude",
+        });
+        oldTaskId = oldTask.id;
+        store.upsertTaskHandoff({
+          taskId: oldTask.id,
+          fromAgent: "claude",
+          summary: "Fix the work board card without creating a duplicate.",
+          next: ["Fix the work board card"],
+        });
         const task = store.createTask({ title: "Codex terminal", ownerAgent: "codex" });
         taskId = task.id;
         startAgentSession("codex-terminal-1", taskId, cwd, "codex");
@@ -32,8 +45,10 @@ describe("Codex hooks", () => {
 
       const result = openStore(cwd);
       try {
-        expect(result.listTasks(10)).toHaveLength(1);
+        expect(result.listTasks(10)).toHaveLength(2);
         expect(result.getTask(taskId)?.title).toBe("Fix the work board card");
+        expect(result.getTask(taskId)?.ownerAgent).toBe("codex");
+        expect(result.getTask(oldTaskId)?.ownerAgent).toBe("claude");
         expect(result.listSessionEvents({ taskId, limit: 10 }).some(
           (event) => event.kind === "prompt_submitted" && event.sessionId === "codex-terminal-1",
         )).toBe(true);
@@ -44,6 +59,41 @@ describe("Codex hooks", () => {
       else process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID = previous;
       rmSync(cwd, { recursive: true, force: true });
     }
+  });
+
+  it("starts a separate Codex task when UserPromptSubmit arrives before SessionStart", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-codex-missed-start-"));
+    try {
+      const seed = openStore(cwd);
+      let claudeTaskId = "";
+      try {
+        const task = seed.createTask({
+          title: "Existing shared work board task",
+          ownerAgent: "claude",
+        });
+        claudeTaskId = task.id;
+        startAgentSession("claude-session", task.id, cwd, "claude");
+      } finally { seed.close(); }
+
+      await handleCodexHook(
+        { cwd, thread_id: "codex-manual-thread", prompt: "Inspect the existing shared work board task" },
+        "UserPromptSubmit",
+      );
+      await handleCodexHook({ cwd, thread_id: "codex-manual-thread" }, "Stop");
+
+      const result = openStore(cwd);
+      try {
+        const tasks = result.listTasks(10);
+        expect(tasks).toHaveLength(2);
+        const codexTask = tasks.find((task) => task.id !== claudeTaskId);
+        expect(codexTask?.ownerAgent).toBe("codex");
+        expect(codexTask?.title).toBe("Inspect the existing shared work board task");
+        expect(result.listSessionEvents({ taskId: claudeTaskId, limit: 10 })).toHaveLength(0);
+        expect(result.listSessionEvents({ taskId: codexTask?.id, limit: 10 }).some(
+          (event) => event.sessionId === "codex-manual-thread" && event.agent === "codex",
+        )).toBe(true);
+      } finally { result.close(); }
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 
   it("keeps the Work Board terminal id but opens a new task after /clear", async () => {
@@ -87,6 +137,76 @@ describe("Codex hooks", () => {
           taskId: second?.id,
         }));
         expect(config.terminalNativeSessions?.[terminalSessionId]).toBe("thread-after-clear");
+      } finally { result.close(); }
+    } finally {
+      if (previous === undefined) delete process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID;
+      else process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID = previous;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("rebinds a Work Board terminal to the task selected with /resume", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-codex-resume-"));
+    const previous = process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID;
+    try {
+      const terminalSessionId = "codex-terminal-resume";
+      const seed = openStore(cwd);
+      let firstTaskId = "";
+      try {
+        const task = seed.createTask({ title: "Codex terminal", ownerAgent: "codex" });
+        firstTaskId = task.id;
+        startAgentSession(terminalSessionId, task.id, cwd, "codex");
+        rememberSessionWindowHandle(terminalSessionId, task.id, "codex", cwd, "67890");
+      } finally { seed.close(); }
+
+      process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID = terminalSessionId;
+      await handleCodexHook({ cwd, thread_id: "native-first" }, "SessionStart");
+      await handleCodexHook({ cwd, thread_id: "native-first", prompt: "Work on the first card" }, "UserPromptSubmit");
+      await handleCodexHook({ cwd, thread_id: "native-first" }, "Stop");
+
+      await handleCodexHook({ cwd, thread_id: "native-second" }, "SessionStart");
+      await handleCodexHook({ cwd, thread_id: "native-second", prompt: "Work on the second card" }, "UserPromptSubmit");
+      await handleCodexHook({ cwd, thread_id: "native-second" }, "Stop");
+
+      // Codex /resume selected the first native thread again.
+      await handleCodexHook({ cwd, thread_id: "native-first" }, "SessionStart");
+      await handleCodexHook({ cwd, thread_id: "native-first", prompt: "Continue after resume" }, "UserPromptSubmit");
+      await handleCodexHook({ cwd, thread_id: "native-first" }, "Stop");
+
+      const result = openStore(cwd);
+      try {
+        const tasks = result.listTasks(10);
+        expect(tasks).toHaveLength(2);
+        const second = tasks.find((task) => task.id !== firstTaskId);
+        expect(result.getTask(firstTaskId)).toMatchObject({
+          title: "Work on the first card",
+          status: "in_progress",
+          ownerAgent: "codex",
+        });
+        expect(second?.title).toBe("Work on the second card");
+        expect(result.listActiveSessionEvents()).toEqual([
+          expect.objectContaining({
+            sessionId: terminalSessionId,
+            taskId: firstTaskId,
+            agent: "codex",
+          }),
+        ]);
+        expect(result.listSessionEvents({ taskId: firstTaskId, limit: 20 }).some(
+          (event) => event.kind === "session_resumed" && (event.summary ?? "").includes("native thread"),
+        )).toBe(true);
+        const config = JSON.parse(readFileSync(join(cwd, ".agent-memory", "config.json"), "utf8")) as {
+          sessionTasks?: Record<string, string>;
+          sessionWindows?: Record<string, { hwnd?: string; taskId: string }>;
+          terminalNativeSessions?: Record<string, string>;
+        };
+        expect(config.sessionTasks?.[terminalSessionId]).toBe(firstTaskId);
+        expect(config.sessionTasks?.["native-first"]).toBe(firstTaskId);
+        expect(config.sessionTasks?.["native-second"]).toBe(second?.id);
+        expect(config.sessionWindows?.[terminalSessionId]).toEqual(expect.objectContaining({
+          hwnd: "67890",
+          taskId: firstTaskId,
+        }));
+        expect(config.terminalNativeSessions?.[terminalSessionId]).toBe("native-first");
       } finally { result.close(); }
     } finally {
       if (previous === undefined) delete process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID;

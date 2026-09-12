@@ -5,6 +5,75 @@ import { describe, expect, it } from "vitest";
 import { cleanupStaleAgentSessions, openStore, readConfig, startAgentSession } from "../workspace.js";
 import { CLAUDE_HOOK_VERSION, getClaudeHookStatus, handleClaudeHook, installClaudeHooks } from "./claude.js";
 
+describe("repository memory auto-capture", () => {
+  it("proposes a repo-wide instruction to the inbox instead of saving it", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-claude-capture-"));
+    try {
+      handleClaudeHook({ cwd, session_id: "capture-1", hook_event_name: "SessionStart" });
+      handleClaudeHook({
+        cwd,
+        session_id: "capture-1",
+        hook_event_name: "UserPromptSubmit",
+        prompt: "Never call the store directly from a route handler in this repository.",
+      });
+
+      const store = openStore(cwd);
+      try {
+        const candidates = store.listMemoryCandidates("pending", 20);
+        expect(candidates).toHaveLength(1);
+        expect(candidates[0]?.content).toContain("Never call the store directly");
+        expect(store.listRepoMemories(20)).toHaveLength(0);
+      } finally {
+        store.close();
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("saves straight to repository memory when the user asks for it", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-claude-capture-"));
+    try {
+      handleClaudeHook({ cwd, session_id: "capture-2", hook_event_name: "SessionStart" });
+      handleClaudeHook({
+        cwd,
+        session_id: "capture-2",
+        hook_event_name: "UserPromptSubmit",
+        prompt: "Remember this rule: never call the store directly from a route handler.",
+      });
+
+      const store = openStore(cwd);
+      try {
+        expect(store.listMemoryCandidates("pending", 20)).toHaveLength(0);
+        expect(store.listRepoMemories(20)).toHaveLength(1);
+      } finally {
+        store.close();
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not re-propose a line that is already saved or already pending", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-claude-capture-"));
+    try {
+      const prompt = "Never call the store directly from a route handler in this repository.";
+      handleClaudeHook({ cwd, session_id: "capture-3", hook_event_name: "SessionStart" });
+      handleClaudeHook({ cwd, session_id: "capture-3", hook_event_name: "UserPromptSubmit", prompt });
+      handleClaudeHook({ cwd, session_id: "capture-3", hook_event_name: "UserPromptSubmit", prompt });
+
+      const store = openStore(cwd);
+      try {
+        expect(store.listMemoryCandidates("pending", 20)).toHaveLength(1);
+      } finally {
+        store.close();
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("Claude session lifecycle", () => {
   it("updates the task pre-created by the Work Board terminal", () => {
     const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-claude-terminal-"));

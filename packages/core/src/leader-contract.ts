@@ -91,6 +91,44 @@ export type ParseLeaderAdjudicateResult =
   | { ok: true; turn: LeaderAdjudicateTurn }
   | { ok: false; error: string };
 
+const subtaskGoalHeadings = ["TASK", "GOAL", "CONSTRAINTS", "SUCCESS CRITERIA"] as const;
+
+export function ensureStructuredSubtaskGoal(
+  title: string,
+  goal: string | undefined,
+  acceptanceCriteria: string[],
+): string {
+  const normalized = goal?.replace(/\r\n/g, "\n").trim();
+  if (normalized && hasCompleteSubtaskGoalStructure(normalized)) return normalized;
+  const criteria = acceptanceCriteria.map((criterion) => criterion.trim()).filter(Boolean);
+  return [
+    "TASK",
+    title.trim(),
+    "",
+    "GOAL",
+    normalized || `Complete ${title.trim()} and leave its requested final state in place.`,
+    "",
+    "CONSTRAINTS",
+    "- Follow the parent task, user instructions, repository rules, dependency boundaries, and assigned scope.",
+    "",
+    "SUCCESS CRITERIA",
+    ...(criteria.length
+      ? criteria.map((criterion) => `- ${criterion}`)
+      : ["- The requested final state is present and has been objectively verified."]),
+  ].join("\n");
+}
+
+function hasCompleteSubtaskGoalStructure(goal: string): boolean {
+  const matches = [...goal.matchAll(/^(TASK|GOAL|CONSTRAINTS|SUCCESS CRITERIA)\s*$/gm)];
+  if (matches.length !== subtaskGoalHeadings.length) return false;
+  return matches.every((match, index) => {
+    if (match[1] !== subtaskGoalHeadings[index]) return false;
+    const contentStart = (match.index ?? 0) + match[0].length;
+    const contentEnd = matches[index + 1]?.index ?? goal.length;
+    return goal.slice(contentStart, contentEnd).trim().length > 0;
+  });
+}
+
 // Walks the text from the first `{` at or after `from` and returns the
 // complete, brace-balanced object literal. String contents (and escapes
 // inside them) are skipped, so a nested ```js sample or a stray brace inside
@@ -281,13 +319,18 @@ function validateSubtask(raw: unknown, index: number): LeaderPlanSubtask | strin
   if (typeof obj.title !== "string" || !obj.title) return `subtasks[${index}].title must be a non-empty string.`;
   const agentPreference = validateAgentPreference(obj.agentPreference);
   if (typeof agentPreference === "string") return `subtasks[${index}].${agentPreference}`;
+  const acceptanceCriteria = asStringArray(obj.acceptanceCriteria) ?? [];
   return {
     key: obj.key,
     title: obj.title,
-    goal: typeof obj.goal === "string" ? obj.goal : undefined,
+    goal: ensureStructuredSubtaskGoal(
+      obj.title,
+      typeof obj.goal === "string" ? obj.goal : undefined,
+      acceptanceCriteria,
+    ),
     priority: typeof obj.priority === "number" ? obj.priority : undefined,
     dependsOn: asStringArray(obj.dependsOn) ?? [],
-    acceptanceCriteria: asStringArray(obj.acceptanceCriteria) ?? [],
+    acceptanceCriteria,
     role: typeof obj.role === "string" ? obj.role : undefined,
     parallelSafe: typeof obj.parallelSafe === "boolean" ? obj.parallelSafe : undefined,
     files: asStringArray(obj.files) ?? [],
@@ -375,13 +418,18 @@ function validateDecision(raw: unknown, index: number): LeaderAdjudicateDecision
   }
   const agentPreference = validateAgentPreference(reworkObj.agentPreference);
   if (typeof agentPreference === "string") return `decisions[${index}].rework.${agentPreference}`;
+  const acceptanceCriteria = asStringArray(reworkObj.acceptanceCriteria) ?? [];
   return {
     subtaskKey: obj.subtaskKey,
     verdict,
     rework: {
       title: reworkObj.title,
-      goal: typeof reworkObj.goal === "string" ? reworkObj.goal : undefined,
-      acceptanceCriteria: asStringArray(reworkObj.acceptanceCriteria) ?? [],
+      goal: ensureStructuredSubtaskGoal(
+        reworkObj.title,
+        typeof reworkObj.goal === "string" ? reworkObj.goal : undefined,
+        acceptanceCriteria,
+      ),
+      acceptanceCriteria,
       agentPreference,
     },
   };

@@ -119,6 +119,11 @@ describe("renderPlanPrompt", () => {
     expect(prompt).toContain("# Leader Planning Turn");
     expect(prompt).not.toContain("Change Request");
     expect(prompt).toContain('`complexity` must be exactly one of: "small", "medium", "large"');
+    expect(prompt).toContain("Every subtask `goal` MUST be a complete four-section contract");
+    expect(prompt).toContain("TASK\\nAdd persistent agent-run records");
+    expect(prompt).toContain("GOAL\\nLive agent processes are stored and queryable");
+    expect(prompt).toContain("CONSTRAINTS\\n- Keep the migration compatible");
+    expect(prompt).toContain("SUCCESS CRITERIA\\n- migration applies");
   });
 
   it("renders a change request with what already exists", () => {

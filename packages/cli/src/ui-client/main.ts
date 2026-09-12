@@ -2791,8 +2791,9 @@ document.addEventListener('click', async event => {
   if (candidateButton) {
     candidateButton.disabled = true;
     try {
-      await api('/api/repo-memory/candidates/' + encodeURIComponent(candidateButton.dataset.candidateId || '') + '/review', {
-        method: 'POST', body: JSON.stringify({ action: candidateButton.dataset.action })
+      await api('/api/repo-memory/candidates/review', {
+        method: 'POST',
+        body: JSON.stringify({ id: candidateButton.dataset.candidateId || '', action: candidateButton.dataset.action })
       });
       await load(true);
     } finally {

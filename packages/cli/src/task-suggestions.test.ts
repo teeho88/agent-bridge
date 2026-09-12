@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { openStore } from "./workspace.js";
 import {
   applyTaskLabelSuggestion,
+  markTaskGoalOmitted,
   placeholderTaskTitle,
   rememberTaskLabelSource,
   firstTaskLabelSource,
@@ -87,6 +88,33 @@ describe("task label suggestions", () => {
         rememberTaskLabelSource(store, task.id, "Second prompt", "codex");
 
         expect(firstTaskLabelSource(store, task.id)).toBe("First prompt");
+      } finally {
+        store.close();
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an intentionally omitted goal empty when delayed prompt seeding runs", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agent-bridge-task-suggestion-"));
+    try {
+      const store = openStore(cwd);
+      try {
+        const task = store.createTask({
+          title: "Explain cache invalidation",
+          goal: "Interactive Codex CLI opened from Work Board.",
+          ownerAgent: "codex",
+        });
+        markTaskGoalOmitted(store, task.id, "codex");
+
+        const seeded = applyTaskLabelSuggestion(store, task.id, {
+          titleText: "Explain how cache invalidation works",
+          goalText: "Explain how cache invalidation works",
+        });
+
+        expect(seeded?.title).toBe("Explain cache invalidation");
+        expect(seeded?.goal).toBeUndefined();
       } finally {
         store.close();
       }

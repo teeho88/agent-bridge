@@ -17,7 +17,7 @@ import {
   syncCurrentTaskArtifact,
   writeCurrentTaskArtifact
 } from "../workspace.js";
-import { placeholderTaskTitle } from "../task-suggestions.js";
+import { markTaskGoalOmitted, placeholderTaskTitle } from "../task-suggestions.js";
 
 export function registerTask(program: Command): void {
   const task = program.command("task").description("Manage task state");
@@ -65,21 +65,35 @@ export function registerTask(program: Command): void {
     .option("--task <taskId>", "task id (defaults to the active task)")
     .option("--title <title>", "new task title")
     .option("--goal <goal>", "new task goal")
+    .option("--clear-goal", "keep the task goal empty and prevent prompt-based goal seeding")
     .option("--status <status>", "todo | in_progress | blocked | done | cancelled")
     .option("--agent <agent>", "owner/current agent")
     .action(
-      (options: { task?: string; title?: string; goal?: string; status?: TaskStatus; agent?: AgentKind }) => {
+      (options: { task?: string; title?: string; goal?: string; clearGoal?: boolean; status?: TaskStatus; agent?: AgentKind }) => {
         const store = openStore();
         try {
           const explicitTask = Boolean(options.task);
           const taskId = options.task ?? getActiveTaskId(store, undefined, undefined, options.agent);
+          const current = store.getTask(taskId);
+          if (!current) throw new Error(`Task not found: ${taskId}`);
+          if (options.clearGoal && options.goal !== undefined) {
+            throw new Error("Use either --goal or --clear-goal, not both.");
+          }
+          const nextTitle = (options.title ?? current.title).trim();
+          const nextGoal = options.clearGoal ? "" : (options.goal ?? current.goal)?.trim();
+          if ((options.title !== undefined || options.goal !== undefined) && nextGoal && nextTitle === nextGoal) {
+            throw new Error("Task title must be a shorter descriptive name distinct from its goal.");
+          }
           const status = options.status ? parseTaskStatus(options.status) : undefined;
-          const updated = store.updateTask(taskId, {
+          let updated = store.updateTask(taskId, {
             title: options.title,
-            goal: options.goal,
+            goal: options.clearGoal ? "" : options.goal,
             status,
             ownerAgent: options.agent
           });
+          if (options.clearGoal) {
+            updated = markTaskGoalOmitted(store, taskId, options.agent ?? updated?.ownerAgent ?? "codex");
+          }
           if (!updated) throw new Error(`Task not found: ${taskId}`);
           const isCurrent = resolveCurrentTaskId(undefined, undefined, options.agent) === updated.id;
           if (!explicitTask || isCurrent) {

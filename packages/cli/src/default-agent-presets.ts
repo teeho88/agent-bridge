@@ -1,4 +1,11 @@
 import type { AgentProvider, AgentRunMode, MemoryStore, RegisteredAgent } from "@agent-bridge/memory";
+import {
+  deleteGlobalDefaultAgent,
+  readGlobalDefaultAgents,
+  unhideGlobalDefaultAgents,
+  updateGlobalDefaultAgent,
+  type GlobalDefaultAgentRecord,
+} from "./global-default-agents.js";
 
 export type DefaultAgentPreset = {
   key: string;
@@ -119,8 +126,65 @@ export const DEFAULT_AGENT_PRESETS: DefaultAgentPreset[] = [
   },
 ];
 
-// Hidden rows are included so a deleted built-in can be filtered out of the
-// table below — the row is the only record that the user removed it.
+// The effective roster: the compiled-in built-ins as edited by the user in
+// ~/.agent-bridge/default-agents.json, plus any custom agents they added there.
+// The file is global on purpose - editing a default agent in one repository
+// must change it in every other repository too.
+type EffectivePreset = DefaultAgentPreset & {
+  selected: boolean;
+  hidden: boolean;
+  custom: boolean;
+};
+
+function applyRecord(
+  preset: DefaultAgentPreset,
+  record: GlobalDefaultAgentRecord | undefined,
+): EffectivePreset {
+  return {
+    ...preset,
+    label: record?.label ?? preset.label,
+    name: record?.name ?? preset.name,
+    description: record?.description ?? preset.description,
+    provider: record?.provider ?? preset.provider,
+    mode: record?.mode ?? preset.mode,
+    command: record?.command ?? preset.command,
+    model: record?.model ?? preset.model,
+    reasoningEffort: record?.reasoningEffort ?? preset.reasoningEffort,
+    capabilities: record?.capabilities ?? preset.capabilities,
+    selected: record?.selected ?? true,
+    hidden: record?.hidden ?? false,
+    custom: false,
+  };
+}
+
+function customPreset(key: string, record: GlobalDefaultAgentRecord): EffectivePreset {
+  const label = record.label ?? record.name ?? key.slice(CUSTOM_PRESET_PREFIX.length);
+  return {
+    key,
+    label,
+    name: record.name ?? label,
+    description: record.description ?? "",
+    provider: record.provider ?? "codex",
+    mode: record.mode ?? "cli",
+    command: record.command ?? "",
+    model: record.model ?? "",
+    reasoningEffort: record.reasoningEffort,
+    capabilities: record.capabilities ?? [],
+    selected: record.selected ?? true,
+    hidden: record.hidden ?? false,
+    custom: true,
+  };
+}
+
+export function listEffectiveDefaultAgentPresets(): EffectivePreset[] {
+  const { presets } = readGlobalDefaultAgents();
+  const builtIn = DEFAULT_AGENT_PRESETS.map((preset) => applyRecord(preset, presets[preset.key]));
+  const custom = Object.entries(presets)
+    .filter(([key]) => key.startsWith(CUSTOM_PRESET_PREFIX))
+    .map(([key, record]) => customPreset(key, record));
+  return [...builtIn, ...custom];
+}
+
 function listPresetAgents(store: MemoryStore): RegisteredAgent[] {
   return store.listRegisteredAgents({
     includeUnselectedPresets: true,
@@ -129,56 +193,47 @@ function listPresetAgents(store: MemoryStore): RegisteredAgent[] {
   });
 }
 
-function toState(preset: DefaultAgentPreset, agent: RegisteredAgent, custom: boolean): DefaultAgentPresetState {
-  return {
-    ...preset,
-    name: agent.name,
-    description: agent.description ?? preset.description,
-    provider: agent.provider,
-    mode: agent.mode,
-    command: agent.command ?? preset.command,
-    model: agent.model ?? preset.model,
-    reasoningEffort: agent.reasoningEffort,
-    capabilities: agent.capabilities,
-    selected: agent.presetSelected ?? true,
-    custom,
-    agentId: agent.id,
-  };
+function toState(preset: EffectivePreset, agent: RegisteredAgent | undefined): DefaultAgentPresetState {
+  const { hidden: _hidden, ...rest } = preset;
+  return { ...rest, agentId: agent?.id };
 }
 
-// The table is the built-in roster minus rows the user deleted, plus any custom
-// rows they added. A custom preset has no compiled-in definition, so its agent
-// row is the only source of truth for it.
+// The table is the effective global roster minus the presets the user deleted.
+// The repository store only contributes the agent id of each materialized row.
 export function listDefaultAgentPresetStates(store: MemoryStore): DefaultAgentPresetState[] {
   const agents = listPresetAgents(store);
-  const builtIn = DEFAULT_AGENT_PRESETS.filter(
-    (preset) =>
-      !agents.some((agent) => agent.presetKey === preset.key && agent.presetHidden),
-  ).map((preset) => {
-    const agent = agents.find((candidate) => candidate.presetKey === preset.key);
-    return agent ? toState(preset, agent, false) : { ...preset, selected: false, custom: false };
+  return listEffectiveDefaultAgentPresets()
+    .filter((preset) => !preset.hidden)
+    .map((preset) => toState(preset, agents.find((agent) => agent.presetKey === preset.key)));
+}
+
+// Materializes one effective preset as a repository agent row so runs have an
+// agent id to reference, and keeps an existing row in step with the global
+// definition.
+function syncPresetAgent(
+  store: MemoryStore,
+  preset: EffectivePreset,
+  agents: RegisteredAgent[],
+): RegisteredAgent | undefined {
+  const existing = agents.find((candidate) => candidate.presetKey === preset.key);
+  const fields = {
+    description: preset.description,
+    provider: preset.provider,
+    mode: preset.mode,
+    command: preset.command,
+    model: preset.model,
+    reasoningEffort: preset.reasoningEffort ?? "",
+    capabilities: preset.capabilities,
+    presetSelected: preset.selected,
+    presetHidden: preset.hidden,
+  };
+  if (existing) return store.updateRegisteredAgent(existing.id, { ...fields, name: preset.name });
+  if (!preset.selected) return undefined;
+  return store.createRegisteredAgent({
+    ...fields,
+    name: uniqueName(agents, preset.name),
+    presetKey: preset.key,
   });
-  const custom = agents
-    .filter((agent) => agent.presetKey?.startsWith(CUSTOM_PRESET_PREFIX) && !agent.presetHidden)
-    .map((agent) =>
-      toState(
-        {
-          key: agent.presetKey as string,
-          label: agent.name,
-          name: agent.name,
-          description: agent.description ?? "",
-          provider: agent.provider,
-          mode: agent.mode,
-          command: agent.command ?? "",
-          model: agent.model ?? "",
-          reasoningEffort: agent.reasoningEffort,
-          capabilities: agent.capabilities,
-        },
-        agent,
-        true,
-      ),
-    );
-  return [...builtIn, ...custom];
 }
 
 export function addCustomDefaultAgentPreset(
@@ -187,90 +242,64 @@ export function addCustomDefaultAgentPreset(
 ): RegisteredAgent {
   const label = input.label.trim();
   if (!label) throw new Error("Agent label is required.");
-  const agents = store.listRegisteredAgents({
-    includeUnselectedPresets: true,
-    includeHiddenPresets: true,
-    limit: 500,
-  });
-  const presetKey = uniquePresetKey(agents, label);
-  return store.createRegisteredAgent({
-    name: uniqueName(agents, label),
-    description: input.description,
+  const presetKey = uniquePresetKey(listEffectiveDefaultAgentPresets(), label);
+  updateGlobalDefaultAgent(presetKey, {
+    label,
+    name: label,
+    description: input.description ?? "",
     provider: input.provider,
     mode: input.mode,
-    command: input.command,
-    model: input.model,
+    command: input.command ?? "",
+    model: input.model ?? "",
     reasoningEffort: input.reasoningEffort,
     capabilities: input.capabilities ?? [],
-    presetKey,
-    presetSelected: true,
+    selected: true,
+    hidden: false,
+    custom: true,
   });
+  const preset = listEffectiveDefaultAgentPresets().find((candidate) => candidate.key === presetKey);
+  const agent = preset ? syncPresetAgent(store, preset, listPresetAgents(store)) : undefined;
+  if (!agent) throw new Error(`Failed to create default agent preset: ${presetKey}`);
+  return agent;
 }
 
-// Deleting a custom preset removes it outright; a built-in one is only marked
-// hidden, because ensureDefaultAgentPresetStates would otherwise re-seed it on
-// the next dashboard load.
+// Deleting a custom preset removes it from the global file outright; a built-in
+// one is only marked hidden there, because ensureDefaultAgentPresetStates would
+// otherwise re-seed it on the next dashboard load.
 export function removeDefaultAgentPreset(store: MemoryStore, presetKey: string): boolean {
-  const agents = store.listRegisteredAgents({
-    includeUnselectedPresets: true,
-    includeHiddenPresets: true,
-    limit: 500,
-  });
-  const existing = agents.find((candidate) => candidate.presetKey === presetKey);
+  const existing = listPresetAgents(store).find((candidate) => candidate.presetKey === presetKey);
   if (presetKey.startsWith(CUSTOM_PRESET_PREFIX)) {
-    if (!existing) return false;
-    return store.deleteRegisteredAgent(existing.id);
+    const removed = deleteGlobalDefaultAgent(presetKey);
+    if (existing) store.deleteRegisteredAgent(existing.id);
+    return removed || Boolean(existing);
   }
   const preset = DEFAULT_AGENT_PRESETS.find((candidate) => candidate.key === presetKey);
   if (!preset) throw new Error(`Unknown default agent preset: ${presetKey}`);
-  if (existing) {
-    store.updateRegisteredAgent(existing.id, { presetSelected: false, presetHidden: true });
-    return true;
-  }
-  store.createRegisteredAgent({
-    name: uniqueName(agents, preset.name),
-    description: preset.description,
-    provider: preset.provider,
-    mode: preset.mode,
-    command: preset.command,
-    model: preset.model,
-    reasoningEffort: preset.reasoningEffort,
-    capabilities: preset.capabilities,
-    presetKey: preset.key,
-    presetSelected: false,
-    presetHidden: true,
-  });
+  updateGlobalDefaultAgent(presetKey, { hidden: true, selected: false });
+  if (existing) store.updateRegisteredAgent(existing.id, { presetSelected: false, presetHidden: true });
   return true;
 }
 
-// Brings deleted built-in rows back into the table, unselected, so the user can
-// re-add one without losing the edits stored on its row.
+// Brings deleted built-in presets back into the table, unselected, so the user
+// can re-add one without losing the edits stored globally.
 export function restoreBuiltInDefaultAgentPresets(store: MemoryStore): DefaultAgentPresetState[] {
-  const agents = store.listRegisteredAgents({
-    includeUnselectedPresets: true,
-    includeHiddenPresets: true,
-    limit: 500,
-  });
-  for (const agent of agents) {
-    if (!agent.presetHidden) continue;
-    if (!agent.presetKey || agent.presetKey.startsWith(CUSTOM_PRESET_PREFIX)) continue;
-    store.updateRegisteredAgent(agent.id, { presetHidden: false, presetSelected: false });
+  unhideGlobalDefaultAgents(DEFAULT_AGENT_PRESETS.map((preset) => preset.key));
+  const agents = listPresetAgents(store);
+  for (const preset of listEffectiveDefaultAgentPresets()) {
+    if (preset.custom) continue;
+    if (agents.some((agent) => agent.presetKey === preset.key)) syncPresetAgent(store, preset, agents);
   }
   return listDefaultAgentPresetStates(store);
 }
 
-// A new workspace starts with the complete recommended roster. Once a preset
-// row exists its selected flag is authoritative, so a user's later uncheck is
-// never overwritten by subsequent dashboard loads.
+// A new workspace starts with the user's global roster - the complete
+// recommended set until they edit it. Selection lives in the global file, so a
+// user's earlier uncheck is never overwritten by a dashboard load in any repo.
 export function ensureDefaultAgentPresetStates(store: MemoryStore): DefaultAgentPresetState[] {
-  const existingKeys = new Set(
-    store
-      .listRegisteredAgents({ includeUnselectedPresets: true, includeHiddenPresets: true, limit: 500 })
-      .map((agent) => agent.presetKey)
-      .filter((key): key is string => Boolean(key)),
-  );
-  for (const preset of DEFAULT_AGENT_PRESETS) {
-    if (!existingKeys.has(preset.key)) setDefaultAgentPresetSelection(store, preset.key, true);
+  const agents = listPresetAgents(store);
+  for (const preset of listEffectiveDefaultAgentPresets()) {
+    if (preset.hidden && !agents.some((agent) => agent.presetKey === preset.key)) continue;
+    syncPresetAgent(store, preset, agents);
   }
   return listDefaultAgentPresetStates(store);
 }
@@ -280,40 +309,34 @@ export function setDefaultAgentPresetSelection(
   presetKey: string,
   selected: boolean,
 ): RegisteredAgent | undefined {
-  const agents = listPresetAgents(store);
-  const existing = agents.find((candidate) => candidate.presetKey === presetKey);
-  // A custom preset only exists as its agent row, so there is nothing to
-  // recreate from a compiled-in definition once the row is gone.
-  if (presetKey.startsWith(CUSTOM_PRESET_PREFIX)) {
-    if (!existing) throw new Error(`Unknown default agent preset: ${presetKey}`);
-    return store.updateRegisteredAgent(existing.id, { presetSelected: selected });
-  }
-  const preset = DEFAULT_AGENT_PRESETS.find((candidate) => candidate.key === presetKey);
-  if (!preset) throw new Error(`Unknown default agent preset: ${presetKey}`);
+  const known = listEffectiveDefaultAgentPresets().some((candidate) => candidate.key === presetKey);
+  if (!known) throw new Error(`Unknown default agent preset: ${presetKey}`);
   // Selecting a preset also brings it back into the table if it was deleted.
-  if (existing)
-    return store.updateRegisteredAgent(existing.id, {
-      presetSelected: selected,
-      presetHidden: selected ? false : existing.presetHidden,
-    });
-  if (!selected) return undefined;
-  return store.createRegisteredAgent({
-    name: uniqueName(agents, preset.name),
-    description: preset.description,
-    provider: preset.provider,
-    mode: preset.mode,
-    command: preset.command,
-    model: preset.model,
-    reasoningEffort: preset.reasoningEffort,
-    capabilities: preset.capabilities,
-    presetKey: preset.key,
-    presetSelected: true,
+  updateGlobalDefaultAgent(presetKey, selected ? { selected: true, hidden: false } : { selected: false });
+  const preset = listEffectiveDefaultAgentPresets().find((candidate) => candidate.key === presetKey);
+  if (!preset) return undefined;
+  return syncPresetAgent(store, preset, listPresetAgents(store));
+}
+
+// An edit to a materialized agent row is an edit to the default agent itself,
+// so it has to land in the global file as well or it would stay in this repo.
+export function syncDefaultAgentPresetFromAgent(agent: RegisteredAgent): void {
+  if (!agent.presetKey) return;
+  updateGlobalDefaultAgent(agent.presetKey, {
+    name: agent.name,
+    description: agent.description,
+    provider: agent.provider,
+    mode: agent.mode,
+    command: agent.command,
+    model: agent.model,
+    reasoningEffort: agent.reasoningEffort ?? "",
+    capabilities: agent.capabilities,
   });
 }
 
-function uniquePresetKey(agents: RegisteredAgent[], label: string): string {
+function uniquePresetKey(presets: EffectivePreset[], label: string): string {
   const slug = label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "agent";
-  const keys = new Set(agents.map((agent) => agent.presetKey).filter(Boolean));
+  const keys = new Set(presets.map((preset) => preset.key));
   const base = `${CUSTOM_PRESET_PREFIX}${slug}`;
   if (!keys.has(base)) return base;
   for (let suffix = 2; suffix < 1000; suffix += 1) {

@@ -23,7 +23,7 @@ describe("writeHandoffArtifacts", () => {
     const task: Task = {
       id: "task-1",
       title: "Improve handoff",
-      goal: "Make handoffs portable across agents.",
+      goal: "Make handoffs portable across agents while preserving the complete runtime objective without truncating any acceptance condition or completion detail.",
       status: "in_progress",
       createdAt: handoff.createdAt,
       updatedAt: handoff.createdAt
@@ -34,6 +34,10 @@ describe("writeHandoffArtifacts", () => {
 
       const current = readFileSync(join(root, ".handoff", "CURRENT.md"), "utf8");
       expect(current).toContain("# Handoff — Improve handoff");
+      expect(current).toContain(
+        "## Goal\nMake handoffs portable across agents while preserving the complete runtime objective without truncating any acceptance condition or completion detail.",
+      );
+      expect(current).not.toContain("# Handoff — Make handoffs portable across agents");
       expect(current).toContain("From: codex");
       expect(current).not.toContain("To:");
       expect(current).toContain("1. **P0** Run the focused tests");

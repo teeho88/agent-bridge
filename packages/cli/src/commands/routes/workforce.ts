@@ -5,6 +5,7 @@ import {
   removeDefaultAgentPreset,
   restoreBuiltInDefaultAgentPresets,
   setDefaultAgentPresetSelection,
+  syncDefaultAgentPresetFromAgent,
 } from "../../default-agent-presets.js";
 import {
   loadRuntimeProviderCatalogs,
@@ -219,6 +220,9 @@ export async function routePostWorkforceAgentUpdate(ctx: RouteContext): Promise<
       credentialRef: optionalString(body.credentialRef),
       capabilities: body.capabilities !== undefined ? parseItems(body.capabilities) : undefined,
     });
+    // Default agents are user-level, so an edit here must persist globally
+    // rather than only in this repository's store.
+    if (updated) syncDefaultAgentPresetFromAgent(updated);
     sendJson(res, 200, { agent: updated });
   } finally {
     store.close();

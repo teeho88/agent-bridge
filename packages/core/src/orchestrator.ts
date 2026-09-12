@@ -22,6 +22,7 @@ import {
 } from "./context-store.js";
 import {
   buildRetryPrompt,
+  ensureStructuredSubtaskGoal,
   parseLeaderTurn,
   type LeaderAgentPreference,
   type LeaderAdjudicateTurn,
@@ -2405,12 +2406,9 @@ function renderImplementerPrompt(
   rework?: ReworkContext,
   context?: ImplementerContextPaths,
 ): string {
-  const lines = [`Subtask: ${subtask.title}`];
-  if (subtask.goal) lines.push(`Goal: ${subtask.goal}`);
-  if (subtask.acceptanceCriteria.length) {
-    lines.push("Acceptance criteria:");
-    for (const criterion of subtask.acceptanceCriteria) lines.push(`- ${criterion}`);
-  }
+  const lines = [
+    ensureStructuredSubtaskGoal(subtask.title, subtask.goal, subtask.acceptanceCriteria),
+  ];
   if (files.length) {
     lines.push("Likely files:");
     for (const file of files) lines.push(`- ${file}`);

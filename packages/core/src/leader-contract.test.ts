@@ -60,7 +60,23 @@ describe("parseLeaderTurn (plan)", () => {
       expect(result.turn.complexity).toBe("medium");
       expect(result.turn.subtasks).toHaveLength(1);
       expect(result.turn.subtasks[0]?.agentPreference?.model).toBe("gpt-5.6");
+      expect(result.turn.subtasks[0]?.goal).toBe(
+        "TASK\nImplement the thing\n\nGOAL\nComplete Implement the thing and leave its requested final state in place.\n\nCONSTRAINTS\n- Follow the parent task, user instructions, repository rules, dependency boundaries, and assigned scope.\n\nSUCCESS CRITERIA\n- tests pass",
+      );
       expect(result.turn.reviewers[0]?.scope).toEqual(["s1"]);
+    }
+  });
+
+  it("preserves a complete leader-authored subtask goal contract", () => {
+    const contract = "TASK\nImplement cache eviction\n\nGOAL\nExpired entries are evicted deterministically.\n\nCONSTRAINTS\n- Preserve the public API.\n\nSUCCESS CRITERIA\n- Eviction tests pass.";
+    const result = parseLeaderTurn(fenced({
+      ...validPlan,
+      subtasks: [{ ...validPlan.subtasks[0], goal: contract }],
+    }), "plan");
+
+    expect(result.ok).toBe(true);
+    if (result.ok && result.turn.phase === "plan") {
+      expect(result.turn.subtasks[0]?.goal).toBe(contract);
     }
   });
 

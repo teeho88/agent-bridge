@@ -165,7 +165,7 @@ describe("initializeWorkspace", () => {
     }
   });
 
-  it("captures explicitly repo-wide Claude instructions as shared memory", () => {
+  it("proposes repo-wide Claude instructions to the review inbox", () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-bridge-repo-memory-"));
     try {
       handleClaudeHook({
@@ -177,10 +177,36 @@ describe("initializeWorkspace", () => {
 
       const store = openStore(dir);
       try {
+        const candidates = store.listMemoryCandidates("pending");
+        expect(candidates).toHaveLength(1);
+        expect(candidates[0]?.content).toContain("never edit generated SDK files");
+        expect(candidates[0]?.tags).toContain("auto-captured");
+        expect(store.listRepoMemories()).toHaveLength(0);
+      } finally {
+        store.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("captures a repo-wide instruction as shared memory when asked to remember it", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-bridge-repo-memory-"));
+    try {
+      handleClaudeHook({
+        cwd: dir,
+        hook_event_name: "UserPromptSubmit",
+        session_id: "repo-memory-session",
+        prompt: "Remember: never edit generated SDK files by hand in this repository.",
+      });
+
+      const store = openStore(dir);
+      try {
         const repoMemory = store.listRepoMemories();
         expect(repoMemory).toHaveLength(1);
         expect(repoMemory[0]?.content).toContain("never edit generated SDK files");
         expect(repoMemory[0]?.tags).toContain("auto-captured");
+        expect(store.listMemoryCandidates("pending")).toHaveLength(0);
       } finally {
         store.close();
       }

@@ -54,6 +54,7 @@ import {
   routePostGraphBriefAutoAll,
   routePostGraphBuild,
   routePostMemoryAdd,
+  routePostRepoMemoryCandidateReview,
   routePostRepoMemoryDelete,
   routePostRepoMemoryUpdate,
 } from "./routes/knowledge.js";
@@ -443,6 +444,7 @@ const ROUTES: RouteTable = {
   "POST /api/memory/add": routePostMemoryAdd,
   "POST /api/repo-memory/update": routePostRepoMemoryUpdate,
   "POST /api/repo-memory/delete": routePostRepoMemoryDelete,
+  "POST /api/repo-memory/candidates/review": routePostRepoMemoryCandidateReview,
   "GET /api/memory/search": routeGetMemorySearch,
   "GET /api/skills/github/search": routeGetSkillsGithubSearch,
   "POST /api/skills/github/install": routePostSkillsGithubInstall,

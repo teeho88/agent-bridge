@@ -182,6 +182,9 @@ export function renderPlanPrompt(input: {
         ]
       : []),
     "- Break this task into subtasks with clear dependencies and acceptance criteria.",
+    "- Every subtask `goal` MUST be a complete four-section contract in this exact order: TASK, GOAL, CONSTRAINTS, SUCCESS CRITERIA. Fill every section with concrete subtask-specific content.",
+    "- TASK says what this subagent owns. GOAL describes its final state. CONSTRAINTS carries every applicable user, repository, dependency, file-scope, and do-not-touch rule. SUCCESS CRITERIA lists objective completion checks.",
+    "- Keep the subtask `title` short and descriptive; it must not equal the goal contract. Copy the SUCCESS CRITERIA checks into `acceptanceCriteria` too so the orchestrator can evaluate them.",
     "- Pick how many implementers and reviewers this needs based on complexity — do not over- or under-split.",
     "- For each subtask, list which files it will likely touch; do not schedule two subtasks that touch the same files as parallelSafe.",
     "- Propose an agent preference (provider/model/reasoning) for each subtask and reviewer group; explain why in `reason`.",
@@ -218,7 +221,7 @@ export function renderPlanPrompt(input: {
           {
             key: "s1",
             title: "Add agent_runs schema",
-            goal: "Track live agent processes",
+            goal: "TASK\nAdd persistent agent-run records.\n\nGOAL\nLive agent processes are stored and queryable through the memory package.\n\nCONSTRAINTS\n- Keep the migration compatible with existing databases.\n- Limit changes to the memory package.\n\nSUCCESS CRITERIA\n- migration applies\n- CRUD roundtrip test passes",
             priority: 5,
             dependsOn: [],
             acceptanceCriteria: ["migration applies", "CRUD roundtrip test passes"],
@@ -601,7 +604,7 @@ export function renderAdjudicatePrompt(input: {
         ]
       : []),
     "- For each subtask with a pending review, decide accept, rework, or block.",
-    "- Use rework when the acceptance criteria are not fully met yet; give the rework subtask a tight, specific goal so the next implementer doesn't redo finished work.",
+    "- Use rework when the acceptance criteria are not fully met yet; give the replacement a complete TASK / GOAL / CONSTRAINTS / SUCCESS CRITERIA contract so the next implementer knows its exact scope and finish line.",
     ...(contextual.length
       ? [
           `- Write the decision file for every subtask you decide. A decision whose file is missing or has an empty \`## Summary\` is rejected and the turn is retried.`,
@@ -611,7 +614,7 @@ export function renderAdjudicatePrompt(input: {
     // The rework goal is not the implementer's whole brief — the reviewer's
     // findings are replayed to it verbatim. Telling the leader that stops it
     // trying to restate a review it can simply point at.
-    "- A rework goal must name the specific defect to fix, not restate the subtask. The reviewer's findings are passed to the implementer verbatim, so point at them rather than re-summarising them.",
+    "- A rework goal contract must name the specific defect to fix, preserve every applicable constraint, and give objective success checks. The reviewer's findings are passed to the implementer verbatim, so point at them rather than re-summarising them.",
     ...(repeated.length
       ? [
           `- ${repeated.map((review) => review.subtaskKey).join(", ")} carries earlier reviews above. Compare them to the current one before deciding: if the same defect is still being reported, the previous rework instruction failed and repeating it will fail again.`,
@@ -659,7 +662,7 @@ export function renderAdjudicatePrompt(input: {
             verdict: "rework",
             rework: {
               title: "Fix migration ordering",
-              goal: "Add the missing index and re-run the roundtrip test",
+              goal: "TASK\nFix migration ordering.\n\nGOAL\nThe agent-runs index exists before any query depends on it.\n\nCONSTRAINTS\n- Preserve the accepted schema behavior from the earlier attempt.\n- Change only the migration ordering defect identified by review.\n\nSUCCESS CRITERIA\n- idx_agent_runs_task exists\n- roundtrip test passes",
               acceptanceCriteria: ["idx_agent_runs_task exists", "roundtrip test passes"],
               agentPreference: { provider: "codex", mode: "cli", model: "gpt-5.6-sol", reasoningEffort: "xhigh" },
             },

@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import type { AgentProvider, AgentRunMode, RegisteredAgent } from "@agent-bridge/memory";
 import { openStore, parseList } from "../workspace.js";
+import { syncDefaultAgentPresetFromAgent } from "../default-agent-presets.js";
 import { loadRuntimeProviderCatalogs } from "../provider-catalog.js";
 
 export function registerAgent(program: Command): void {
@@ -117,6 +118,9 @@ export function registerAgent(program: Command): void {
             credentialRef: options.credential,
             capabilities: options.capabilities !== undefined ? parseList(options.capabilities) : undefined,
           });
+          // A preset-backed agent is a global default agent, so mirror the
+          // edit into the user-level roster instead of only this repository.
+          if (updated) syncDefaultAgentPresetFromAgent(updated);
           console.log(JSON.stringify(updated, null, 2));
         } finally {
           store.close();

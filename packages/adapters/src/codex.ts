@@ -34,6 +34,46 @@ At the start of work:
    \`\`\`
    After meaningful progress, save a short state with \`agent-bridge session summary "<state>" --agent codex\`; finish with \`agent-bridge session end --agent codex\`.
 
+## Runtime Goal Rules
+When the first substantive user prompt for a task arrives, decide whether the work
+needs a durable Codex runtime goal:
+- Create a goal with \`create_goal\` before starting work when the user asks for an
+  implementation, change, build, or other sustained action with a verifiable end
+  state. Before calling the tool, derive a complete goal contract from the user's
+  prompt and the compiled repository context. Pass this exact four-section shape
+  as the \`objective\`:
+  \`\`\`text
+  TASK
+  <What the agent should work on>
+
+  GOAL
+  <The final state that should exist>
+
+  CONSTRAINTS
+  <The rules and limits the work must obey>
+
+  SUCCESS CRITERIA
+  <Objective checks that prove completion>
+  \`\`\`
+  Fill every section with concrete task-specific content. Do not leave template
+  questions or placeholders in the created goal. State that no additional
+  constraints were identified when the prompt and repository provide none.
+  Success criteria must be observable and verifiable, not vague claims such as
+  "works correctly". Immediately
+  mirror the complete, unabridged runtime goal into the Work Board task and give
+  the task a shorter descriptive name:
+  \`agent-bridge task update --title "<descriptive task name>" --goal "<full runtime goal>" --agent codex\`.
+  The title must describe the work, and must not equal or repeat the goal.
+- Leave the runtime goal as \`none\` for questions, explanations, plan-only
+  requests, and other response-only work that does not need completion tracking.
+  Give that Work Board task a descriptive title while keeping its goal empty:
+  \`agent-bridge task update --title "<descriptive task name>" --clear-goal --agent codex\`.
+- Do not set a token budget unless the user explicitly gives one.
+- Do not create a second goal when the current task already has an unfinished
+  runtime goal. Complete it only after the requested outcome is actually achieved.
+- Handoffs include \`task.goal\` automatically, so keep it identical to the full
+  runtime goal; never shorten the goal for a handoff.
+
 ## Compiled Context
 See \`.agent-memory/compiled-context.md\`. The agent-bridge hook recompiles it for
 codex on every user prompt, so it is always current when you open it — but reading

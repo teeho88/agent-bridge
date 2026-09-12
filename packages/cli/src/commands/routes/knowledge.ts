@@ -90,6 +90,27 @@ export async function routePostRepoMemoryDelete(ctx: RouteContext): Promise<void
   return;
 }
 
+// The inbox review action: promote writes the proposal into repository memory,
+// reject drops it. Auto-capture only ever files proposals here, so this is the
+// one path by which a captured line becomes shared knowledge.
+export async function routePostRepoMemoryCandidateReview(ctx: RouteContext): Promise<void> {
+  const { req, res, cwd } = ctx;
+  const body = await readJson(req);
+  const action = requiredString(body.action, "action");
+  if (action !== "promote" && action !== "reject") {
+    throw new Error("action must be promote or reject");
+  }
+  const store = openStore(cwd);
+  try {
+    const candidate = store.reviewMemoryCandidate(requiredString(body.id, "id"), action);
+    if (!candidate) sendJson(res, 404, { error: "Memory candidate not found" });
+    else sendJson(res, 200, { candidate });
+  } finally {
+    store.close();
+  }
+  return;
+}
+
 export async function routeGetMemorySearch(ctx: RouteContext): Promise<void> {
   const { res, url, cwd } = ctx;
   const query = String(url.query.q ?? "");

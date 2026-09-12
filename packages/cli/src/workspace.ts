@@ -1000,6 +1000,11 @@ export function findContinuationTask(
   const promptTerms = significantTerms(prompt);
   if (!promptTerms.size) return undefined;
   const explicit = continuationPhrase.test(prompt);
+  // Similar vocabulary is not enough evidence that a brand-new terminal
+  // should take over an old task. That used to make the first prompt replace
+  // the launcher's card (and even inherit another provider's card). Cross-task
+  // adoption is reserved for an explicit continue/resume request.
+  if (!explicit) return undefined;
 
   let best: ContinuationMatch | undefined;
   for (const task of store.listTasks(50)) {
@@ -1024,8 +1029,7 @@ export function findContinuationTask(
     if (!best || score > best.score) best = { task, handoff, score };
   }
 
-  const threshold = explicit ? 3 : 4;
-  return best && best.score >= threshold ? best : undefined;
+  return best && best.score >= 3 ? best : undefined;
 }
 
 function significantTerms(text: string): Set<string> {

@@ -664,15 +664,38 @@ function captureRepoMemory(
   sessionEventId?: string,
 ): void {
   if (readConfig(cwd).repoMemory?.autoCapture === false) return;
+  // Auto-capture only ever proposes. A line is written straight into repository
+  // memory when the user explicitly asked for it to be remembered; everything
+  // else lands in the reviewable inbox so a passing remark cannot silently
+  // become shared knowledge.
+  const saveDirectly = source !== "assistant-summary" && isExplicitSaveRequest(text);
   const candidates = text
     .split(/\r?\n/)
     .map((line) => line.replace(/^[-*#\s]+/, "").trim())
     .filter((line) => line.length >= 24 && line.length <= 700)
     .filter(isRepoWideInstruction)
     .slice(0, 3);
+  const known = new Set([
+    ...store.listRepoMemories(200).map((memory) => memory.content),
+    ...store.listMemoryCandidates("pending", 200).map((candidate) => candidate.content),
+  ]);
   for (const content of candidates) {
+    if (known.has(content)) continue;
+    known.add(content);
     const type = /decision|architecture|quyết định|kiến trúc/i.test(content) ? "decision" : "constraint";
-    store.addMemory({
+    if (saveDirectly) {
+      store.addMemory({
+        type,
+        content,
+        importance: 4,
+        tags: ["repo-memory", "auto-captured", source],
+        sourceAgent: "claude",
+      });
+      continue;
+    }
+    store.createMemoryCandidate({
+      taskId,
+      sessionEventId,
       type,
       content,
       importance: 4,
@@ -684,6 +707,17 @@ function captureRepoMemory(
 
 function isRepoWideInstruction(text: string): boolean {
   return /\b(always|never|must|should not|do not|don't|only|require|architecture|convention|repository|repo)\b|\b(lưu ý|luôn|không bao giờ|bắt buộc|không được|chỉ dùng|quy ước|quy định|kiến trúc|toàn repo)\b/i.test(text);
+}
+
+// "Remember this", "lưu vào repo memory" — an explicit order to persist, as
+// opposed to an instruction that merely happens to sound repo-wide.
+function isExplicitSaveRequest(text: string): boolean {
+  return (
+    /\b(remember|memori[sz]e)\b/i.test(text) ||
+    /\b(save|store|persist|write|add|put|keep)\b[^.\n]{0,30}\b(to|in|into|as)\b[^.\n]{0,20}\b(repo|repository|shared|project)?\s?(memory|memories|knowledge)\b/i.test(text) ||
+    /(ghi nhớ|ghi nhận|nhớ lấy|hãy nhớ|nhớ giùm|nhớ dùm)/i.test(text) ||
+    /(lưu|ghi|thêm)[^.\n]{0,30}(bộ nhớ|memory|repository memory|repo memory|knowledge)/i.test(text)
+  );
 }
 
 function captureTaskFindings(

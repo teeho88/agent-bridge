@@ -13,8 +13,10 @@ The tool runs locally, stores project state in `.agent-memory/`, and exposes bot
 - A repository knowledge graph with concise per-file briefs and automatic brief refresh (`graph brief-auto`).
 - Registered agents with provider, model, reasoning level, and capabilities, plus a curated default-agent preset list and live model discovery from installed provider CLIs.
 - Leader-driven orchestration with plan, implement, review, adjudication, and reporting phases.
+- Durable, per-orchestration context documents that preserve plans, findings, reviews, and rework history between agent turns.
 - Per-task file leases so parallel agents do not edit the same file.
-- A local dashboard (Work Board, Orchestrator, Task, Knowledge, Context, Graph, Handoff, Tools).
+- Repository and global skill management, including installing complete skills from GitHub.
+- A local dashboard (Work Board, Orchestrator, Task, Knowledge, Context, Graph, Handoff, Skills, Tools).
 - UTF-8-safe input paths and secret redaction before logs or memories are stored.
 
 ## Requirements
@@ -131,7 +133,7 @@ Leases are per task, default to a one-hour TTL, and are the coordination primiti
 
 ### Register agents
 
-Agents are selected by provider availability, enabled state, Team Providers, and required capabilities.
+Agents are selected from the enabled roster by provider availability and required capabilities.
 
 ```powershell
 agent-bridge agent add codex-implementer `
@@ -171,13 +173,13 @@ agent-bridge orchestration start "Build a settings page with tests" `
 Useful controls:
 
 ```powershell
-agent-bridge orchestration status
-agent-bridge orchestration step
-agent-bridge orchestration watch
-agent-bridge orchestration autonomy auto
-agent-bridge orchestration pause
-agent-bridge orchestration resume
-agent-bridge orchestration stop
+agent-bridge orchestration status --task <taskId>
+agent-bridge orchestration step --task <taskId>
+agent-bridge orchestration watch --task <taskId>
+agent-bridge orchestration autonomy --task <taskId> --mode auto
+agent-bridge orchestration pause --task <taskId>
+agent-bridge orchestration resume --task <taskId>
+agent-bridge orchestration stop --task <taskId>
 
 agent-bridge assignment list
 agent-bridge assignment update <assignmentId> --status done --result "Merged"
@@ -189,7 +191,9 @@ The normal lifecycle is:
 plan -> implement -> review -> adjudicate -> re-plan or report
 ```
 
-`Team Providers` is a hard allowlist for both the initial plan and change-request re-plans. Routine adjudication can be handled by an eligible adjudicator; risky, conflicting, blocked, or project-completion decisions are escalated to the leader. The dashboard adds spawn approvals, leader questions, change requests, per-task lanes (patch or worktree), and live run logs.
+The enabled roster in the dashboard's Agents tab determines which agents the leader can staff. If the roster is empty, Agent Bridge can discover installed provider CLIs and register a suitable agent on first use. Routine adjudication can be handled by an eligible adjudicator; risky, conflicting, blocked, or project-completion decisions are escalated to the leader. The dashboard adds spawn approvals (including reassignment and a note for the authorised turn), leader questions, change requests, per-task lanes (patch or worktree), and live run logs.
+
+Each orchestration keeps its narrative state under `.agent-memory/context/<orchestrationId>/`. Plans, assignment briefs, implementation reports, reviews, adjudications, summaries, and rework rounds are stored as Markdown and passed between agents by path. SQLite remains the source of truth for statuses, assignments, approvals, and run IDs. Spawned orchestration runs are isolated from the terminal agent's task, session, handoff, context, and memory lifecycle commands.
 
 Generate a final report with:
 
@@ -197,7 +201,13 @@ Generate a final report with:
 agent-bridge report generate
 ```
 
-An eligible reporter must have the `report` capability and belong to an allowed provider. If reporter execution fails, Agent Bridge can generate a deterministic fallback report.
+An eligible reporter must be enabled and have the `report` capability. If reporter execution fails, Agent Bridge can generate a deterministic fallback report.
+
+### Skills
+
+The dashboard's Skills tab can create, import, list, and delete reusable agent skills. Repository skills are stored in `.agents/skills/`; global skills are stored in the user's `.agents/skills/` directory. A GitHub install brings the selected skill's `SKILL.md` together with its scripts, references, and assets.
+
+GitHub code search requires a token visible to the Agent Bridge UI process. Set `GITHUB_TOKEN` or `GH_TOKEN` before starting the dashboard; the token is read from the environment and is not saved by the Skills UI.
 
 ### Token savings
 
@@ -275,6 +285,7 @@ Initialization creates local runtime state such as:
   token-policy.yaml
   current-task.md
   compiled-context.md
+  context/
   tasks/
   reports/
   artifacts/
@@ -296,6 +307,7 @@ It may also create managed agent files and hooks:
 ```text
 AGENTS.md
 CLAUDE.md
+.agents/skills/
 .claude/
 .codex/
 ```
