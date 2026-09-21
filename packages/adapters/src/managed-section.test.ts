@@ -37,4 +37,11 @@ describe("orchestratedRunSection", () => {
       expect(section.indexOf("AGENT_BRIDGE_SPAWNED_RUN")).toBeLessThan(section.indexOf("agent-bridge:end"));
     }
   });
+
+  it("includes a recoverable Git checkpoint rule for every provider", () => {
+    for (const section of [claudeManagedSection(), codexManagedSection(), antigravityRulesSection()]) {
+      expect(section).toContain("After completing a meaningful repo change");
+      expect(section).toContain("Stage and commit only the files that belong to that change");
+    }
+  });
 });

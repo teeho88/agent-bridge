@@ -82,6 +82,7 @@ active task; continue the current one unless the user asks to switch.
   \`\`\`bash
   agent-bridge file release "<lease-id>"
   \`\`\`
+- After completing a meaningful repo change and its relevant checks pass, create a Git commit so the change has a recoverable history point. Stage and commit only the files that belong to that change; never include unrelated pre-existing working-tree changes. Use a concise commit message that describes the completed change.
 
 ## File Brief Rules
 - After reading any source/config/test/doc file for task work, run:

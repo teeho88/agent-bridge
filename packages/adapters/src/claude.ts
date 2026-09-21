@@ -16,6 +16,7 @@ export function claudeManagedSection(): string {
 - Before editing a relevant source/config/test/doc file, run \`agent-bridge file lease "<repo-relative-path>" --mode write --agent claude\`; continue only if the response has \`"acquired": true\`.
 - After the edit is recorded with \`brief-auto --task-edited\`, release the lease with \`agent-bridge file release "<lease-id>"\`.
 - Work-Git leases are enforced by \`brief-auto --task-edited\`; if another task holds the file, coordinate through handoff/request and do not edit it.
+- After completing a meaningful repo change and its relevant checks pass, create a Git commit so the change has a recoverable history point. Stage and commit only the files that belong to that change; never include unrelated pre-existing working-tree changes. Use a concise commit message that describes the completed change.
 - After reading a relevant source/config/test/doc file, run \`agent-bridge graph brief-auto "<repo-relative-path>"\`.
 - After editing a relevant source/config/test/doc file, run \`agent-bridge graph brief-auto "<repo-relative-path>" --task-edited --agent claude\`.
 - Always pass \`--agent claude\` with \`--task-edited\`; without it the lease check resolves the default agent's task and rejects your own lease.

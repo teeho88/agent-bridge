@@ -102,6 +102,7 @@ the packet is task-scoped and available to whichever agent continues it.
   agent-bridge file release "<lease-id>"
   \`\`\`
 - \`agent-bridge graph brief-auto "<repo-relative-path>" --task-edited\` verifies an active write lease for the current task and fails if the file was edited without one.
+- After completing a meaningful repo change and its relevant checks pass, create a Git commit so the change has a recoverable history point. Stage and commit only the files that belong to that change; never include unrelated pre-existing working-tree changes. Use a concise commit message that describes the completed change.
 
 ## File Brief Rules
 - After reading any source/config/test/doc file for task work, run:
