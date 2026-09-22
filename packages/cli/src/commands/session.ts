@@ -29,10 +29,12 @@ export function registerSession(program: Command): void {
       const agent = parseAgent(options.agent);
       const store = openStore();
       try {
-        const taskId = options.task?.trim() || resolveSessionStartTaskId(store, agent);
+        const config = readConfig();
+        const terminalBinding = resolveWorkBoardTerminalBinding(config, agent);
+        const taskId = options.task?.trim() || terminalBinding?.taskId || resolveSessionStartTaskId(store, agent);
         const task = taskId ? store.getTask(taskId) : undefined;
         if (!task) throw new Error("No active task. Run `agent-bridge task start \"...\" --agent " + agent + "` first.");
-        const sessionId = options.id?.trim() || `${agent}-${randomUUID()}`;
+        const sessionId = options.id?.trim() || terminalBinding?.sessionId || `${agent}-${randomUUID()}`;
         startAgentSession(sessionId, task.id, undefined, agent);
         setTerminalTitle(agent, task.id, sessionId);
         rememberSessionWindowHandle(sessionId, task.id, agent);
@@ -96,6 +98,17 @@ export function registerSession(program: Command): void {
         store.close();
       }
     });
+}
+
+export function resolveWorkBoardTerminalBinding(
+  config: ReturnType<typeof readConfig>,
+  agent: AgentKind,
+): { sessionId: string; taskId: string } | undefined {
+  if (agent !== "codex") return undefined;
+  const sessionId = process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID?.trim();
+  if (!sessionId || config.activeSessions?.[sessionId] !== agent) return undefined;
+  const taskId = config.sessionTasks?.[sessionId];
+  return taskId ? { sessionId, taskId } : undefined;
 }
 
 function resolveSessionStartTaskId(

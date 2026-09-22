@@ -16,23 +16,15 @@ export function codexManagedSection(): string {
 See \`.agent-memory/current-task.md\`.
 
 ## Agent Startup Rules
+Codex lifecycle hooks already create or restore the task and live session before the first model call. Do not run \`agent-bridge task start\`, \`agent-bridge session start\`, or \`agent-bridge session end\` during ordinary hooked Codex work; doing so can create a second live card for the same terminal.
 At the start of work:
 1. Read \`.agent-memory/current-task.md\`.
-2. If it says "No current task", start one before editing or recording memory. A title is optional; agent-bridge seeds one after the first completed response:
-   \`\`\`bash
-   agent-bridge task start --agent codex
-   \`\`\`
-   Do not start a new task just because the user sends a new prompt inside an active task/session; continue the current task unless the user explicitly asks to switch tasks.
-3. Then compile fresh context for this agent:
+2. Compile fresh context for this agent:
    \`\`\`bash
    agent-bridge context compile --agent codex
    \`\`\`
-4. Read \`.agent-memory/compiled-context.md\` and continue only the current task.
-5. Mark this work live in the shared dashboard:
-   \`\`\`bash
-   agent-bridge session start --agent codex
-   \`\`\`
-   After meaningful progress, save a short state with \`agent-bridge session summary "<state>" --agent codex\`; finish with \`agent-bridge session end --agent codex\`.
+3. Read \`.agent-memory/compiled-context.md\` and continue only the current task.
+Do not start a new task just because the user sends a new prompt inside an active task/session; continue the current task unless the user explicitly asks to switch tasks.
 
 ## Runtime Goal Rules
 When the first substantive user prompt for a task arrives, decide whether the work

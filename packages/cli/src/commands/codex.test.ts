@@ -168,6 +168,22 @@ describe("Codex hooks", () => {
       await handleCodexHook({ cwd, thread_id: "native-second", prompt: "Work on the second card" }, "UserPromptSubmit");
       await handleCodexHook({ cwd, thread_id: "native-second" }, "Stop");
 
+      // The startup rules may also register the same terminal under a second
+      // session id. It must not keep the superseded card live after /resume.
+      const alias = openStore(cwd);
+      try {
+        const second = alias.listTasks(10).find((task) => task.id !== firstTaskId)!;
+        startAgentSession("codex-agent-alias", second.id, cwd, "codex");
+        rememberSessionWindowHandle("codex-agent-alias", second.id, "codex", cwd, "67890");
+        alias.recordSessionEvent({
+          sessionId: "codex-agent-alias",
+          taskId: second.id,
+          agent: "codex",
+          kind: "session_started",
+          summary: "Codex session started by the agent startup rules.",
+        });
+      } finally { alias.close(); }
+
       // Codex /resume selected the first native thread again.
       await handleCodexHook({ cwd, thread_id: "native-first" }, "SessionStart");
       await handleCodexHook({ cwd, thread_id: "native-first", prompt: "Continue after resume" }, "UserPromptSubmit");
@@ -184,6 +200,7 @@ describe("Codex hooks", () => {
           ownerAgent: "codex",
         });
         expect(second?.title).toBe("Work on the second card");
+        expect(second?.status).toBe("done");
         expect(result.listActiveSessionEvents()).toEqual([
           expect.objectContaining({
             sessionId: terminalSessionId,

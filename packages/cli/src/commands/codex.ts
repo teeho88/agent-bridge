@@ -6,6 +6,7 @@ import type { Command } from "commander";
 import type { AgentRequest, AgentRequestType } from "@agent-bridge/memory";
 import {
   adoptContinuationTask,
+  endAgentSession,
   ensureWorkspace,
   openStore,
   readConfig,
@@ -109,13 +110,7 @@ export async function handleCodexHook(input: CodexHookInput, forcedEvent?: strin
           const previousTaskId = resolveCodexSessionTask(store, cwd, sessionId);
           if (resumedTask) {
             if (previousTaskId && previousTaskId !== resumedTask.id) {
-              store.recordSessionEvent({
-                sessionId,
-                taskId: previousTaskId,
-                agent: "codex",
-                kind: "session_ended",
-                summary: "Codex switched away from this task with /resume.",
-              });
+              closeSupersededCodexTask(store, cwd, previousTaskId, sessionId, "/resume");
             }
             const task = store.updateTask(resumedTask.id, { status: "in_progress" }) ?? resumedTask;
             startAgentSession(sessionId, task.id, cwd, "codex");
@@ -132,23 +127,7 @@ export async function handleCodexHook(input: CodexHookInput, forcedEvent?: strin
             return undefined;
           }
           if (previousTaskId) {
-            const source = firstTaskLabelSource(store, previousTaskId);
-            if (source) {
-              applyTaskLabelSuggestion(store, previousTaskId, {
-                titleText: source,
-                goalText: source,
-                status: "done",
-              });
-            } else {
-              store.updateTask(previousTaskId, { status: "done" });
-            }
-            store.recordSessionEvent({
-              sessionId,
-              taskId: previousTaskId,
-              agent: "codex",
-              kind: "session_ended",
-              summary: "Codex task completed when the terminal started a new thread.",
-            });
+            closeSupersededCodexTask(store, cwd, previousTaskId, sessionId, "a new thread");
           }
           const task = store.createTask({ title: placeholderTaskTitle("codex"), ownerAgent: "codex" });
           startAgentSession(sessionId, task.id, cwd, "codex");
@@ -253,6 +232,55 @@ export async function handleCodexHook(input: CodexHookInput, forcedEvent?: strin
     }
     return undefined;
   } finally { store.close(); }
+}
+
+function closeSupersededCodexTask(
+  store: ReturnType<typeof openStore>,
+  cwd: string,
+  taskId: string,
+  terminalSessionId: string,
+  destination: "/resume" | "a new thread",
+): void {
+  const config = readConfig(cwd);
+  const terminalWindow = config.sessionWindows?.[terminalSessionId];
+  for (const event of store.listActiveSessionEvents(200)) {
+    if (event.taskId !== taskId || event.agent !== "codex") continue;
+    const sessionWindow = config.sessionWindows?.[event.sessionId];
+    const sharesTerminalWindow = Boolean(
+      terminalWindow && sessionWindow && (
+        (terminalWindow.hwnd && terminalWindow.hwnd === sessionWindow.hwnd) ||
+        (terminalWindow.windowId && terminalWindow.windowId === sessionWindow.windowId)
+      ),
+    );
+    if (event.sessionId !== terminalSessionId && !sharesTerminalWindow) continue;
+    store.recordSessionEvent({
+      sessionId: event.sessionId,
+      taskId,
+      agent: "codex",
+      kind: "session_ended",
+      summary: destination === "/resume"
+        ? "Codex switched away from this task with /resume."
+        : "Codex task completed when the terminal started a new thread.",
+    });
+    // Keep the stable Work Board session/window registered: it is rebound to
+    // the destination task immediately after this helper returns.
+    if (event.sessionId !== terminalSessionId) endAgentSession(event.sessionId, cwd);
+  }
+
+  // Another terminal may legitimately still be working on the same task.
+  // In that case its card stays live; only this window's aliases are retired.
+  if (store.listActiveSessionEvents(200).some((event) => event.taskId === taskId)) return;
+
+  const source = firstTaskLabelSource(store, taskId);
+  if (source) {
+    applyTaskLabelSuggestion(store, taskId, {
+      titleText: source,
+      goalText: source,
+      status: "done",
+    });
+  } else {
+    store.updateTask(taskId, { status: "done" });
+  }
 }
 
 function resolveCodexSessionTask(

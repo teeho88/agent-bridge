@@ -3,18 +3,18 @@ import { antigravityArtifact } from "./antigravity.js";
 import { codexManagedSection } from "./codex.js";
 
 describe("agent startup prompts", () => {
-  it("tells Codex to start a task only when none exists", () => {
+  it("keeps Codex task and session lifecycle owned by hooks", () => {
     const prompt = codexManagedSection();
     expect(prompt).toContain("Agent Startup Rules");
-    expect(prompt).toContain(
-      'agent-bridge task start --agent codex',
-    );
+    expect(prompt).toContain("Codex lifecycle hooks already create or restore the task and live session");
+    expect(prompt).toContain("Do not run `agent-bridge task start`, `agent-bridge session start`, or `agent-bridge session end`");
+    expect(prompt).not.toContain('agent-bridge task start --agent codex');
     expect(prompt).not.toContain("this session is starting an unrelated user task");
     expect(prompt).toContain(
       "Do not start a new task just because the user sends a new prompt inside an active task/session",
     );
     expect(prompt).toContain("agent-bridge context compile --agent codex");
-    expect(prompt).toContain("agent-bridge session start --agent codex");
+    expect(prompt).not.toContain("agent-bridge session start --agent codex");
     expect(prompt).toContain("Runtime Goal Rules");
     expect(prompt).toContain("Create a goal with `create_goal`");
     const taskSection = prompt.indexOf("  TASK\n");
