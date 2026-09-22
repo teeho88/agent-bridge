@@ -4,6 +4,15 @@ import { resolve } from "node:path";
 const start = "<!-- agent-bridge:start -->";
 const end = "<!-- agent-bridge:end -->";
 
+export function permissionEscalationSection(): string {
+  return `## Permission Escalation Rules
+
+- If a required command or tool action is blocked by sandboxing, filesystem permissions, or an approval gate, use the available approval/escalation mechanism to ask the user for the minimum permission needed, then retry the blocked action after approval.
+- Do not silently skip a required action, downgrade the requested outcome, or finish the task merely because the first attempt was permission-blocked while an approval path is available.
+- Before requesting permission, resolve the exact command/action and target, and briefly explain why that permission is needed.
+- If the platform rejects the escalation before it reaches the user, or the user denies it, continue every safe in-scope step that remains possible and report the exact blocked action and reason.`;
+}
+
 // Every rule above this block — start a task, compile context, open a session,
 // write a handoff — addresses the agent a human is driving in a terminal. An
 // agent spawned by an orchestration runs in the same workspace and reads the

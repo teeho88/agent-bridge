@@ -1,4 +1,4 @@
-import { orchestratedRunSection } from "./managed-section.js";
+import { orchestratedRunSection, permissionEscalationSection } from "./managed-section.js";
 
 export function codexManagedSection(): string {
   return `<!-- agent-bridge:start -->
@@ -83,6 +83,8 @@ work, then again only when:
 - the user refers to another agent's work, a handoff, or an earlier decision;
 - you are about to edit and no longer hold this task's constraints and handoff.
 Within one task, keep working from what you already read.
+
+${permissionEscalationSection()}
 
 ## Handoff
 The \`## Latest Handoff\` section of \`.agent-memory/compiled-context.md\` carries the

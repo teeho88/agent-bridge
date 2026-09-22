@@ -32,6 +32,10 @@ describe("orchestratedRunSection", () => {
     for (const section of [claudeManagedSection(), codexManagedSection(), antigravityRulesSection()]) {
       expect(section).toContain("AGENT_BRIDGE_SPAWNED_RUN");
       expect(section).toContain(".agent-memory/context/");
+      expect(section).toContain("Permission Escalation Rules");
+      expect(section).toContain("ask the user for the minimum permission needed");
+      expect(section).toContain("retry the blocked action after approval");
+      expect(section).toContain("finish the task merely because the first attempt was permission-blocked");
       // The block sits inside the managed markers, so `agent-bridge init` keeps
       // it in sync instead of leaving it behind on the next rewrite.
       expect(section.indexOf("AGENT_BRIDGE_SPAWNED_RUN")).toBeLessThan(section.indexOf("agent-bridge:end"));

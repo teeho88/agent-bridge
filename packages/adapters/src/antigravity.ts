@@ -1,6 +1,6 @@
 import type { PromptPack } from "@agent-bridge/core";
 import type { CreateRegisteredAgentInput } from "@agent-bridge/memory";
-import { orchestratedRunSection } from "./managed-section.js";
+import { orchestratedRunSection, permissionEscalationSection } from "./managed-section.js";
 
 // Replaces the deprecated gemini CLI (whose geminiAgentDefaults this supersedes).
 // The command is `agy`, not `antigravity`: the latter only launches the IDE,
@@ -71,6 +71,8 @@ section — it is the context to work from, and your own handoff replaces it (on
 per task).
 Do not start a new task just because the user sends a new prompt inside an
 active task; continue the current one unless the user asks to switch.
+
+${permissionEscalationSection()}
 
 ## Work-Git Rules
 - Before editing any source/config/test/doc file for task work, acquire a write lease:
