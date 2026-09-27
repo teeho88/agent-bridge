@@ -32,6 +32,8 @@ export class PixelOfficeSceneController {
   }
 
   apply(state: PixelOfficeSceneState, transitions: PixelTransition[]): void {
+    const previousPositions = new Map<string, DOMRect>();
+    for (const [id, node] of this.actors) previousPositions.set(id, node.getBoundingClientRect());
     this.root.dataset.status = state.globalStatus;
     this.root.dataset.activity = state.dominantActivity;
     this.root.setAttribute('aria-label', `Pixel Office: ${state.globalStatus}; ${state.dominantActivity}`);
@@ -53,6 +55,7 @@ export class PixelOfficeSceneController {
       this.actors.delete(id);
       this.actorState.delete(id);
     }
+    this.animateActorMoves(previousPositions);
     this.renderNotifications(state);
     this.renderActivityList(state);
     if (this.selectedActorId && !this.actorState.has(this.selectedActorId)) this.selectedActorId = '';
@@ -156,6 +159,23 @@ export class PixelOfficeSceneController {
     host.replaceChildren(heading, meta, task, progress, ...(runDetails ? [runDetails] : []), ...(logTail ? [logTail] : []), actions);
   }
 
+  private animateActorMoves(previousPositions: Map<string, DOMRect>): void {
+    const reduced = this.root.classList.contains('reduced-effects') || window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduced) return;
+    for (const [id, before] of previousPositions) {
+      const node = this.actors.get(id);
+      if (!node || !node.isConnected) continue;
+      const after = node.getBoundingClientRect();
+      const deltaX = before.left - after.left;
+      const deltaY = before.top - after.top;
+      if (Math.abs(deltaX) < 2 && Math.abs(deltaY) < 2) continue;
+      node.animate([
+        { transform: `translate3d(${deltaX}px, ${deltaY}px, 0)` },
+        { transform: 'translate3d(0, 0, 0)' },
+      ], { duration: 620, easing: 'steps(8, end)' });
+    }
+  }
+
   private enqueue(items: PixelTransition[]): void {
     for (const item of items) {
       if (this.played.has(item.key) || this.transitions.some(queued => queued.key === item.key)) continue;
@@ -181,10 +201,33 @@ export class PixelOfficeSceneController {
       const actor = transition.actorId ? this.actors.get(transition.actorId) : null;
       actor?.classList.add('is-transitioning');
       const reduced = this.root.classList.contains('reduced-effects') || window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-      await new Promise(resolve => window.setTimeout(resolve, reduced ? 20 : 360));
+      const effect = this.createEffect(transition);
+      await new Promise(resolve => window.setTimeout(resolve, reduced ? 20 : 560));
       actor?.classList.remove('is-transitioning');
+      effect?.remove();
     }
     delete this.root.dataset.transition;
     this.playing = false;
+  }
+
+  private createEffect(transition: PixelTransition): HTMLElement | null {
+    const icons: Record<string, string> = {
+      DISPATCH: '▣',
+      REVIEW_HANDOFF: '➜ REVIEW',
+      REWORK_RETURN: '↶ REWORK',
+      VERDICT_PASS: '✓ PASS',
+      VERDICT_REWORK: '↶ REWORK',
+      VERDICT_BLOCK: '! BLOCK',
+      REPORTING: '▤ REPORT',
+      EXTERNAL_ARRIVAL: '↳ VISITOR',
+      STATUS_DONE: '★ DONE',
+      STATUS_FAILED: '! FAILED',
+    };
+    const icon = icons[transition.type];
+    if (!icon) return null;
+    const effect = textElement('div', `office-effect is-${transition.type.toLowerCase()}`, icon);
+    effect.setAttribute('aria-label', transition.label);
+    this.root.append(effect);
+    return effect;
   }
 }

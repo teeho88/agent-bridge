@@ -9,10 +9,18 @@ export function diffOfficeState(previous: PixelOfficeSceneState | null, current:
   for (const actor of current.actors) {
     const before = previousActors.get(actor.id);
     if (!before) {
-      transitions.push({ key: `run:${actor.runId}:started`, type: 'DISPATCH', actorId: actor.id, critical: false, label: `${actor.name} received ${actor.taskLabel || 'a task'}` });
+      const type = actor.activity === 'reviewing'
+        ? 'REVIEW_HANDOFF'
+        : actor.activity === 'reworking'
+          ? 'REWORK_RETURN'
+          : actor.activity === 'reporting'
+            ? 'REPORTING'
+            : actor.origin === 'adopted' || actor.origin === 'manual' ? 'EXTERNAL_ARRIVAL' : 'DISPATCH';
+      transitions.push({ key: `run:${actor.runId}:started`, type, actorId: actor.id, critical: actor.activity === 'reworking', label: `${actor.name} received ${actor.taskLabel || 'a task'}` });
     } else if (before.activity !== actor.activity || before.status !== actor.status) {
       const critical = actor.activity === 'failed' || actor.activity === 'done' || actor.activity === 'reworking';
-      transitions.push({ key: `run:${actor.runId}:${actor.activity}:${actor.status}`, type: actor.activity.toUpperCase(), actorId: actor.id, critical, label: `${actor.name}: ${before.activity} → ${actor.activity}` });
+      const type = actor.activity === 'reviewing' ? 'REVIEW_HANDOFF' : actor.activity === 'reworking' ? 'REWORK_RETURN' : actor.activity.toUpperCase();
+      transitions.push({ key: `run:${actor.runId}:${actor.activity}:${actor.status}`, type, actorId: actor.id, critical, label: `${actor.name}: ${before.activity} → ${actor.activity}` });
     }
   }
   const previousVerdicts = new Map(previous.verdicts.map(verdict => [verdict.id, verdict]));

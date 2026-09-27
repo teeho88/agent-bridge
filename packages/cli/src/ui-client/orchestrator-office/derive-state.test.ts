@@ -103,7 +103,19 @@ describe('Pixel Office state', () => {
       reviews: [{ id: 'review-1', subtaskId: 'sub-1', verdict: 'rework' }],
     }));
     expect(diffOfficeState(null, current)).toEqual([]);
-    expect(diffOfficeState(previous, current).map(item => item.type)).toEqual(expect.arrayContaining(['REVIEWING', 'VERDICT_REWORK']));
+    expect(diffOfficeState(previous, current).map(item => item.type)).toEqual(expect.arrayContaining(['REVIEW_HANDOFF', 'VERDICT_REWORK']));
+  });
+
+  it('names snapshot-skip transitions for review handoff and rework return', () => {
+    const previous = deriveOfficeState(board());
+    const review = deriveOfficeState(board({
+      runs: [{ id: 'review-run', agentId: 'reviewer-1', phase: 'review', status: 'running' }],
+    }));
+    const rework = deriveOfficeState(board({
+      runs: [{ id: 'rework-run', agentId: 'worker-1', phase: 'implement', status: 'running', cycle: 2 }],
+    }));
+    expect(diffOfficeState(previous, review)[0]?.type).toBe('REVIEW_HANDOFF');
+    expect(diffOfficeState(previous, rework)[0]?.type).toBe('REWORK_RETURN');
   });
 
   it('bounds transition backlog while retaining critical events first', () => {

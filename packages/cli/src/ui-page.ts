@@ -194,6 +194,11 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     }
     .pixel-actor:hover, .pixel-actor:focus-visible { transform: translate3d(0,-3px,0); outline: 3px solid #fde68a; outline-offset: 1px; }
     .pixel-actor.is-transitioning { animation: office-hop 360ms steps(4); }
+    .pixel-actor[data-pose="type"] .pixel-body { animation: office-type 480ms steps(2) infinite; }
+    .pixel-actor[data-pose="inspect"] .pixel-avatar { animation: office-inspect 900ms steps(3) infinite; }
+    .pixel-actor[data-pose="think"] .pixel-avatar { animation: office-think 1200ms steps(2) infinite; }
+    .pixel-actor[data-pose="celebrate"] .pixel-avatar { animation: office-celebrate 620ms steps(2) 3; }
+    .pixel-actor[data-pose="error"] .pixel-avatar { animation: office-error 300ms steps(2) infinite; }
     .pixel-actor[data-activity="failed"] { background: #fee2e2; border-color: #b91c1c; }
     .pixel-actor[data-activity="reviewing"] { background: #e0f2fe; }
     .pixel-actor[data-activity="reworking"] { background: #ffedd5; }
@@ -221,11 +226,26 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     .office-inspector-task { overflow-wrap: anywhere; font-size: 12px; }
     .office-status-fallback { overflow: auto; }
     .office-status-list { margin: 8px 0 0; padding-left: 18px; display: grid; gap: 5px; font-size: 11px; }
+    .office-effect {
+      position: absolute; left: 50%; top: 48%; z-index: 9; transform: translate(-50%,-50%);
+      padding: 10px 14px; border: 4px solid #172033; background: #f8fafc; color: #172033;
+      box-shadow: 7px 7px 0 rgba(15,23,42,.38); font: 900 17px/1 ui-monospace, monospace;
+      animation: office-effect 560ms steps(5) both; pointer-events: none;
+    }
+    .office-effect.is-verdict_pass, .office-effect.is-status_done { background: #dcfce7; color: #166534; border-color: #166534; }
+    .office-effect.is-verdict_rework, .office-effect.is-rework_return { background: #ffedd5; color: #9a3412; border-color: #9a3412; }
+    .office-effect.is-verdict_block, .office-effect.is-status_failed { background: #fee2e2; color: #991b1b; border-color: #991b1b; }
     @keyframes office-hop { 0%,100% { transform: translate3d(0,0,0); } 50% { transform: translate3d(0,-7px,0); } }
+    @keyframes office-type { 0%,100% { transform: translateY(0); } 50% { transform: translateY(2px); } }
+    @keyframes office-inspect { 0%,100% { transform: translateX(0); } 50% { transform: translateX(4px); } }
+    @keyframes office-think { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
+    @keyframes office-celebrate { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
+    @keyframes office-error { 0%,100% { transform: translateX(-2px); } 50% { transform: translateX(2px); } }
+    @keyframes office-effect { 0% { opacity: 0; transform: translate(-50%,-35%) scale(.7); } 35%,75% { opacity: 1; transform: translate(-50%,-50%) scale(1); } 100% { opacity: 0; transform: translate(-50%,-65%) scale(.9); } }
     @media (max-width: 1050px) { .pixel-office-shell { overflow-x: auto; grid-template-columns: 760px 260px; } }
     @media (max-width: 760px) { .pixel-office-shell { grid-template-columns: 680px 240px; } .pixel-office { min-width: 680px; } }
-    @media (prefers-reduced-motion: reduce) { .pixel-actor, .pixel-actor.is-transitioning { animation: none; transition: none; } }
-    .pixel-office.reduced-effects .pixel-actor { animation: none; transition-duration: 20ms; }
+    @media (prefers-reduced-motion: reduce) { .pixel-actor, .pixel-actor *, .pixel-actor.is-transitioning, .office-effect { animation: none; transition: none; } }
+    .pixel-office.reduced-effects .pixel-actor, .pixel-office.reduced-effects .pixel-actor *, .pixel-office.reduced-effects .office-effect { animation: none; transition-duration: 20ms; }
     .task-card-section { min-width: 0; display: grid; gap: 7px; align-content: start; }
     .task-card-section h3 { margin: 0; }
     .task-card-panel { min-width: 0; border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,0.78); padding: 9px; }
