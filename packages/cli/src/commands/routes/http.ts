@@ -36,14 +36,8 @@ export function sendHtml(res: ServerResponse, html: string): void {
  * a real module keeps the code type-checked and splittable.
  */
 export function sendClientModule(res: ServerResponse, pathname: string): void {
-  const relative = pathname.slice("/ui-client/".length);
-  // Path traversal guard: only flat `.js` files from the compiled client.
-  if (!/^[\w.-]+\.js$/.test(relative) || relative.includes("..")) {
-    sendJson(res, 404, { error: "Not found" });
-    return;
-  }
-  const file = join(uiClientDir(), relative);
-  if (!existsSync(file)) {
+  const file = clientModulePath(pathname);
+  if (!file || !existsSync(file)) {
     sendJson(res, 404, { error: "Not found" });
     return;
   }
@@ -52,6 +46,20 @@ export function sendClientModule(res: ServerResponse, pathname: string): void {
     "cache-control": "no-store",
   });
   res.end(readFileSync(file));
+}
+
+export function clientModulePath(pathname: string, clientDir = uiClientDir()): string | undefined {
+  const prefix = "/ui-client/";
+  if (!pathname.startsWith(prefix)) return undefined;
+  const segments = pathname.slice(prefix.length).split("/");
+  if (
+    segments.length === 0 ||
+    !segments.at(-1)?.endsWith(".js") ||
+    segments.some((segment) => segment === "." || segment === ".." || !/^[\w.-]+$/.test(segment))
+  ) {
+    return undefined;
+  }
+  return join(clientDir, ...segments);
 }
 
 export function uiClientDir(packageRoot = cliPackageRoot()): string {
