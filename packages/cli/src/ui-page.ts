@@ -165,6 +165,67 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     .run-carousel-shell:hover .task-carousel-button:not(:disabled) { opacity: 1; pointer-events: auto; }
     @media (max-width: 1100px) { .run-grid { grid-auto-columns: calc((100% - 12px) / 2); } }
     @media (max-width: 760px) { .run-grid { grid-auto-columns: 100%; grid-template-rows: minmax(0, 1fr); } }
+    .pixel-office-shell { display: grid; grid-template-columns: minmax(0, 1fr) 280px; min-height: 590px; background: #19243a; }
+    .pixel-office {
+      --office-floor: #d9bd86; --office-wall: #24324d; min-width: 760px; min-height: 590px; position: relative;
+      display: grid; grid-template-columns: 1fr 1.65fr 1fr; grid-template-rows: 150px 120px 250px;
+      gap: 8px; padding: 12px; overflow: hidden; color: #f8fafc;
+      background: linear-gradient(#1e2c46 0 31%, transparent 31%), repeating-linear-gradient(90deg, rgba(95,67,39,.12) 0 2px, transparent 2px 48px), var(--office-floor);
+      image-rendering: pixelated;
+    }
+    .pixel-office[data-status="failed"] { box-shadow: inset 0 0 0 4px #ef4444; }
+    .pixel-office[data-status="paused"]::after { content: "PAUSED"; position: absolute; inset: 0; display: grid; place-items: center; background: rgba(15,23,42,.42); color: #fff; font-size: 30px; font-weight: 900; letter-spacing: .18em; z-index: 8; pointer-events: none; }
+    .office-zone { position: relative; min-width: 0; border: 3px solid #101827; border-radius: 3px; padding: 28px 8px 8px; background: rgba(248,250,252,.13); box-shadow: inset 0 0 0 2px rgba(255,255,255,.08); overflow: hidden; }
+    .office-zone > h3 { position: absolute; top: 6px; left: 8px; margin: 0; color: #f8fafc; font: 800 10px/1 ui-monospace, monospace; letter-spacing: .08em; text-transform: uppercase; }
+    .office-zone[data-office-zone="leader"] { grid-column: 1; grid-row: 1; background: #33476c; }
+    .office-zone[data-office-zone="gate"] { grid-column: 2; grid-row: 1; background: #3d5277; }
+    .office-zone[data-office-zone="report"] { grid-column: 3; grid-row: 1; background: #354968; }
+    .office-zone[data-office-zone="dispatch"] { grid-column: 1; grid-row: 2; background: #56647b; }
+    .office-zone[data-office-zone="decision"] { grid-column: 2 / 4; grid-row: 2; background: #59677d; }
+    .office-zone[data-office-zone="implement"] { grid-column: 1 / 3; grid-row: 3; background: rgba(248,250,252,.22); }
+    .office-zone[data-office-zone="review"] { grid-column: 3; grid-row: 3; background: rgba(226,232,240,.22); }
+    .office-zone[data-office-zone="entrance"] { position: absolute; right: 12px; bottom: 12px; width: 118px; height: 92px; z-index: 3; background: #3b4b64; }
+    .office-zone[data-office-zone="entrance"] > h3 { font-size: 8px; }
+    .office-zone-actors { display: flex; align-items: flex-end; align-content: flex-end; flex-wrap: wrap; gap: 8px; height: 100%; }
+    .pixel-actor {
+      width: 112px; min-height: 82px; padding: 5px; display: grid; grid-template-columns: 34px minmax(0,1fr); gap: 6px; align-items: end;
+      border: 2px solid #172033; border-radius: 3px; background: rgba(255,255,255,.94); color: #172033; text-align: left;
+      box-shadow: 4px 4px 0 rgba(15,23,42,.32); transform: translate3d(0,0,0); transition: transform 260ms steps(4), opacity 180ms linear;
+    }
+    .pixel-actor:hover, .pixel-actor:focus-visible { transform: translate3d(0,-3px,0); outline: 3px solid #fde68a; outline-offset: 1px; }
+    .pixel-actor.is-transitioning { animation: office-hop 360ms steps(4); }
+    .pixel-actor[data-activity="failed"] { background: #fee2e2; border-color: #b91c1c; }
+    .pixel-actor[data-activity="reviewing"] { background: #e0f2fe; }
+    .pixel-actor[data-activity="reworking"] { background: #ffedd5; }
+    .pixel-office:not(.show-completed) .pixel-actor[data-activity="done"] { display: none; }
+    .pixel-office.hide-task-labels .pixel-actor-copy small { display: none; }
+    .pixel-avatar { position: relative; display: block; width: 30px; height: 48px; align-self: end; filter: drop-shadow(2px 2px 0 rgba(15,23,42,.28)); }
+    .pixel-avatar i { position: absolute; display: block; image-rendering: pixelated; }
+    .pixel-hair { width: 22px; height: 8px; left: 4px; top: 0; background: hsl(var(--actor-hue) 38% 24%); box-shadow: -3px 5px 0 hsl(var(--actor-hue) 38% 24%); }
+    .pixel-face { width: 18px; height: 15px; left: 7px; top: 8px; background: #dca77b; box-shadow: 3px 4px 0 #dca77b; }
+    .pixel-body { width: 24px; height: 20px; left: 4px; top: 25px; background: hsl(var(--actor-hue) 58% 50%); box-shadow: -4px 4px 0 hsl(var(--actor-hue) 58% 42%), 4px 4px 0 hsl(var(--actor-hue) 58% 42%), 2px 20px 0 #26334d, -6px 20px 0 #26334d; }
+    .pixel-actor-copy { min-width: 0; display: grid; gap: 2px; align-self: stretch; align-content: center; }
+    .pixel-actor-copy strong, .pixel-actor-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pixel-actor-copy strong { font: 800 11px/1.2 ui-monospace, monospace; }
+    .pixel-actor-copy small { font: 9px/1.25 ui-monospace, monospace; color: #475569; }
+    .pixel-actor-copy em { width: max-content; max-width: 100%; overflow: hidden; padding: 2px 4px; background: #172033; color: #fff; font: normal 800 8px/1 ui-monospace, monospace; text-transform: uppercase; }
+    .office-hud { position: absolute; inset: 8px 8px auto auto; z-index: 6; display: flex; gap: 5px; align-items: center; max-width: 65%; }
+    .office-state, .office-transition { padding: 4px 7px; border: 2px solid #0f172a; background: rgba(255,255,255,.94); color: #0f172a; font: 800 9px/1.2 ui-monospace, monospace; }
+    .office-transition { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .office-notifications { position: absolute; left: 12px; top: 10px; z-index: 7; display: flex; gap: 5px; flex-wrap: wrap; }
+    .office-notification { padding: 4px 6px; border: 2px solid #7c2d12; background: #ffedd5; color: #7c2d12; font: 800 9px/1 ui-monospace, monospace; }
+    .office-sidebar { min-width: 0; display: grid; grid-template-rows: auto minmax(0,1fr); background: #f8fafc; border-left: 1px solid var(--line); color: var(--text); }
+    .office-inspector, .office-status-fallback { padding: 12px; min-width: 0; }
+    .office-inspector { border-bottom: 1px solid var(--line); display: grid; gap: 8px; align-content: start; }
+    .office-inspector-title { font-weight: 850; }
+    .office-inspector-task { overflow-wrap: anywhere; font-size: 12px; }
+    .office-status-fallback { overflow: auto; }
+    .office-status-list { margin: 8px 0 0; padding-left: 18px; display: grid; gap: 5px; font-size: 11px; }
+    @keyframes office-hop { 0%,100% { transform: translate3d(0,0,0); } 50% { transform: translate3d(0,-7px,0); } }
+    @media (max-width: 1050px) { .pixel-office-shell { overflow-x: auto; grid-template-columns: 760px 260px; } }
+    @media (max-width: 760px) { .pixel-office-shell { grid-template-columns: 680px 240px; } .pixel-office { min-width: 680px; } }
+    @media (prefers-reduced-motion: reduce) { .pixel-actor, .pixel-actor.is-transitioning { animation: none; transition: none; } }
+    .pixel-office.reduced-effects .pixel-actor { animation: none; transition-duration: 20ms; }
     .task-card-section { min-width: 0; display: grid; gap: 7px; align-content: start; }
     .task-card-section h3 { margin: 0; }
     .task-card-panel { min-width: 0; border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,0.78); padding: 9px; }
@@ -661,18 +722,43 @@ agent-bridge ui</pre>
           </div>
         </div>
       </section>
-      <section class="panel">
+      <section class="panel" id="orchestratorRunsPanel">
         <div class="panel-head">
-          <h2>Runs</h2>
-          <span class="help" data-tip="Every spawned/adopted agent process for this orchestration: role, model, phase, status, and live log output. Running agents come first. Finished runs keep their full log behind the Full log button.">?</span>
+          <h2>Pixel Office</h2>
+          <span class="help" data-tip="A live visual projection of orchestration lifecycle, concurrent agent activity, reviews, rework, approvals and reporting. The backend board remains authoritative.">?</span>
+          <div class="panel-tabs" aria-label="Run view">
+            <button class="tab-button active" data-office-view="pixel" type="button">Pixel Office</button>
+            <button class="tab-button" data-office-view="classic" type="button">Classic Runs</button>
+          </div>
           <div class="panel-tabs" style="margin-left:auto">
             <button class="tab-button active" data-runs-filter="active" type="button">Active</button>
             <button class="tab-button" data-runs-filter="cycle" type="button">This cycle</button>
             <button class="tab-button" data-runs-filter="all" type="button">All</button>
           </div>
+          <label class="meta toolbar"><input id="officeShowCompleted" type="checkbox" style="width:14px;height:14px;min-height:0"> Completed</label>
+          <label class="meta toolbar"><input id="officeShowLabels" type="checkbox" checked style="width:14px;height:14px;min-height:0"> Labels</label>
+          <label class="meta toolbar"><input id="officeReducedEffects" type="checkbox" style="width:14px;height:14px;min-height:0"> Reduced effects</label>
           <span class="meta" id="orchestratorRunsCount"></span>
         </div>
-        <div class="panel-body run-carousel-shell" id="orchestratorRunsShell">
+        <div class="pixel-office-shell" id="orchestratorOfficeShell">
+          <div class="pixel-office" id="orchestratorOffice" role="region" aria-live="polite">
+            <div class="office-notifications" data-office-notifications></div>
+            <div class="office-hud"><span class="office-state" data-office-status>idle</span><span class="office-transition" data-office-transition>Waiting for orchestration activity</span></div>
+            <section class="office-zone" data-office-zone="leader"><h3>Leader Office</h3><div class="office-zone-actors" data-zone-actors></div></section>
+            <section class="office-zone" data-office-zone="gate"><h3>User Gate / Approval</h3><div class="office-zone-actors" data-zone-actors></div></section>
+            <section class="office-zone" data-office-zone="report"><h3>Report / Archive</h3><div class="office-zone-actors" data-zone-actors></div></section>
+            <section class="office-zone" data-office-zone="dispatch"><h3>Dispatch</h3><div class="office-zone-actors" data-zone-actors></div></section>
+            <section class="office-zone" data-office-zone="decision"><h3>Decision Table</h3><div class="office-zone-actors" data-zone-actors></div></section>
+            <section class="office-zone" data-office-zone="implement"><h3>Implementer Floor · Rework Lane</h3><div class="office-zone-actors" data-zone-actors></div></section>
+            <section class="office-zone" data-office-zone="review"><h3>Review Lab</h3><div class="office-zone-actors" data-zone-actors></div></section>
+            <section class="office-zone" data-office-zone="entrance"><h3>External</h3><div class="office-zone-actors" data-zone-actors></div></section>
+          </div>
+          <aside class="office-sidebar">
+            <div class="office-inspector" data-office-inspector><div class="muted">Select an agent or desk to inspect its run.</div></div>
+            <div class="office-status-fallback"><strong>Current activity</strong><ul class="office-status-list" data-office-activity-list></ul></div>
+          </aside>
+        </div>
+        <div class="panel-body run-carousel-shell" id="orchestratorRunsShell" hidden>
           <button class="task-carousel-button prev" id="orchestratorRunsPrev" type="button" aria-label="Previous runs">&lsaquo;</button>
           <div class="run-grid" id="orchestratorRuns"></div>
           <button class="task-carousel-button next" id="orchestratorRunsNext" type="button" aria-label="More runs">&rsaquo;</button>

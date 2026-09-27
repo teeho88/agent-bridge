@@ -7,6 +7,32 @@ import { SQLiteMemoryStore } from "./sqlite-store.js";
 import { schemaStatements } from "./schema.js";
 
 describe("SQLiteMemoryStore", () => {
+  it("normalizes legacy reviewing and reworking orchestration statuses", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-bridge-"));
+    const path = join(dir, "memories.db");
+    const store = new SQLiteMemoryStore(path);
+    try {
+      const leader = store.createRegisteredAgent({
+        name: "legacy-leader",
+        provider: "codex",
+        mode: "cli",
+        command: "codex",
+      });
+      const task = store.createTask({ title: "Legacy orchestration", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
+      const db = (store as unknown as { db: Database.Database }).db;
+
+      db.prepare("UPDATE orchestrations SET status = 'reviewing' WHERE id = ?").run(orchestration.id);
+      expect(store.getOrchestration(orchestration.id)?.status).toBe("executing");
+
+      db.prepare("UPDATE orchestrations SET status = 'reworking' WHERE id = ?").run(orchestration.id);
+      expect(store.listOrchestrations()[0]?.status).toBe("executing");
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("backfills reasons for legacy blocked and cancelled subtasks", () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-bridge-"));
     const path = join(dir, "memories.db");

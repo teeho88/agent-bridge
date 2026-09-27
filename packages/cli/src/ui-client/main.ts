@@ -1,3 +1,8 @@
+import { deriveOfficeState } from './orchestrator-office/derive-state.js';
+import { PixelOfficeSceneController } from './orchestrator-office/scene-controller.js';
+import { diffOfficeState } from './orchestrator-office/transitions.js';
+import type { PixelOfficeSceneState } from './orchestrator-office/types.js';
+
 // Dashboard client. Runs in the browser as an ES module served from
 // /ui-client/main.js - it is no longer a string inside ui-page.ts, so tsc
 // checks it and it can be split by domain without touching the HTML.
@@ -1845,6 +1850,24 @@ async function loadOrchestratorCatalog() {
 // behind, and scrolling past them to find the one that matters is the
 // whole complaint. Nothing is deleted — the other tabs still show them.
 let runsFilter = 'active';
+let officeView = 'pixel';
+let previousOfficeState: PixelOfficeSceneState | null = null;
+const officeRoot = elById('orchestratorOffice');
+const officeController = officeRoot ? new PixelOfficeSceneController(officeRoot) : null;
+try {
+  officeView = window.localStorage.getItem('agent-bridge.orchestratorView') === 'classic' ? 'classic' : 'pixel';
+} catch {}
+
+function selectOfficeView(view) {
+  officeView = view === 'classic' ? 'classic' : 'pixel';
+  const officeShell = elById('orchestratorOfficeShell');
+  const runsShell = elById('orchestratorRunsShell');
+  if (officeShell) officeShell.hidden = officeView !== 'pixel';
+  if (runsShell) runsShell.hidden = officeView !== 'classic';
+  qsa(document, '[data-office-view]').forEach(button => button.classList.toggle('active', button.dataset.officeView === officeView));
+  try { window.localStorage.setItem('agent-bridge.orchestratorView', officeView); } catch {}
+  if (officeView === 'classic') updateRunsCarousel();
+}
 
 function filterRunsForBoard(runs) {
   // "cycle" and "all" are decided server-side (see the runs= query param);
@@ -1997,6 +2020,8 @@ async function refreshOrchestratorBoard() {
     if (!data.orchestration) {
       summaryEl.textContent = 'No orchestrations yet. Start one with the form on the left.';
       elById('orchestratorRuns').innerHTML = '';
+      previousOfficeState = null;
+      officeController?.clear();
       elById('orchestratorSubtasks').innerHTML = '';
       elById('orchestratorReviews').innerHTML = '';
       elById('orchestratorEvents').innerHTML = '';
@@ -2044,6 +2069,9 @@ async function refreshOrchestratorBoard() {
     (data.registeredAgents || []).forEach(agent => { agentsById[agent.id] = agent; });
     const sentRuns = data.runs || [];
     syncRunCompletionToasts(sentRuns, agentsById);
+    const nextOfficeState = deriveOfficeState(data);
+    officeController?.apply(nextOfficeState, diffOfficeState(previousOfficeState, nextOfficeState));
+    previousOfficeState = nextOfficeState;
     const shownRuns = filterRunsForBoard(sortRunsForBoard(sentRuns));
     // runsTotal counts every run on the task, including the ones the
     // server did not send for this scope.
@@ -2132,6 +2160,14 @@ qsa(document, '[data-runs-filter]').forEach(button => {
     refreshOrchestratorBoard();
   });
 });
+
+qsa(document, '[data-office-view]').forEach(button => {
+  onElement(button, 'click', () => selectOfficeView(button.dataset.officeView));
+});
+selectOfficeView(officeView);
+on('officeShowCompleted', 'change', event => officeRoot?.classList.toggle('show-completed', event.target.checked));
+on('officeShowLabels', 'change', event => officeRoot?.classList.toggle('hide-task-labels', !event.target.checked));
+on('officeReducedEffects', 'change', event => officeRoot?.classList.toggle('reduced-effects', event.target.checked));
 
 on('orchestratorRunsPrev', 'click', () => scrollRunsByPage(-1));
 on('orchestratorRunsNext', 'click', () => scrollRunsByPage(1));
@@ -2663,10 +2699,11 @@ on('orchestratorSubtaskForm', 'submit', async event => {
   }
 });
 
-on('orchestratorRuns', 'click', async event => {
+async function handleRunAction(event) {
   const stopButton = closestFrom(event.target, '.run-stop');
   const logButton = closestFrom(event.target, '.run-log');
   const modelButton = closestFrom(event.target, '.run-set-model');
+  if (!stopButton && !logButton && !modelButton) return;
   try {
     if (stopButton) {
       if (!confirm('Stop this run?')) return;
@@ -2685,7 +2722,10 @@ on('orchestratorRuns', 'click', async event => {
   } catch (error) {
     alert(error.message);
   }
-});
+}
+
+on('orchestratorRuns', 'click', handleRunAction);
+on('orchestratorOfficeShell', 'click', handleRunAction);
 
 on('orchestratorAdoptable', 'click', async event => {
   const adoptButton = closestFrom(event.target, '.session-adopt');

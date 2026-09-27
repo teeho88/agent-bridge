@@ -87,7 +87,7 @@ import type {
   UpsertTaskChangeInput,
   UpsertTaskLaneInput,
 } from "./types.js";
-import { FINISHED_ORCHESTRATION_STATUSES } from "./types.js";
+import { FINISHED_ORCHESTRATION_STATUSES, normalizeOrchestrationStatus } from "./types.js";
 
 type Row = Record<string, unknown>;
 
@@ -479,7 +479,7 @@ function toOrchestration(row: Row): Orchestration {
     taskId: String(row.task_id),
     workforceId: row.workforce_id ? String(row.workforce_id) : undefined,
     leaderAgentId: String(row.leader_agent_id),
-    status: String(row.status) as Orchestration["status"],
+    status: normalizeOrchestrationStatus(row.status),
     autonomy: String(row.autonomy) as Orchestration["autonomy"],
     cycle: Number(row.cycle ?? 0),
     maxCycles: Number(row.max_cycles ?? 8),
@@ -3370,6 +3370,5 @@ function taskRelevance(
   );
   return terms.filter((term) => text.includes(term)).length / terms.length;
 }
-
 
 

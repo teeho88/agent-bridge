@@ -656,6 +656,20 @@ describe("dashboard overview", () => {
     expect(clientJs).toContain("function renderProviderToggles()");
     expect(clientJs).toContain("class=\"provider-toggle\"");
     expect(html).toContain('id="orchestratorRuns"');
+    expect(html).toContain('id="orchestratorOffice"');
+    expect(html).toContain('data-office-view="pixel"');
+    expect(html).toContain('data-office-view="classic"');
+    expect(html).toContain('data-office-zone="leader"');
+    expect(html).toContain('data-office-zone="implement"');
+    expect(html).toContain('data-office-zone="review"');
+    expect(html).toContain('data-office-zone="decision"');
+    expect(html).toContain('data-office-zone="gate"');
+    expect(html).toContain('data-office-inspector');
+    expect(html).toContain('id="officeReducedEffects"');
+    expect(html).toContain('@media (prefers-reduced-motion: reduce)');
+    expect(clientJs).toContain("deriveOfficeState(data)");
+    expect(clientJs).toContain("diffOfficeState(previousOfficeState, nextOfficeState)");
+    expect(clientJs).toContain("new PixelOfficeSceneController(officeRoot)");
     expect(html).toContain('id="orchestratorAdoptable"');
     // Picker + Remove: the board must be reachable even when the active task
     // has no orchestration, and removable without hand-editing the database.

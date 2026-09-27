@@ -671,13 +671,42 @@ export type UpdateAgentRunInput = Partial<
 export type OrchestrationStatus =
   | "planning"
   | "executing"
-  | "reviewing"
   | "adjudicating"
-  | "reworking"
   | "reporting"
   | "done"
   | "failed"
   | "paused";
+
+export type WorkflowActivity =
+  | "idle"
+  | "planning"
+  | "dispatching"
+  | "implementing"
+  | "reviewing"
+  | "adjudicating"
+  | "reworking"
+  | "reporting"
+  | "waiting_approval"
+  | "waiting_user"
+  | "stopping"
+  | "failed"
+  | "done";
+
+export function normalizeOrchestrationStatus(status: unknown): OrchestrationStatus {
+  if (status === "reviewing" || status === "reworking") return "executing";
+  switch (status) {
+    case "planning":
+    case "executing":
+    case "adjudicating":
+    case "reporting":
+    case "done":
+    case "failed":
+    case "paused":
+      return status;
+    default:
+      return "failed";
+  }
+}
 
 // Statuses an orchestration never steps out of on its own. Everything else —
 // "paused" included — can still spawn another turn, so it still needs a leader
