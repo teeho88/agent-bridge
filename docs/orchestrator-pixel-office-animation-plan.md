@@ -52,7 +52,7 @@ Mọi trạng thái trong Pixel Office phải được suy ra từ dữ liệu t
 
 Không được tạo một workflow animation độc lập rồi giả định backend sẽ đi theo animation đó.
 
-### 3.2. Không phụ thuộc duy nhất vào `orchestration.status`
+### 3.2. Tách `OrchestrationStatus` khỏi workflow activity
 
 Hiện tại type có các trạng thái:
 
@@ -66,11 +66,75 @@ Hiện tại type có các trạng thái:
 - `failed`
 - `paused`
 
-Nhưng implementation hiện tại không nhất thiết chuyển orchestration sang `reviewing` hoặc `reworking` ở mọi thời điểm tương ứng.
+Nhưng implementation hiện tại không chuyển orchestration sang `reviewing` hoặc `reworking` như các global state độc lập trong workflow chính.
 
-Review thực tế có thể xảy ra ngay trong `executing`; rework có thể được tạo sau bước adjudication dưới dạng subtask mới.
+Review thực tế xảy ra trong khi orchestration vẫn ở `executing`; rework được tạo sau adjudication dưới dạng subtask mới rồi orchestration quay lại `executing`.
 
-Vì vậy UI cần một lớp trạng thái riêng:
+Điều này không nên sửa bằng cách đơn giản thêm:
+
+```ts
+status = "reviewing"
+status = "reworking"
+```
+
+vào state machine, vì một orchestration có thể đồng thời có nhiều activity:
+
+```text
+Orchestration: executing
+
+Worker A:    implementing
+Worker B:    implementing
+Reviewer 1:  reviewing
+Worker C:    reworking
+```
+
+Một global status duy nhất không thể mô tả chính xác tất cả các activity song song đó.
+
+Kiến trúc mục tiêu của upgrade này là tách thành hai tầng:
+
+```text
+OrchestrationStatus
+= lifecycle tổng thể của orchestration
+
+WorkflowActivity / ActorActivity
+= công việc thực tế đang diễn ra trên từng run/subtask/actor
+```
+
+Global `OrchestrationStatus` canonical đề xuất:
+
+```ts
+type OrchestrationStatus =
+  | "planning"
+  | "executing"
+  | "adjudicating"
+  | "reporting"
+  | "paused"
+  | "done"
+  | "failed";
+```
+
+Activity chi tiết đề xuất:
+
+```ts
+type WorkflowActivity =
+  | "idle"
+  | "planning"
+  | "dispatching"
+  | "implementing"
+  | "reviewing"
+  | "adjudicating"
+  | "reworking"
+  | "reporting"
+  | "waiting_approval"
+  | "waiting_user"
+  | "stopping"
+  | "failed"
+  | "done";
+```
+
+`reviewing` và `reworking` vì vậy vẫn tồn tại về mặt semantics, nhưng ở đúng tầng activity thay vì global orchestration lifecycle.
+
+Pixel Office cần một lớp trạng thái riêng:
 
 ```ts
 PixelOfficeSceneState
@@ -92,7 +156,24 @@ State này phải được derive từ kết hợp của:
 
 Đây là quyết định kiến trúc quan trọng nhất để animation phản ánh chính xác workflow thực tế.
 
-### 3.3. Animation không được block workflow
+### 3.3. Chuẩn hóa status model trong cùng upgrade
+
+Việc chuẩn hóa trạng thái được triển khai cùng Pixel Office, không để thành technical debt riêng sau này.
+
+Phạm vi gồm:
+
+1. Xác định `OrchestrationStatus` canonical chỉ chứa lifecycle state tổng thể.
+2. Không phát sinh mới `reviewing`/`reworking` như global status.
+3. Tạo contract `WorkflowActivity`/`ActorActivity` dùng cho Pixel Office và tests.
+4. Derive activity từ run phase, subtask state, review verdict, event, approval và question.
+5. Hỗ trợ compatibility với dữ liệu legacy nếu database/workspace cũ từng chứa `reviewing` hoặc `reworking`:
+   - `reviewing` legacy -> normalize về `executing` + derived review activity.
+   - `reworking` legacy -> normalize về `executing` + derived rework activity.
+6. Chỉ xóa hoàn toàn hai giá trị legacy khỏi public/shared type sau khi migration/normalization tests chứng minh không phá workspace cũ.
+
+Không được dùng Pixel Office làm lý do để thay đổi semantics nghiệp vụ của orchestrator. Core vẫn quyết định lifecycle; activity layer chỉ diễn tả chi tiết những gì đang xảy ra bên trong lifecycle đó.
+
+### 3.4. Animation không được block workflow
 
 Animation queue chỉ phục vụ UI.
 
@@ -382,7 +463,16 @@ Không nên thêm Canvas ngay khi chưa có nhu cầu thực tế.
 ```ts
 interface PixelOfficeSceneState {
   orchestrationId: string | null;
-  mode:
+  globalStatus:
+    | "idle"
+    | "planning"
+    | "executing"
+    | "adjudicating"
+    | "reporting"
+    | "paused"
+    | "failed"
+    | "done";
+  dominantActivity:
     | "idle"
     | "planning"
     | "dispatching"
@@ -391,9 +481,12 @@ interface PixelOfficeSceneState {
     | "adjudicating"
     | "reworking"
     | "reporting"
-    | "paused"
+    | "waiting_approval"
+    | "waiting_user"
+    | "stopping"
     | "failed"
     | "done";
+  activities: PixelActivityState[];
   leader: PixelActorState | null;
   actors: PixelActorState[];
   desks: PixelDeskState[];
@@ -402,6 +495,20 @@ interface PixelOfficeSceneState {
   notifications: PixelNotificationState[];
   transitions: PixelTransition[];
 }
+```
+
+`dominantActivity` chỉ dùng để chọn ambience/scene emphasis tổng thể. Nó không được dùng để thay thế `activities`, vì nhiều activity có thể đồng thời tồn tại trong một orchestration.
+
+Ví dụ hợp lệ:
+
+```text
+globalStatus = executing
+dominantActivity = reviewing
+
+activities:
+- worker-a -> implementing
+- reviewer-b -> reviewing
+- worker-c -> reworking
 ```
 
 Đây chỉ là contract đề xuất. Tên/type cuối cùng cần được điều chỉnh theo conventions của repo khi implementation.
@@ -922,6 +1029,28 @@ Tên cuối cùng cần kiểm tra conventions/build pipeline khi bắt đầu i
 
 ## 23. File impact dự kiến
 
+### `packages/memory/src/types.ts`
+
+Thay đổi trong cùng upgrade:
+
+- Chuẩn hóa contract `OrchestrationStatus` theo lifecycle state tổng thể.
+- Deprecate rồi loại `reviewing`/`reworking` khỏi global status sau khi compatibility path được kiểm chứng.
+- Nếu cần shared type, thêm `WorkflowActivity` ở tầng phù hợp thay vì tiếp tục mở rộng global status.
+
+Phải có test cho legacy normalization trước khi remove giá trị cũ khỏi type/runtime parsing.
+
+### `packages/core/src/orchestrator.ts`
+
+Nguyên tắc:
+
+- Không thêm các assignment `status: "reviewing"` hoặc `status: "reworking"` chỉ để phục vụ UI.
+- Giữ state machine lifecycle theo `planning -> executing -> adjudicating -> reporting` cùng các nhánh `paused/failed/done`.
+- Review vẫn được nhận diện bằng `run.phase === "review"`, subtask/review data.
+- Rework vẫn được nhận diện bằng adjudication decision + replacement subtask + cycle metadata.
+- Bổ sung helper/normalization tại boundary nếu cần đọc orchestration legacy.
+
+Tests phải chứng minh nhiều implementer/reviewer/rework activity có thể tồn tại đồng thời trong một orchestration `executing`.
+
 ### `packages/cli/src/ui-page.ts`
 
 Thay đổi:
@@ -957,6 +1086,8 @@ Mới:
 - desk allocation
 - path movement
 - inspector integration
+- workflow activity derivation
+- legacy status normalization at the UI boundary nếu backend chưa normalize trước
 
 ### `packages/cli/src/commands/routes/workforce.ts`
 
@@ -981,6 +1112,9 @@ Dự kiến liên quan:
 - `packages/cli/src/commands/ui.test.ts`
 - `packages/cli/src/commands/ui-routes.test.ts` nếu API thay đổi
 - test mới cho office state reducer/transition logic
+- test canonical `OrchestrationStatus` + `WorkflowActivity`
+- test legacy `reviewing/reworking` normalization
+- test concurrent implementing + reviewing + reworking activities
 
 ## 24. Event usage strategy
 
@@ -1206,6 +1340,8 @@ Mục tiêu:
 - chốt scene zones
 - chốt actor/desk/task packet model
 - chốt mapping backend -> scene
+- chốt boundary giữa `OrchestrationStatus` và `WorkflowActivity`
+- xác định migration/normalization path cho legacy `reviewing/reworking`
 - tạo static Pixel Office shell
 
 Deliverable:
@@ -1220,6 +1356,8 @@ Mục tiêu:
 
 - `normalizeBoardSnapshot`
 - `deriveOfficeState`
+- canonical orchestration status normalization
+- derive nhiều concurrent `WorkflowActivity` thay vì một global review/rework state
 - stable actor identity
 - stable desk assignment
 
@@ -1231,6 +1369,10 @@ Tests:
 - reworking derived từ rework subtask/review
 - reporting
 - done/failed/paused
+- legacy `reviewing` -> `executing` + review activity
+- legacy `reworking` -> `executing` + rework activity
+- implementing + reviewing song song
+- implementing + reworking song song
 
 ### Phase 2 - Core movement và workflow
 
@@ -1434,6 +1576,10 @@ Pixel Office chỉ được coi là hoàn thành khi đáp ứng tất cả các
 18. Backend orchestration behavior không bị thay đổi chỉ để phục vụ animation.
 19. Classic Runs có thể bật lại trong rollout phase nếu cần debug/rollback.
 20. Performance vẫn mượt với số agent song song thực tế của orchestrator.
+21. Global `OrchestrationStatus` không cần đổi sang `reviewing`/`reworking` để Pixel Office hiển thị đúng review/rework.
+22. Một orchestration `executing` có thể đồng thời hiển thị implementer đang code, reviewer đang review và worker khác đang rework.
+23. Legacy orchestration có status `reviewing`/`reworking`, nếu tồn tại, được normalize an toàn và không làm crash/mất workflow state.
+24. Tests phân biệt rõ lifecycle status và actor/workflow activity để tránh hai lớp trạng thái bị nhập lại với nhau sau này.
 
 ## 38. Rủi ro và cách xử lý
 
@@ -1445,13 +1591,17 @@ Giải pháp:
 - events hỗ trợ fidelity
 - reconciliation + fast-forward
 
-### Rủi ro 2: `reviewing/reworking` không được backend set đầy đủ
+### Rủi ro 2: Global status và activity semantics bị trộn lẫn
 
 Giải pháp:
 
+- chuẩn hóa `OrchestrationStatus` thành lifecycle state
+- chuyển `reviewing/reworking` sang activity semantics
 - derived scene state từ phase/runs/reviews/subtasks/events
+- compatibility normalization cho dữ liệu legacy
+- test concurrent activities
 
-Không sửa core state machine chỉ để animation đẹp hơn trong V1.
+Không sửa core state machine bằng cách ép review/rework thành global state chỉ để animation đẹp hơn.
 
 ### Rủi ro 3: Animation backlog
 
@@ -1518,24 +1668,26 @@ Các mục này có thể xem xét sau khi Pixel Office core đã ổn định.
 Khi bắt đầu code, nên thực hiện theo thứ tự:
 
 ```text
-1. Static office shell
-2. Board snapshot normalizer
-3. Derived scene state
-4. Stable actors/desks
-5. Leader planning
-6. Dispatch
-7. Implementing
-8. Review handoff
-9. Reviewer + verdict
-10. Adjudication
-11. Rework loop
-12. Reporting/done
-13. Approval/question/error/pause
-14. Inspector parity
-15. Reconciliation/queue hardening
-16. Sprite polish
-17. Responsive/accessibility/performance
-18. Default rollout
+1. Chuẩn hóa OrchestrationStatus vs WorkflowActivity contract
+2. Legacy reviewing/reworking normalization tests
+3. Static office shell
+4. Board snapshot normalizer
+5. Derived concurrent activity state
+6. Stable actors/desks
+7. Leader planning
+8. Dispatch
+9. Implementing
+10. Review handoff
+11. Reviewer + verdict
+12. Adjudication
+13. Rework loop
+14. Reporting/done
+15. Approval/question/error/pause
+16. Inspector parity
+17. Reconciliation/queue hardening
+18. Sprite polish
+19. Responsive/accessibility/performance
+20. Default rollout
 ```
 
 Không nên bắt đầu bằng sprite polish trước khi state reducer và transition semantics ổn định.
@@ -1564,3 +1716,12 @@ Leader thinks
 
 Mọi animation phải luôn hội tụ về trạng thái backend thật, vẫn giữ được khả năng quản lý run hiện tại, và không làm orchestration phụ thuộc vào tốc độ hoặc trạng thái của UI.
 
+Ngoài ra, upgrade này phải để lại một status architecture rõ ràng:
+
+```text
+OrchestrationStatus = lifecycle tổng thể
+WorkflowActivity    = activity chi tiết, có thể chạy song song
+PixelOfficeScene    = biểu diễn trực quan của cả hai lớp trên
+```
+
+`reviewing` và `reworking` phải được biểu diễn chính xác ở activity layer; không được yêu cầu global orchestration chuyển sang hai status đó mới có thể quan sát hoặc animate workflow.
