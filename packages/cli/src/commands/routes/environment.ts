@@ -54,6 +54,12 @@ import {
   type AgentKind,
 } from "@agent-bridge/memory";
 
+const cliApprovalPolicyValues = {
+  codex: new Set(["default", "auto-review", "never", "bypass"]),
+  antigravity: new Set(["default", "accept-edits", "plan", "bypass"]),
+  claude: new Set(["manual", "auto", "accept-edits", "dont-ask", "plan", "bypass"]),
+} as const;
+
 // Environment and one-off actions: optional CLI installs, agent hooks, the
 // file watcher, graph config, the cache report, the optimize baseline and the
 // handoff packet.
@@ -201,9 +207,26 @@ export async function routePostConfigGraph(ctx: RouteContext): Promise<void> {
     graph.includePaths = parseList(optionalString(body.includePaths));
   if (body.ignorePaths != null)
     graph.ignorePaths = parseList(optionalString(body.ignorePaths));
-  writeConfig({ ...config, graph });
+  writeConfig({ ...config, graph }, cwd);
   sendJson(res, 200, { graph });
   return;
+}
+
+export async function routePostConfigCliApprovals(ctx: RouteContext): Promise<void> {
+  const { req, res, cwd } = ctx;
+  const body = await readJson(req);
+  const config = readConfig(cwd);
+  const policies = { ...(config.cliApprovalPolicies ?? {}) };
+  for (const provider of ["codex", "antigravity", "claude"] as const) {
+    if (body[provider] === undefined) continue;
+    const value = requiredString(body[provider], provider);
+    if (!cliApprovalPolicyValues[provider].has(value as never)) {
+      throw new Error(`Invalid ${provider} approval policy: ${value}`);
+    }
+    policies[provider] = value as never;
+  }
+  writeConfig({ ...config, cliApprovalPolicies: policies }, cwd);
+  sendJson(res, 200, { cliApprovalPolicies: policies });
 }
 
 export async function routePostWatchStart(ctx: RouteContext): Promise<void> {

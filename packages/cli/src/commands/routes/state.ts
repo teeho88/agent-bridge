@@ -65,6 +65,15 @@ export async function routeGetState(ctx: RouteContext): Promise<void> {
       const activeTaskId = resolveActiveTaskId(store, cwd);
       const config = readConfig(cwd);
       const tasks = store.listTasks(30);
+      // Handoff History is repository-wide, so it must not inherit either the
+      // selected-task filter or the shorter task list used by the main board.
+      const latestTaskHandoffs = store
+        .listTasks(1_000_000)
+        .flatMap((task) => {
+          const handoff = store.getLatestHandoff(task.id);
+          return handoff ? [{ task, handoff }] : [];
+        })
+        .sort((a, b) => b.handoff.createdAt.localeCompare(a.handoff.createdAt));
       const currentTask = activeTaskId
         ? store.getTask(activeTaskId)
         : undefined;
@@ -236,6 +245,7 @@ export async function routeGetState(ctx: RouteContext): Promise<void> {
         memories,
         compiledContext,
         handoff,
+        latestTaskHandoffs,
         portableHandoff,
         claudeHookInstalled,
         claudeHookStatus,
@@ -280,6 +290,7 @@ export async function routeGetState(ctx: RouteContext): Promise<void> {
       dispatchRuns: [],
       activeSessionEvents: [],
       handoff: undefined,
+      latestTaskHandoffs: [],
       portableHandoff: emptyPortableHandoffState(),
       claudeHookInstalled: getClaudeHookStatus(cwd).installed,
       claudeHookStatus: getClaudeHookStatus(cwd),

@@ -28,7 +28,11 @@ import {
   mustGetOrchestrationForUi,
 } from "./lookups.js";
 import {
+  markTaskGoalOmitted,
+} from "../../task-suggestions.js";
+import {
   optionalCount,
+  optionalBoolean,
   optionalString,
   requiredString,
 } from "./validation.js";
@@ -64,6 +68,7 @@ export async function routePostWorkforceOrchestrationStart(ctx: RouteContext): P
   const store = openStore(cwd);
   try {
     const prompt = requiredString(body.prompt, "prompt");
+    const createGoal = optionalBoolean(body.createGoal, true);
     // Only the starting position: the Orchestration panel can move this at
     // any point during the run via /api/workforce/orchestration/autonomy.
     const autonomy = optionalString(body.autonomy) ?? "manual";
@@ -85,7 +90,12 @@ export async function routePostWorkforceOrchestrationStart(ctx: RouteContext): P
       // "spawn antigravity ENOENT".
       { command: optionalString(body.leaderCommand) ?? defaultCommandForProvider(leaderProvider) },
     );
-    const task = store.createTask({ title: prompt, goal: prompt, ownerAgent: "codex" });
+    let task = store.createTask({
+      title: prompt,
+      goal: createGoal ? prompt : undefined,
+      ownerAgent: "codex",
+    });
+    if (!createGoal) task = markTaskGoalOmitted(store, task.id, "codex") ?? task;
 
     // The leader can only staff registered, enabled agents, so a ticked
     // provider has to exist in the roster before the first planning turn.

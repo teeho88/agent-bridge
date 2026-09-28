@@ -29,6 +29,13 @@ export function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+export function optionalBoolean(value: unknown, fallback: boolean): boolean {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (value === true || value === "true" || value === "on" || value === 1 || value === "1") return true;
+  if (value === false || value === "false" || value === "off" || value === 0 || value === "0") return false;
+  throw new Error("Expected a boolean value.");
+}
+
 export function requiredSkillScope(value: unknown): SkillScope {
   if (value !== "global" && value !== "repo") {
     throw new Error("scope must be global or repo");

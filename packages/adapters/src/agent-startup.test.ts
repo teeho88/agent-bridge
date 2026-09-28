@@ -16,6 +16,8 @@ describe("agent startup prompts", () => {
     expect(prompt).toContain("agent-bridge context compile --agent codex");
     expect(prompt).not.toContain("agent-bridge session start --agent codex");
     expect(prompt).toContain("Runtime Goal Rules");
+    expect(prompt).toContain("Task intentionally has no runtime goal.");
+    expect(prompt).toContain("do not call `create_goal`");
     expect(prompt).toContain("Create a goal with `create_goal`");
     const taskSection = prompt.indexOf("  TASK\n");
     const goalSection = prompt.indexOf("  GOAL\n", taskSection);

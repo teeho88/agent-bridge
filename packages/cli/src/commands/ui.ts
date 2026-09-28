@@ -10,6 +10,7 @@ import {
   statSync,
 } from "node:fs";
 import {
+  execFile,
   execFileSync,
 } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
@@ -23,6 +24,7 @@ import {
   routeGetCacheReport,
   routePostAntigravityInstallHooks,
   routePostClaudeInstallHooks,
+  routePostConfigCliApprovals,
   routePostConfigGraph,
   routePostHandoffSave,
   routePostOptimizeBaseline,
@@ -135,6 +137,12 @@ import { applyTaskLabelSuggestion } from "../task-suggestions.js";
 import { refreshBriefs } from "../graph-brief.js";
 
 type JsonBody = Record<string, unknown>;
+type BrowserLauncher = (
+  command: string,
+  args: string[],
+  options: { windowsHide: boolean },
+  callback: (error: Error | null) => void,
+) => unknown;
 
 
 
@@ -275,8 +283,10 @@ function listenUiServer(
     const address = server.address();
     const boundPort =
       typeof address === "object" && address ? address.port : port;
-    console.log(`agent-bridge UI running at http://127.0.0.1:${boundPort}`);
+    const url = `http://127.0.0.1:${boundPort}`;
+    console.log(`agent-bridge UI running at ${url}`);
     console.log(`Workspace: ${project}`);
+    openUiInBrowser(url);
   };
   const onError = (error: NodeJS.ErrnoException): void => {
     server.off("listening", onListening);
@@ -298,6 +308,29 @@ function listenUiServer(
   server.once("error", onError);
   server.listen(port, "127.0.0.1");
 }
+
+export function browserOpenCommand(
+  url: string,
+  platform = process.platform,
+): { command: string; args: string[] } {
+  if (platform === "win32") {
+    return { command: "cmd.exe", args: ["/d", "/c", "start", "", url] };
+  }
+  return platform === "darwin"
+    ? { command: "open", args: [url] }
+    : { command: "xdg-open", args: [url] };
+}
+
+export function openUiInBrowser(
+  url: string,
+  launcher: BrowserLauncher = execFile as BrowserLauncher,
+): void {
+  const { command, args } = browserOpenCommand(url);
+  launcher(command, args, { windowsHide: true }, (error) => {
+    if (error) console.warn(`Could not open the UI in a browser: ${error.message}`);
+  });
+}
+
 export function parseUiPort(value: string): number {
   const port = Number(value);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -462,6 +495,7 @@ const ROUTES: RouteTable = {
   "POST /api/graph/brief-auto-all": routePostGraphBriefAutoAll,
   "POST /api/graph/brief": routePostGraphBrief,
   "POST /api/config/graph": routePostConfigGraph,
+  "POST /api/config/cli-approvals": routePostConfigCliApprovals,
   "POST /api/watch/start": routePostWatchStart,
   "POST /api/watch/stop": routePostWatchStop,
   "POST /api/optimize/baseline": routePostOptimizeBaseline,

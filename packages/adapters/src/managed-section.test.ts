@@ -32,6 +32,9 @@ describe("orchestratedRunSection", () => {
     for (const section of [claudeManagedSection(), codexManagedSection(), antigravityRulesSection()]) {
       expect(section).toContain("AGENT_BRIDGE_SPAWNED_RUN");
       expect(section).toContain(".agent-memory/context/");
+      expect(section).toContain("Temporary Artifact Cleanup");
+      expect(section).toContain(".agent-tmp/<agent-or-task>/");
+      expect(section).toContain("Never remove pre-existing files");
       expect(section).toContain("Permission Escalation Rules");
       expect(section).toContain("ask the user for the minimum permission needed");
       expect(section).toContain("retry the blocked action after approval");

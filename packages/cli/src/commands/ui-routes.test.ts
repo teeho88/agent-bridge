@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { prepareUiWorkspace, serveRequest, uiRouteManifest } from "./ui.js";
 import { callRoute } from "./ui-route-harness.js";
+import { prepareAgentTerminalTask } from "./routes/session.js";
 import { openStore } from "../workspace.js";
 
 // Route-level coverage. Every assertion goes through `serveRequest`, the same
@@ -84,6 +85,42 @@ describe("/api/state", () => {
       "Route harness task",
     );
   });
+
+  it("returns the latest handoff for every repository task", async () => {
+    const first = await call("POST", "/api/task/start", {
+      title: "First handoff task",
+      agent: "codex",
+    });
+    const second = await call("POST", "/api/task/start", {
+      title: "Second handoff task",
+      agent: "claude",
+    });
+    const firstTaskId = first.json<{ task: { id: string } }>().task.id;
+    const secondTaskId = second.json<{ task: { id: string } }>().task.id;
+
+    const store = openStore(root);
+    try {
+      store.upsertTaskHandoff({ taskId: firstTaskId, summary: "First latest handoff" });
+      store.upsertTaskHandoff({ taskId: secondTaskId, summary: "Second latest handoff" });
+    } finally {
+      store.close();
+    }
+
+    const state = (await call("GET", "/api/state")).json<{
+      latestTaskHandoffs: Array<{
+        task: { id: string; title: string };
+        handoff: { taskId: string; summary: string };
+      }>;
+    }>();
+    expect(state.latestTaskHandoffs).toHaveLength(2);
+    expect(state.latestTaskHandoffs.map((entry) => [
+      entry.task.title,
+      entry.handoff.summary,
+    ])).toEqual(expect.arrayContaining([
+      ["First handoff task", "First latest handoff"],
+      ["Second handoff task", "Second latest handoff"],
+    ]));
+  });
 });
 
 describe("task routes", () => {
@@ -118,6 +155,27 @@ describe("task routes", () => {
     const state = (await call("GET", "/api/state")).json<{ tasks: unknown[] }>();
     expect(state.tasks).toHaveLength(0);
   });
+
+  it("keeps a deliberately disabled task goal empty", async () => {
+    const created = await call("POST", "/api/task/start", {
+      title: "Goal-free task",
+      goal: "This must be ignored",
+      createGoal: false,
+      agent: "codex",
+    });
+    expect(created.status).toBe(200);
+    const taskId = created.json<{ task: { id: string; goal?: string } }>().task.id;
+
+    const store = openStore(root);
+    try {
+      expect(store.getTask(taskId)?.goal).toBeUndefined();
+      expect(store.listMemoriesForTask(taskId, 20).some(
+        (memory) => memory.tags.includes("task-goal-omitted"),
+      )).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
 });
 
 describe("memory routes", () => {
@@ -148,6 +206,85 @@ describe("watch routes", () => {
     const res = await call("POST", "/api/watch/stop");
     expect(res.status).toBe(200);
     expect(res.json<{ watcherRunning: boolean }>().watcherRunning).toBe(false);
+  });
+});
+
+describe("agent terminal task selection", () => {
+  it("continues an existing task without transferring ownership by default", () => {
+    const store = openStore(root);
+    try {
+      const existing = store.createTask({
+        title: "Claude handoff",
+        ownerAgent: "claude",
+      });
+      store.updateTask(existing.id, { status: "done" });
+      const result = prepareAgentTerminalTask(store, "codex", existing.id);
+
+      expect(result.continued).toBe(true);
+      expect(result.task.id).toBe(existing.id);
+      expect(result.task.status).toBe("in_progress");
+      expect(result.task.ownerAgent).toBe("claude");
+      expect(store.listTasks(10)).toHaveLength(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("can transfer ownership, while an open without taskId still creates a task", () => {
+    const store = openStore(root);
+    try {
+      const existing = store.createTask({ title: "Transfer me", ownerAgent: "claude" });
+      const continued = prepareAgentTerminalTask(store, "codex", existing.id, true);
+      const created = prepareAgentTerminalTask(store, "antigravity");
+
+      expect(continued.task.ownerAgent).toBe("codex");
+      expect(created.continued).toBe(false);
+      expect(created.task.id).not.toBe(existing.id);
+      expect(created.task.ownerAgent).toBe("antigravity");
+      expect(store.listTasks(10)).toHaveLength(2);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("can create a Work Board terminal task without prompt-seeding a goal", () => {
+    const store = openStore(root);
+    try {
+      const created = prepareAgentTerminalTask(store, "codex", undefined, false, false);
+
+      expect(created.task.goal).toBeUndefined();
+      expect(store.listMemoriesForTask(created.task.id, 20).some(
+        (memory) => memory.tags.includes("task-goal-omitted"),
+      )).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("CLI approval policy routes", () => {
+  it("persists valid policies and returns them through dashboard state", async () => {
+    const saved = await call("POST", "/api/config/cli-approvals", {
+      codex: "never",
+      antigravity: "plan",
+      claude: "accept-edits",
+    });
+    expect(saved.status).toBe(200);
+
+    const state = (await call("GET", "/api/state")).json<{
+      config: { cliApprovalPolicies: Record<string, string> };
+    }>();
+    expect(state.config.cliApprovalPolicies).toEqual({
+      codex: "never",
+      antigravity: "plan",
+      claude: "accept-edits",
+    });
+  });
+
+  it("rejects policy values unsupported by the selected CLI", async () => {
+    const res = await call("POST", "/api/config/cli-approvals", { antigravity: "auto-review" });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.body).toContain("Invalid antigravity approval policy");
   });
 });
 
@@ -224,6 +361,7 @@ describe("graph routes", () => {
 // which is what the sweep below looks for - a 4xx/5xx from validation still
 // proves the handler was found and ran.
 const SWEEPABLE_ROUTES: Array<[string, string]> = [
+  ["POST", "/api/config/cli-approvals"],
   ["POST", "/api/config/graph"],
   ["POST", "/api/context/compile"],
   ["POST", "/api/context/save"],

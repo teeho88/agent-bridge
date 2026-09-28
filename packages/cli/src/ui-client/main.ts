@@ -156,6 +156,13 @@ const els: Record<string, any> = {
   defaultAgentPresetsModal: elById('defaultAgentPresetsModal'),
   defaultAgentPresetsSummary: elById('defaultAgentPresetsSummary'),
   defaultAgentSelectAll: elById('defaultAgentSelectAll'),
+  codexApprovalPolicy: elById('codexApprovalPolicy'),
+  codexApprovalPolicyDescription: elById('codexApprovalPolicyDescription'),
+  antigravityApprovalPolicy: elById('antigravityApprovalPolicy'),
+  antigravityApprovalPolicyDescription: elById('antigravityApprovalPolicyDescription'),
+  claudeApprovalPolicy: elById('claudeApprovalPolicy'),
+  claudeApprovalPolicyDescription: elById('claudeApprovalPolicyDescription'),
+  cliApprovalSettingsStatus: elById('cliApprovalSettingsStatus'),
   taskDetailModal: elById('taskDetailModal'),
   taskDetailTitle: elById('taskDetailTitle'),
   taskDetailBody: elById('taskDetailBody'),
@@ -165,6 +172,7 @@ let live = true;
 let lastFingerprint = '';
 let graphLoaded = false;
 let graphSettingsTouched = false;
+let cliApprovalSettingsTouched = false;
 let taskEditTouched = false;
 let contextEditTouched = false;
 let memoryImportanceTouched = false;
@@ -174,6 +182,34 @@ let lastState = null;
 let selectedLiveTaskId = '';
 let graphAnim = null;
 let selectedGraphPath = '';
+const workboardCreateGoalStorageKey = 'agent-bridge.workboardCreateGoal';
+try {
+  const savedCreateGoal = window.localStorage.getItem(workboardCreateGoalStorageKey);
+  const input = elById('workboardCreateGoal');
+  if (input && savedCreateGoal !== null) input.checked = savedCreateGoal === 'true';
+} catch {}
+const cliApprovalPolicyDescriptions = {
+  codex: {
+    'default': 'sandbox_mode=workspace-write · approval_policy=on-request · approvals_reviewer=user. Codex can edit this repository and asks you before an escalation; a headless run may pause while waiting.',
+    'auto-review': 'sandbox_mode=workspace-write · approval_policy=on-request · approvals_reviewer=auto_review. A reviewer agent decides escalation requests automatically while writes remain limited to this workspace.',
+    'never': 'sandbox_mode=workspace-write · approval_policy=never. Codex runs unattended inside this workspace; requests for extra permission are rejected instead of prompting.',
+    'bypass': 'Danger: skips every approval and disables the sandbox, giving the agent unrestricted machine access.'
+  },
+  antigravity: {
+    'default': 'Uses the Agy CLI default. A headless run may stop if an action needs an interactive approval.',
+    'accept-edits': 'Allows file edits automatically; other protected tools can still require approval.',
+    'plan': 'Planning-only mode: the agent can investigate and propose changes but cannot implement them.',
+    'bypass': 'Danger: automatically accepts every tool permission request without prompting.'
+  },
+  claude: {
+    'manual': 'Uses manual approvals. Because spawned runs are headless, a required prompt can stop the run.',
+    'auto': 'Lets Claude automatically decide when an action can proceed or needs tighter permission handling.',
+    'accept-edits': 'Automatically permits file edits; commands and other sensitive tools may still need approval.',
+    'dont-ask': 'Never opens approval prompts; tools without an existing allow rule are denied instead.',
+    'plan': 'Read-and-plan mode: Claude can analyze the repository but cannot edit files or run modifying tools.',
+    'bypass': 'Danger: bypasses all permission checks and allows every available tool without prompting.'
+  }
+};
 // Task ids that have an orchestration behind them. A request raised on one
 // of these belongs to the leader loop, not the Work Board, so its toast has
 // to open the Orchestration view.
@@ -210,11 +246,12 @@ async function load(force = false) {
       memories: state.memories.map(m => m.id + m.updatedAt).join('|'),
       compiledContextLength: (state.compiledContext || '').length,
       handoff: state.handoff && state.handoff.id,
-      handoffHistory: (state.portableHandoff?.history || []).map(item => item.path).join('|'),
+      handoffHistory: (state.latestTaskHandoffs || []).map(item => [item.task.id, item.task.updatedAt, item.handoff.id].join(':')).join('|'),
       tools: (state.optionalTools || []).map(t => t.name + t.installed).join('|'),
       skills: (state.skills || []).map(skill => skill.scope + ':' + skill.name + ':' + skill.updatedAt).join('|'),
       tokenStack: (state.tokenStack || []).map(t => t.id + t.enabled + t.installed).join('|'),
       graphStats: JSON.stringify(state.graphStats || {}),
+      cliApprovalPolicies: JSON.stringify(state.config.cliApprovalPolicies || {}),
       optimizeStats: JSON.stringify(state.optimizeStats || {}),
       work: JSON.stringify({
         lanes: state.taskLanes || [],
@@ -339,11 +376,10 @@ function renderState(state) {
     ? state.repoMemoryCandidates.map(renderMemoryCandidate).join('')
     : '<div class="muted">Inbox is clear. Session discoveries that look repository-wide will appear here for review.</div>';
   const activeHandoff = selected?.handoff || state.handoff;
-  const portableHandoff = selected?.portableHandoff || state.portableHandoff || { history: [] };
   els.handoff.innerHTML = activeHandoff ? renderHandoff(activeHandoff, current) : '<div class="muted">No current handoff.</div>';
-  els.handoffHistory.innerHTML = portableHandoff.history?.length
-    ? portableHandoff.history.map(renderHandoffHistory).join('')
-    : '<div class="muted">No archived handoffs for this task.</div>';
+  els.handoffHistory.innerHTML = state.latestTaskHandoffs?.length
+    ? state.latestTaskHandoffs.map(renderLatestTaskHandoff).join('')
+    : '<div class="muted">No handoffs in this repository.</div>';
   populateTaskSelects(state.tasks || [], current?.id);
   populateWorkTaskSelects(state.tasks || [], current?.id);
   renderWorkState(state, current?.id);
@@ -378,6 +414,24 @@ function renderState(state) {
     els.graphIncludePaths.value = (g.includePaths || []).join('\n');
     els.graphIgnorePaths.value = (g.ignorePaths || []).join('\n');
   }
+  if (!cliApprovalSettingsTouched) {
+    const policies = (state.config && state.config.cliApprovalPolicies) || {};
+    els.codexApprovalPolicy.value = policies.codex || 'default';
+    els.antigravityApprovalPolicy.value = policies.antigravity || 'bypass';
+    els.claudeApprovalPolicy.value = policies.claude || 'bypass';
+  }
+  renderCliApprovalPolicyDescriptions();
+}
+
+function renderCliApprovalPolicyDescriptions() {
+  const bindings = [
+    ['codex', els.codexApprovalPolicy, els.codexApprovalPolicyDescription],
+    ['antigravity', els.antigravityApprovalPolicy, els.antigravityApprovalPolicyDescription],
+    ['claude', els.claudeApprovalPolicy, els.claudeApprovalPolicyDescription]
+  ];
+  bindings.forEach(([provider, select, description]) => {
+    if (select && description) description.textContent = cliApprovalPolicyDescriptions[provider][select.value] || '';
+  });
 }
 
 function renderTokenStats(stats) {
@@ -848,10 +902,19 @@ function renderHandoff(handoff, task) {
     '<div class="meta" style="margin-top:12px">.handoff/CURRENT.md</div></div>';
 }
 
-function renderHandoffHistory(item) {
-  return '<div class="card"><div class="toolbar" style="justify-content:space-between"><strong>' + escapeHtml(item.title) + '</strong><span class="pill">' + escapeHtml(item.state) + '</span></div>' +
-    '<div class="meta">' + escapeHtml(item.date) + '</div><div class="memory-content" style="margin-top:8px">' + escapeHtml(item.summary || 'No current-state summary') + '</div>' +
-    '<div class="meta" style="margin-top:8px">' + escapeHtml(item.path) + '</div></div>';
+function renderLatestTaskHandoff(item) {
+  const task = item.task || {};
+  const handoff = item.handoff || {};
+  const agents = ['codex', 'claude', 'antigravity'];
+  const defaultAgent = agents.includes(task.ownerAgent) ? task.ownerAgent : 'codex';
+  const agentOptions = agents.map(agent => '<option value="' + agent + '"' + (agent === defaultAgent ? ' selected' : '') + '>' + (agent === 'antigravity' ? 'Antigravity' : agent[0].toUpperCase() + agent.slice(1)) + '</option>').join('');
+  return '<div class="card handoff-history-card"><div class="toolbar" style="justify-content:space-between"><strong>' + escapeHtml(task.title || handoff.taskId) + '</strong><span class="pill">' + escapeHtml(task.status || 'active') + '</span></div>' +
+    '<div class="meta">' + escapeHtml(handoff.createdAt || '') + ' | Created by ' + escapeHtml(handoff.fromAgent || 'unknown') + '</div>' +
+    '<div class="memory-content" style="margin-top:8px">' + escapeHtml(handoff.summary || 'No current-state summary') + '</div>' +
+    '<div class="toolbar" style="margin-top:12px"><label class="meta">Continue with <select class="handoff-agent-select">' + agentOptions + '</select></label>' +
+    '<label class="meta handoff-transfer-label"><input class="handoff-transfer-owner" type="checkbox"> Transfer ownership</label>' +
+    '<button class="secondary continue-handoff" data-task-id="' + escapeHtml(task.id || handoff.taskId) + '" type="button">Continue</button>' +
+    '<span class="meta handoff-continue-status"></span></div></div>';
 }
 
 function renderTool(tool) {
@@ -940,6 +1003,34 @@ bindForm('compileForm', '/api/context/compile', { reset: false, onSuccess: data 
 } });
 bindForm('handoffForm', '/api/handoff/save');
 bindForm('laneForm', '/api/orchestration/lane', { reset: false });
+on('workboardCreateGoal', 'change', () => {
+  const input = elById('workboardCreateGoal');
+  try {
+    window.localStorage.setItem(workboardCreateGoalStorageKey, input?.checked ? 'true' : 'false');
+  } catch {}
+});
+onElement(els.codexApprovalPolicy, 'change', () => { cliApprovalSettingsTouched = true; renderCliApprovalPolicyDescriptions(); });
+onElement(els.antigravityApprovalPolicy, 'change', () => { cliApprovalSettingsTouched = true; renderCliApprovalPolicyDescriptions(); });
+onElement(els.claudeApprovalPolicy, 'change', () => { cliApprovalSettingsTouched = true; renderCliApprovalPolicyDescriptions(); });
+on('cliApprovalSettingsForm', 'submit', async event => {
+  event.preventDefault();
+  els.cliApprovalSettingsStatus.textContent = 'Saving...';
+  try {
+    await api('/api/config/cli-approvals', {
+      method: 'POST',
+      body: JSON.stringify({
+        codex: els.codexApprovalPolicy.value,
+        antigravity: els.antigravityApprovalPolicy.value,
+        claude: els.claudeApprovalPolicy.value
+      })
+    });
+    cliApprovalSettingsTouched = false;
+    els.cliApprovalSettingsStatus.textContent = 'Saved.';
+    await load(true);
+  } catch (error) {
+    els.cliApprovalSettingsStatus.innerHTML = '<span class="error">' + escapeHtml(error.message) + '</span>';
+  }
+});
 // Declared up here with providerCommands: syncAgentSetupMode() runs during
 // wiring below, well before the model helpers further down, and a const in
 // their block would still be in its temporal dead zone at that point.
@@ -1125,7 +1216,10 @@ function syncLiveTaskCarousel(smooth = true) {
   if (els.liveTaskNext) els.liveTaskNext.disabled = selectedIndex < 0 || selectedIndex >= cards.length - 1;
   const selectedCard = selectedIndex >= 0 ? cards[selectedIndex] : null;
   if (selectedCard) {
-    requestAnimationFrame(() => selectedCard.scrollIntoView({ behavior: smooth ? 'smooth' : 'auto', inline: 'center', block: 'nearest' }));
+    requestAnimationFrame(() => els.liveTasks.scrollTo({
+      left: selectedCard.offsetLeft - (els.liveTasks.clientWidth - selectedCard.clientWidth) / 2,
+      behavior: smooth ? 'smooth' : 'auto'
+    }));
   }
 }
 
@@ -1219,18 +1313,23 @@ document.addEventListener('click', async event => {
     }
     return;
   }
-  const openAgentTerminal = closestFrom(event.target, '.open-agent-terminal');
+  const openAgentTerminal = closestFrom(event.target, '.open-agent-terminal, .continue-handoff');
   if (openAgentTerminal) {
-    const agent = openAgentTerminal.dataset.agent || '';
+    const handoffCard = closestFrom(openAgentTerminal, '.handoff-history-card');
+    const taskId = openAgentTerminal.dataset.taskId || '';
+    const agent = openAgentTerminal.dataset.agent || qs(handoffCard, '.handoff-agent-select')?.value || '';
+    const transferOwnership = Boolean(qs(handoffCard, '.handoff-transfer-owner')?.checked);
+    const createGoal = taskId ? true : Boolean(elById('workboardCreateGoal')?.checked);
     openAgentTerminal.disabled = true;
-    const status = elById('agentTerminalStatus');
-    if (status) status.textContent = 'Opening ' + agent + ' terminal...';
+    const status = qs(handoffCard, '.handoff-continue-status') || elById('agentTerminalStatus');
+    if (status) status.textContent = taskId ? 'Continuing with ' + agent + '...' : 'Opening ' + agent + ' terminal...';
     try {
       const data = await api('/api/session/terminal', {
         method: 'POST',
-        body: JSON.stringify({ agent })
+        body: JSON.stringify({ agent, createGoal, ...(taskId ? { taskId, transferOwnership } : {}) })
       });
-      if (status) status.textContent = 'Opened ' + agent + ' · window ID ' + (data.terminal.windowId || data.sessionId);
+      if (taskId) selectedLiveTaskId = data.task.id;
+      if (status) status.textContent = (data.continued ? 'Continued ' : 'Opened ') + agent + ' · window ID ' + (data.terminal.windowId || data.sessionId);
       await load(true);
     } catch (error) {
       if (status) status.textContent = 'Open failed: ' + (error.message || String(error));
@@ -2116,6 +2215,7 @@ on('orchestratorStartForm', 'submit', async event => {
       // 0 is a deliberate setting ("never stop to ask"), so an empty box
       // is the only thing that falls back to the server default.
       maxQuestionRounds: form.maxQuestionRounds.value === '' ? undefined : Number(form.maxQuestionRounds.value),
+      createGoal: form.createGoal.checked,
       // Always send the exact checked set. "All currently visible" is a
       // concrete team choice: omitting it prevented the backend from
       // provisioning those providers and made the leader fall back to the

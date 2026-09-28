@@ -13,9 +13,11 @@ import { describe, expect, it, vi } from "vitest";
 import {
   answeredQuestionRouting,
   assertUiPageFreshness,
+  browserOpenCommand,
   filterWorkBoardSessionEvents,
   inferContextAgent,
   isAutoRunning,
+  openUiInBrowser,
   parseUiPort,
   prepareUiWorkspace,
   readPortableHandoffState,
@@ -111,6 +113,34 @@ describe("assertUiPageFreshness", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("browserOpenCommand", () => {
+  it("uses the platform browser launcher for the dashboard URL", () => {
+    const url = "http://127.0.0.1:4310";
+
+    expect(browserOpenCommand(url, "win32")).toEqual({
+      command: "cmd.exe",
+      args: ["/d", "/c", "start", "", url],
+    });
+    expect(browserOpenCommand(url, "darwin")).toEqual({ command: "open", args: [url] });
+    expect(browserOpenCommand(url, "linux")).toEqual({ command: "xdg-open", args: [url] });
+  });
+
+  it("launches the default browser without delaying the UI server", () => {
+    const launcher = vi.fn();
+    const url = "http://127.0.0.1:4310";
+    const expected = browserOpenCommand(url);
+
+    openUiInBrowser(url, launcher);
+
+    expect(launcher).toHaveBeenCalledWith(
+      expected.command,
+      expected.args,
+      { windowsHide: true },
+      expect.any(Function),
+    );
   });
 });
 
@@ -509,6 +539,14 @@ describe("dashboard overview", () => {
     expect(html).toContain('class="secondary open-agent-terminal" data-agent="claude"');
     expect(html).toContain('class="secondary open-agent-terminal" data-agent="codex"');
     expect(html).toContain('class="secondary open-agent-terminal" data-agent="antigravity"');
+    expect(html).toContain('id="workboardCreateGoal"');
+    expect(clientJs).toContain("agent-bridge.workboardCreateGoal");
+    expect(clientJs).toContain("window.localStorage.setItem(workboardCreateGoalStorageKey");
+    expect(html).toContain("{ agent, createGoal,");
+    expect(html).toContain('class="secondary continue-handoff"');
+    expect(html).toContain('class="handoff-agent-select"');
+    expect(html).toContain('class="handoff-transfer-owner"');
+    expect(html).toContain("{ taskId, transferOwnership }");
     expect(html).toContain("/api/session/terminal");
     expect(html).toContain("window ID ");
     expect(html).toContain("Each terminal gets its own live task card and window ID.");
@@ -522,7 +560,9 @@ describe("dashboard overview", () => {
     expect(html).toContain("liveTaskNext");
     expect(html).toContain("liveTaskCard");
     expect(html).toContain("selectLiveTask(liveTaskCard.dataset.taskId");
-    expect(html).toContain("scrollIntoView({ behavior: smooth ? 'smooth' : 'auto', inline: 'center'");
+    expect(html).toContain("els.liveTasks.scrollTo({");
+    expect(html).toContain("left: selectedCard.offsetLeft - (els.liveTasks.clientWidth - selectedCard.clientWidth) / 2");
+    expect(html).not.toContain("selectedCard.scrollIntoView");
     expect(html).toContain(".live-task-grid::-webkit-scrollbar { display: none; }");
     expect(html).toContain("tabindex=\"0\" role=\"button\"");
     expect(html).toContain("is-before");
@@ -631,6 +671,8 @@ describe("dashboard overview", () => {
     expect(html).toContain('data-view="orchestrator"');
     expect(html).toContain('id="view-orchestrator"');
     expect(html).toContain('id="orchestratorStartForm"');
+    expect(html).toContain('name="createGoal" checked');
+    expect(clientJs).toContain("createGoal: form.createGoal.checked");
     expect(html).toContain('id="orchestratorSubtaskForm"');
     // Both forms share one panel, switched by a tab strip; Start is the
     // default because Add Subtask only makes sense once one exists.
@@ -659,6 +701,9 @@ describe("dashboard overview", () => {
     expect(html).toContain('id="orchestratorOffice"');
     expect(html).toContain('data-office-view="pixel"');
     expect(html).toContain('data-office-view="classic"');
+    expect(html).toContain('.pixel-office-shell[hidden], .run-carousel-shell[hidden] { display: none; }');
+    expect(html).not.toContain('Current activity');
+    expect(html).not.toContain('data-office-activity-list');
     expect(html).toContain('data-office-zone="leader"');
     expect(html).toContain('data-office-zone="implement"');
     expect(html).toContain('data-office-zone="review"');
@@ -739,6 +784,22 @@ describe("dashboard overview", () => {
     expect(clientJs).not.toContain("/api/workforce/orchestration/team-providers");
     expect(html).toContain('id="workforceProviderToggles"');
     expect(clientJs).toContain("/api/workforce/agents/provider-enabled");
+    expect(html).toContain('id="cliApprovalSettingsForm"');
+    expect(html.indexOf('id="cliApprovalSettingsForm"')).toBeLessThan(html.indexOf('id="view-orchestrator"'));
+    expect(html).toContain('id="codexApprovalPolicy"');
+    expect(html).toContain('id="antigravityApprovalPolicy"');
+    expect(html).toContain('id="claudeApprovalPolicy"');
+    expect(html).toContain('id="codexApprovalPolicyDescription"');
+    expect(html).toContain('id="antigravityApprovalPolicyDescription"');
+    expect(html).toContain('id="claudeApprovalPolicyDescription"');
+    expect(clientJs).toContain("function renderCliApprovalPolicyDescriptions()");
+    expect(clientJs).toContain("skips every approval and disables the sandbox");
+    expect(html).toContain('<option value="never">Never ask · workspace sandbox</option>');
+    expect(clientJs).toContain("approval_policy=never");
+    expect(clientJs).toContain("approvals_reviewer=auto_review");
+    expect(clientJs).toContain("Planning-only mode");
+    expect(clientJs).toContain("tools without an existing allow rule are denied instead");
+    expect(clientJs).toContain("/api/config/cli-approvals");
     expect(html).toContain('<option value="auto">Auto');
     expect(html).toContain('<option value="manual">Manual');
     // approve-each is a real mode: it gates every agent spawn.

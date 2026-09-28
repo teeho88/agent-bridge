@@ -5,7 +5,7 @@ import { buildSpawnPreview, reapAgentRuns, spawnAgentRun, stopAgentRun } from "@
 import { compressLog } from "@agent-bridge/core";
 import type { AgentRun, Assignment, RegisteredAgent, SessionEvent, Subtask } from "@agent-bridge/memory";
 import type { AgentRunStatus } from "@agent-bridge/memory";
-import { getActiveTaskId, openStore, paths } from "../workspace.js";
+import { getActiveTaskId, openStore, paths, readCliApprovalPolicy } from "../workspace.js";
 
 type Store = ReturnType<typeof openStore>;
 
@@ -319,7 +319,8 @@ export async function respawnRun(
     "utf8",
   );
 
-  const preview = buildSpawnPreview(targetAgent, resumePath, paths().cwd);
+  const cwd = paths().cwd;
+  const preview = buildSpawnPreview(targetAgent, resumePath, cwd, readCliApprovalPolicy(cwd, targetAgent.provider));
   const newRun = spawnAgentRun(store, {
     orchestrationId: oldRun.orchestrationId,
     taskId: oldRun.taskId,

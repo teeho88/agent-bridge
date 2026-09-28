@@ -38,11 +38,17 @@ describe("agent invocation previews", () => {
       adapter: "codex",
       mode: "cli",
       executable: "codex",
-      args: ["exec", "--sandbox", "workspace-write", "-"],
+      args: [
+        "exec",
+        "--sandbox", "workspace-write",
+        "-c", 'approval_policy="on-request"',
+        "-c", 'approvals_reviewer="user"',
+        "-",
+      ],
       stdinFilePath: ".agent-memory/artifacts/assignments/a.md",
-      command: "codex exec --sandbox workspace-write -",
+      command: 'codex exec --sandbox workspace-write -c "approval_policy=\\"on-request\\"" -c "approvals_reviewer=\\"user\\"" -',
     });
-    expect(preview.description).toContain("Approval is required");
+    expect(preview.description).toContain("Approval policy: default");
   });
 
   it("never grants codex full disk access, only workspace writes", () => {
@@ -52,6 +58,18 @@ describe("agent invocation previews", () => {
     expect(preview.args).toContain("workspace-write");
     expect(preview.args).not.toContain("danger-full-access");
     expect(preview.args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+  });
+
+  it("maps configurable Codex approval policies to current CLI flags", () => {
+    const autoReview = buildSpawnPreview(registeredAgent(), "a.md", "C:/repo", "auto-review").args ?? [];
+    expect(autoReview).toContain('approval_policy="on-request"');
+    expect(autoReview).toContain('approvals_reviewer="auto_review"');
+    const never = buildSpawnPreview(registeredAgent(), "a.md", "C:/repo", "never").args ?? [];
+    expect(never).toContain('approval_policy="never"');
+    expect(never).toContain("workspace-write");
+    const bypass = buildSpawnPreview(registeredAgent(), "a.md", "C:/repo", "bypass").args ?? [];
+    expect(bypass).toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(bypass).not.toContain("--sandbox");
   });
 
   it("falls back to the provider's default CLI binary, never the display name, when command is blank", () => {
@@ -69,6 +87,18 @@ describe("agent invocation previews", () => {
       args: ["--print", "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose", "--model", "opus", "--effort", "high"],
       stdinFilePath: "assignment.md",
     });
+  });
+
+  it("maps Claude approval policy names to Claude permission modes", () => {
+    const preview = buildSpawnPreview(
+      registeredAgent({ provider: "claude", command: "claude" }),
+      "assignment.md",
+      "C:/repo",
+      "accept-edits",
+    );
+    expect(preview.args).toContain("--permission-mode");
+    expect(preview.args).toContain("acceptEdits");
+    expect(preview.args).not.toContain("--dangerously-skip-permissions");
   });
 
   it("builds an unattended agy spawn preview with the prompt inline, not on stdin", () => {
@@ -110,6 +140,18 @@ describe("agent invocation previews", () => {
     // The preview string stays readable — flags, not the whole turn.
     expect(preview.command).not.toContain("Do the thing");
     expect(preview.command).toContain(artifact);
+  });
+
+  it("maps Agy approval policy names to execution modes", () => {
+    const preview = buildSpawnPreview(
+      registeredAgent({ provider: "antigravity", command: "agy" }),
+      promptFile("plan it", "plan.md"),
+      "C:/repo",
+      "plan",
+    );
+    expect(preview.args).toContain("--mode");
+    expect(preview.args).toContain("plan");
+    expect(preview.args).not.toContain("--dangerously-skip-permissions");
   });
 
   it("runs agy even when the agent row still names the IDE launcher", () => {

@@ -70,7 +70,6 @@ export class PixelOfficeSceneController {
     }
     this.animateActorMoves(previousPositions);
     this.renderNotifications(state);
-    this.renderActivityList(state);
     if (this.selectedActorId && !this.actorState.has(this.selectedActorId)) this.selectedActorId = '';
     this.renderThoughtCloud();
     this.enqueue(transitions);
@@ -124,12 +123,6 @@ export class PixelOfficeSceneController {
       item.setAttribute('role', 'status');
       return item;
     }));
-  }
-
-  private renderActivityList(state: PixelOfficeSceneState): void {
-    const host = this.root.querySelector('[data-office-activity-list]');
-    if (!host) return;
-    host.replaceChildren(...state.activities.map(activity => textElement('li', `is-${activity.activity}`, activity.label)));
   }
 
   private renderThoughtCloud(): void {
@@ -193,7 +186,7 @@ export class PixelOfficeSceneController {
     const rootRect = this.root.getBoundingClientRect();
     const actorRect = actor.getBoundingClientRect();
     const cloudRect = host.getBoundingClientRect();
-    const margin = 10;
+    const margin = 20;
     let side = 'top-right';
     let left = actorRect.right - rootRect.left + 8;
     let top = actorRect.top - rootRect.top - cloudRect.height - 12;

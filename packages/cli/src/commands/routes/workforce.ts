@@ -13,6 +13,7 @@ import {
 import {
   openStore,
   paths,
+  readCliApprovalPolicy,
 } from "../../workspace.js";
 import {
   listAdoptableSessions,
@@ -479,7 +480,7 @@ export async function routePostWorkforceSubtaskAddAndSpawn(ctx: RouteContext): P
     mkdirSync(runsDir, { recursive: true });
     const promptPath = join(runsDir, `${randomUUID()}-prompt.md`);
     writeFileSync(promptPath, prompt, "utf8");
-    const preview = buildSpawnPreview(agent, promptPath, cwd);
+    const preview = buildSpawnPreview(agent, promptPath, cwd, readCliApprovalPolicy(cwd, agent.provider));
     if (preview.mode !== "cli" || !preview.executable) {
       throw new Error(`Agent ${agent.name} is not CLI-spawnable (mode: ${preview.mode}).`);
     }

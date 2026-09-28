@@ -165,7 +165,8 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     .run-carousel-shell:hover .task-carousel-button:not(:disabled) { opacity: 1; pointer-events: auto; }
     @media (max-width: 1100px) { .run-grid { grid-auto-columns: calc((100% - 12px) / 2); } }
     @media (max-width: 760px) { .run-grid { grid-auto-columns: 100%; grid-template-rows: minmax(0, 1fr); } }
-    .pixel-office-shell { display: grid; grid-template-columns: minmax(0, 1fr) 280px; min-height: 590px; background: #19243a; }
+    .pixel-office-shell { display: grid; min-height: 590px; background: #19243a; }
+    .pixel-office-shell[hidden], .run-carousel-shell[hidden] { display: none; }
     .pixel-office {
       --office-floor: #d9bd86; --office-wall: #24324d; min-width: 760px; min-height: 590px; position: relative;
       display: grid; grid-template-columns: 1fr 1.65fr 1fr; grid-template-rows: 150px 120px 250px;
@@ -220,25 +221,18 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     .office-transition { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .office-notifications { position: absolute; left: 12px; top: 10px; z-index: 7; display: flex; gap: 5px; flex-wrap: wrap; }
     .office-notification { padding: 4px 6px; border: 2px solid #7c2d12; background: #ffedd5; color: #7c2d12; font: 800 9px/1 ui-monospace, monospace; }
-    .office-thought-cloud { position: absolute; z-index: 8; width: min(330px, calc(100% - 20px)); padding: 11px; border: 3px solid #172033; border-radius: 20px; background: #eff6ff; color: #172033; box-shadow: 5px 5px 0 rgba(15,23,42,.38); display: grid; gap: 7px; }
+    .office-thought-cloud { box-sizing: border-box; position: absolute; z-index: 8; width: min(290px, calc(100% - 40px)); max-height: calc(100% - 40px); overflow: auto; padding: 9px; border: 3px solid #172033; border-radius: 20px; background: #eff6ff; color: #172033; box-shadow: 5px 5px 0 rgba(15,23,42,.38); display: grid; gap: 5px; }
     .office-thought-cloud[hidden] { display: none; }
     .office-thought-cloud::after { content: ''; position: absolute; width: 11px; height: 11px; border: 3px solid #172033; border-radius: 50%; background: #eff6ff; }
     .office-thought-cloud[data-cloud-side="top-right"]::after { right: 20px; bottom: -14px; }
     .office-thought-cloud[data-cloud-side="top-left"]::after { left: 20px; bottom: -14px; }
     .office-thought-cloud[data-cloud-side="bottom-right"]::after { right: 20px; top: -14px; }
     .office-thought-cloud[data-cloud-side="bottom-left"]::after { left: 20px; top: -14px; }
-    .office-thought-cloud-header { font: 850 13px/1.2 ui-monospace, monospace; }
-    .office-thought-cloud-meta { color: #475569; font-size: 11px; overflow-wrap: anywhere; }
-    .office-thought-cloud-task { font-size: 12px; font-weight: 700; overflow-wrap: anywhere; }
-    .office-thought-cloud-log { margin: 0; max-height: 128px; overflow: auto; border-radius: 7px; padding: 8px; background: #0f172a; color: #e2e8f0; font: 10px/1.4 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .office-thought-cloud-header { font: 850 12px/1.2 ui-monospace, monospace; }
+    .office-thought-cloud-meta { color: #475569; font-size: 10px; overflow-wrap: anywhere; }
+    .office-thought-cloud-task { font-size: 11px; font-weight: 700; overflow-wrap: anywhere; }
+    .office-thought-cloud-log { margin: 0; max-height: 96px; overflow: auto; border-radius: 7px; padding: 7px; background: #0f172a; color: #e2e8f0; font: 9px/1.35 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
     .office-thought-cloud-actions { display: flex; gap: 6px; flex-wrap: wrap; }
-    .office-sidebar { min-width: 0; display: grid; grid-template-rows: auto minmax(0,1fr); background: #f8fafc; border-left: 1px solid var(--line); color: var(--text); }
-    .office-inspector, .office-status-fallback { padding: 12px; min-width: 0; }
-    .office-inspector { border-bottom: 1px solid var(--line); display: grid; gap: 8px; align-content: start; }
-    .office-inspector-title { font-weight: 850; }
-    .office-inspector-task { overflow-wrap: anywhere; font-size: 12px; }
-    .office-status-fallback { overflow: auto; }
-    .office-status-list { margin: 8px 0 0; padding-left: 18px; display: grid; gap: 5px; font-size: 11px; }
     .office-effect {
       position: absolute; left: 50%; top: 48%; z-index: 9; transform: translate(-50%,-50%);
       padding: 10px 14px; border: 4px solid #172033; background: #f8fafc; color: #172033;
@@ -255,8 +249,8 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     @keyframes office-celebrate { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
     @keyframes office-error { 0%,100% { transform: translateX(-2px); } 50% { transform: translateX(2px); } }
     @keyframes office-effect { 0% { opacity: 0; transform: translate(-50%,-35%) scale(.7); } 35%,75% { opacity: 1; transform: translate(-50%,-50%) scale(1); } 100% { opacity: 0; transform: translate(-50%,-65%) scale(.9); } }
-    @media (max-width: 1050px) { .pixel-office-shell { overflow-x: auto; grid-template-columns: 760px 260px; } }
-    @media (max-width: 760px) { .pixel-office-shell { grid-template-columns: 680px 240px; } .pixel-office { min-width: 680px; } .office-thought-cloud { position: sticky; left: 10px !important; top: auto !important; bottom: 10px; width: calc(100% - 20px); max-height: 45%; overflow: auto; } }
+    @media (max-width: 1050px) { .pixel-office-shell { overflow-x: auto; grid-template-columns: 760px; } }
+    @media (max-width: 760px) { .pixel-office-shell { grid-template-columns: 680px; } .pixel-office { min-width: 680px; } .office-thought-cloud { position: sticky; left: 20px !important; top: auto !important; bottom: 20px; width: calc(100% - 40px); max-height: calc(100% - 40px); } }
     @media (prefers-reduced-motion: reduce) { .pixel-actor, .pixel-actor *, .pixel-actor.is-transitioning, .office-effect { animation: none; transition: none; } }
     .pixel-office.reduced-effects .pixel-actor, .pixel-office.reduced-effects .pixel-actor *, .pixel-office.reduced-effects .office-effect { animation: none; transition-duration: 20ms; }
     .task-card-section { min-width: 0; display: grid; gap: 7px; align-content: start; }
@@ -322,6 +316,10 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     input, textarea, select {
       width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 8px 9px;
       font: inherit; font-size: 13px; color: var(--text); background: #fff; min-height: 38px;
+    }
+    .handoff-transfer-label { display: inline-flex; align-items: center; gap: 6px; width: auto; margin: 0; white-space: nowrap; }
+    .handoff-transfer-label .handoff-transfer-owner {
+      width: 14px; height: 14px; min-height: 0; margin: 0; padding: 0; flex: 0 0 14px; accent-color: var(--blue);
     }
     textarea { min-height: 78px; resize: vertical; }
     .card, .memory-row, .tool-row {
@@ -605,8 +603,53 @@ agent-bridge ui</pre>
           <button class="secondary open-agent-terminal" data-agent="claude" type="button">Open Claude</button>
           <button class="secondary open-agent-terminal" data-agent="codex" type="button">Open Codex</button>
           <button class="secondary open-agent-terminal" data-agent="antigravity" type="button">Open Antigravity</button>
+          <label class="toolbar" style="font-weight:650; color:var(--text)">
+            <input type="checkbox" id="workboardCreateGoal" checked style="width:auto; min-height:0; margin:0">
+            Create runtime goal
+            <span class="help" data-tip="When off, a new terminal task is intentionally created without a goal and later prompt-based goal seeding stays disabled.">?</span>
+          </label>
           <span class="meta" id="agentTerminalStatus">Each terminal gets its own live task card and window ID.</span>
         </div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>CLI Approval Policies</h2><span class="help" data-tip="Applied to every orchestration spawn, respawn, and reporter run for that CLI. Bypass modes remove native permission prompts and should only be used in a trusted sandbox.">?</span></div>
+        <form id="cliApprovalSettingsForm" class="panel-body stack">
+          <div class="grid-3">
+            <label>Codex
+              <select id="codexApprovalPolicy">
+                <option value="default">Ask me · workspace sandbox</option>
+                <option value="auto-review">Auto-review · workspace sandbox (recommended)</option>
+                <option value="never">Never ask · workspace sandbox</option>
+                <option value="bypass">Bypass approvals + sandbox (dangerous)</option>
+              </select>
+              <span class="meta" id="codexApprovalPolicyDescription" aria-live="polite"></span>
+            </label>
+            <label>Agy
+              <select id="antigravityApprovalPolicy">
+                <option value="default">Ask / CLI default</option>
+                <option value="accept-edits">Accept edits</option>
+                <option value="plan">Plan only</option>
+                <option value="bypass">Bypass permissions</option>
+              </select>
+              <span class="meta" id="antigravityApprovalPolicyDescription" aria-live="polite"></span>
+            </label>
+            <label>Claude
+              <select id="claudeApprovalPolicy">
+                <option value="manual">Manual approvals</option>
+                <option value="auto">Auto</option>
+                <option value="accept-edits">Accept edits</option>
+                <option value="dont-ask">Don't ask</option>
+                <option value="plan">Plan only</option>
+                <option value="bypass">Bypass permissions</option>
+              </select>
+              <span class="meta" id="claudeApprovalPolicyDescription" aria-live="polite"></span>
+            </label>
+          </div>
+          <div class="toolbar">
+            <button class="secondary" type="submit">Save approval policies</button>
+            <span class="meta" id="cliApprovalSettingsStatus"></span>
+          </div>
+        </form>
       </section>
       <section class="panel">
         <div class="panel-head"><h2>Live Task Board</h2><div class="toolbar"><span class="meta" id="liveTaskSummary">0 live tasks</span><span class="help" data-tip="Only direct agent sessions are shown. Orchestrator agents stay in Orchestrator → Runs. Hover either side to move between live task cards.">?</span></div></div>
@@ -658,6 +701,11 @@ agent-bridge ui</pre>
               <div class="grid-3">
                 <label><span class="label-row">Max question rounds <span class="help" data-tip="A ceiling on how many times the leader may stop planning to ask you. It does not make the leader ask that many times — it plans as soon as it has enough. Past the cap it must decide the rest itself and record the assumptions in the plan. 0 = never stop to ask.">?</span></span>
                   <input name="maxQuestionRounds" type="number" value="4" min="0"></label>
+                <label class="toolbar" style="font-weight:650; color:var(--text); align-content:end">
+                  <input type="checkbox" name="createGoal" checked style="width:auto; min-height:0; margin:0">
+                  Create runtime goal
+                  <span class="help" data-tip="When off, the orchestration still uses the request as its title and planning input, but its Work Board task has no goal.">?</span>
+                </label>
               </div>
               <button type="submit">Start Project</button>
               <div class="meta" id="orchestratorStartStatus"></div>
@@ -787,9 +835,6 @@ agent-bridge ui</pre>
             <section class="office-zone" data-office-zone="review"><h3>Review Lab</h3><div class="office-zone-actors" data-zone-actors></div></section>
             <section class="office-zone" data-office-zone="entrance"><h3>External</h3><div class="office-zone-actors" data-zone-actors></div></section>
           </div>
-          <aside class="office-sidebar">
-            <div class="office-status-fallback"><strong>Current activity</strong><ul class="office-status-list" data-office-activity-list></ul></div>
-          </aside>
         </div>
         <div class="panel-body run-carousel-shell" id="orchestratorRunsShell" hidden>
           <button class="task-carousel-button prev" id="orchestratorRunsPrev" type="button" aria-label="Previous runs">&lsaquo;</button>
@@ -824,6 +869,11 @@ agent-bridge ui</pre>
             <form id="taskForm" class="stack">
               <label>Title <input name="title" required placeholder="Fix checkout validation bug"></label>
               <label>Goal <textarea name="goal" placeholder="Expected outcome"></textarea></label>
+              <input type="hidden" name="createGoal" value="false">
+              <label class="toolbar" style="font-weight:650; color:var(--text)">
+                <input type="checkbox" name="createGoal" value="true" checked style="width:auto; min-height:0; margin:0">
+                Create runtime goal
+              </label>
               <label>Agent
                 <select name="agent">
                   <option value="claude">Claude</option>
@@ -1136,8 +1186,8 @@ agent-bridge ui</pre>
         </div>
       </section>
       <section class="panel">
-        <div class="panel-head"><h2>Handoff History</h2><span class="help" data-tip="Newest archived checkpoints for the selected task, indexed by .handoff/INDEX.md.">?</span></div>
-        <div class="panel-body"><div id="handoffHistory">No archived handoffs.</div></div>
+        <div class="panel-head"><h2>Handoff History</h2><span class="help" data-tip="Latest handoff for every task in this repository, newest first.">?</span></div>
+        <div class="panel-body"><div id="handoffHistory">No handoffs in this repository.</div></div>
       </section>
     </section>
 
@@ -1218,17 +1268,6 @@ function escapeStaticHtml(value: string): string {
     "'": '&#039;',
   }[char] ?? char));
 }
-
-
-
-
-
-
-
-
-
-
-
 
 
 

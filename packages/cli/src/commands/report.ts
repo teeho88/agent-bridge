@@ -12,7 +12,7 @@ import {
   type SpawnApprovalPayload,
 } from "@agent-bridge/core";
 import type { RegisteredAgent } from "@agent-bridge/memory";
-import { getActiveTaskId, openStore, paths } from "../workspace.js";
+import { getActiveTaskId, openStore, paths, readCliApprovalPolicy } from "../workspace.js";
 
 type Store = ReturnType<typeof openStore>;
 
@@ -165,7 +165,12 @@ export function generateReport(
   mkdirSync(runsDir, { recursive: true });
   const promptPath = join(runsDir, `${taskId}-report-prompt.md`);
   writeFileSync(promptPath, prompt, "utf8");
-  const preview = buildSpawnPreview(reporterAgent, promptPath, projectPaths.cwd);
+  const preview = buildSpawnPreview(
+    reporterAgent,
+    promptPath,
+    projectPaths.cwd,
+    readCliApprovalPolicy(projectPaths.cwd, reporterAgent.provider),
+  );
   if (preview.mode !== "cli" || !preview.executable) {
     return finalizeReport(
       store,

@@ -2,6 +2,7 @@ import type { RouteContext } from "./types.js";
 import { defaultUiPort } from "./http.js";
 import {
   applyTaskLabelSuggestion,
+  markTaskGoalOmitted,
 } from "../../task-suggestions.js";
 import {
   endAgentSession,
@@ -9,6 +10,7 @@ import {
   readConfig,
   resolveActiveTaskId,
   startAgentSession,
+  writeCompiledContextFor,
   writeConfig,
   writeCurrentTaskArtifact,
 } from "../../workspace.js";
@@ -23,6 +25,7 @@ import {
 } from "./terminal.js";
 import {
   agentLabel,
+  optionalBoolean,
   optionalString,
   parseAgentKind,
   requiredString,
@@ -80,11 +83,17 @@ export async function routePostSessionTerminal(ctx: RouteContext): Promise<void>
   if (!commandExists(command)) throw new Error(`${command} is not installed or not on PATH.`);
   const store = openStore(cwd);
   try {
-    const task = store.createTask({
-      title: `${agentLabel(agent)} terminal`,
-      goal: `Interactive ${agentLabel(agent)} CLI opened from Work Board.`,
-      ownerAgent: agent,
-    });
+    const requestedTaskId = optionalString(body.taskId);
+    const transferOwnership = body.transferOwnership === true;
+    const createGoal = optionalBoolean(body.createGoal, true);
+    const { task, continued } = prepareAgentTerminalTask(
+      store,
+      agent,
+      requestedTaskId,
+      transferOwnership,
+      createGoal,
+    );
+    if (continued) writeCompiledContextFor(store, cwd, task.id, agent);
     const sessionId = `${agent}-terminal-${randomUUID()}`;
     startAgentSession(sessionId, task.id, cwd, agent);
     store.recordSessionEvent({
@@ -92,9 +101,11 @@ export async function routePostSessionTerminal(ctx: RouteContext): Promise<void>
       taskId: task.id,
       agent,
       kind: "session_started",
-      summary: `${agentLabel(agent)} terminal opened from Work Board.`,
+      summary: continued
+        ? `${agentLabel(agent)} continued task from Work Board handoff.`
+        : `${agentLabel(agent)} terminal opened from Work Board.`,
     });
-    writeCurrentTaskArtifact(task, cwd);
+    if (!continued) writeCurrentTaskArtifact(task, cwd);
     try {
       const terminal = launchAgentTerminal(
         cwd,
@@ -104,7 +115,7 @@ export async function routePostSessionTerminal(ctx: RouteContext): Promise<void>
         command,
         req.socket.localPort ?? defaultUiPort,
       );
-      sendJson(res, 200, { task, sessionId, terminal });
+      sendJson(res, 200, { task, sessionId, terminal, continued });
     } catch (error) {
       endAgentSession(sessionId, cwd);
       throw error;
@@ -113,6 +124,34 @@ export async function routePostSessionTerminal(ctx: RouteContext): Promise<void>
     store.close();
   }
   return;
+}
+
+export function prepareAgentTerminalTask(
+  store: ReturnType<typeof openStore>,
+  agent: AgentKind,
+  taskId?: string,
+  transferOwnership = false,
+  createGoal = true,
+) {
+  if (!taskId) {
+    const created = store.createTask({
+      title: `${agentLabel(agent)} terminal`,
+      goal: createGoal ? `Interactive ${agentLabel(agent)} CLI opened from Work Board.` : undefined,
+      ownerAgent: agent,
+    });
+    return {
+      task: createGoal ? created : (markTaskGoalOmitted(store, created.id, agent) ?? created),
+      continued: false,
+    };
+  }
+  const existing = store.getTask(taskId);
+  if (!existing) throw new Error(`Task not found: ${taskId}`);
+  const task = store.updateTask(taskId, {
+    status: "in_progress",
+    ownerAgent: transferOwnership ? agent : undefined,
+  });
+  if (!task) throw new Error(`Task not found: ${taskId}`);
+  return { task, continued: true };
 }
 
 export async function routePostSessionWindow(ctx: RouteContext): Promise<void> {

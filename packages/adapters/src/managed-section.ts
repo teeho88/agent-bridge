@@ -4,6 +4,17 @@ import { resolve } from "node:path";
 const start = "<!-- agent-bridge:start -->";
 const end = "<!-- agent-bridge:end -->";
 
+export function temporaryArtifactCleanupSection(): string {
+  return `## Temporary Artifact Cleanup
+
+- Put disposable scratch files, caches, and test outputs in the system temp directory when practical. If they must live inside the repository, keep them under one clearly temporary path such as \`.agent-tmp/<agent-or-task>/\` instead of scattering them through project folders.
+- Keep track of temporary files and directories you create during the task.
+- Before finishing or handing off the task, remove temporary caches, scratch files, test outputs, and ad-hoc fixtures that you created solely for the work, then check the working tree for leftovers.
+- Delete only artifacts you created for this task and have confirmed are no longer needed. Never remove pre-existing files, user-created untracked files, shared caches, or another agent's artifacts merely because they look temporary.
+- Keep generated artifacts only when the user requested them or they are needed to reproduce/continue the work. Report any intentionally retained temporary-looking path and why it remains.
+- If ownership or necessity is uncertain, leave the path in place and report it rather than deleting it.`;
+}
+
 export function permissionEscalationSection(): string {
   return `## Permission Escalation Rules
 

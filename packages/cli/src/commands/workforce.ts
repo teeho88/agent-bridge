@@ -20,7 +20,7 @@ import {
   type OrchestratorDeps,
 } from "@agent-bridge/core";
 import type { Orchestration, OrchestrationAutonomy } from "@agent-bridge/memory";
-import { openStore, paths } from "../workspace.js";
+import { openStore, paths, readCliApprovalPolicy } from "../workspace.js";
 
 type Store = ReturnType<typeof openStore>;
 
@@ -256,7 +256,12 @@ export function makeOrchestratorDeps(store: Store, cwd: string = paths().cwd): O
       mkdirSync(runsDir, { recursive: true });
       const promptPath = join(runsDir, `${randomUUID()}-prompt.md`);
       writeFileSync(promptPath, input.prompt, "utf8");
-      const preview = buildSpawnPreview(input.agent, promptPath, projectPaths.cwd);
+      const preview = buildSpawnPreview(
+        input.agent,
+        promptPath,
+        projectPaths.cwd,
+        readCliApprovalPolicy(projectPaths.cwd, input.agent.provider),
+      );
       if (preview.mode !== "cli" || !preview.executable) {
         throw new Error(
           `Orchestrator spawning currently supports CLI-mode agents only (got mode "${preview.mode}" for ${input.agent.name}).`,
@@ -357,6 +362,5 @@ function parseAutonomy(value: string): OrchestrationAutonomy {
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
 
 

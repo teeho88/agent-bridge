@@ -29,11 +29,15 @@ import {
 } from "./task-changes.js";
 import {
   agentLabel,
+  optionalBoolean,
   optionalString,
   parseAgentKind,
   parseTaskStatus,
   requiredString,
 } from "./validation.js";
+import {
+  markTaskGoalOmitted,
+} from "../../task-suggestions.js";
 import {
   compileContext,
 } from "@agent-bridge/core";
@@ -54,11 +58,13 @@ export async function routePostTaskStart(ctx: RouteContext): Promise<void> {
   const store = openStore(cwd);
   try {
     const agent = parseAgentKind(optionalString(body.agent) ?? "claude");
-    const task = store.createTask({
+    const createGoal = optionalBoolean(body.createGoal, true);
+    let task = store.createTask({
       title: requiredString(body.title, "title"),
-      goal: optionalString(body.goal),
+      goal: createGoal ? optionalString(body.goal) : undefined,
       ownerAgent: agent,
     });
+    if (!createGoal) task = markTaskGoalOmitted(store, task.id, agent) ?? task;
     setCurrentTask(task.id, cwd, agent);
     const sessionId = readConfig(cwd).currentSessions?.[agent];
     if (sessionId) {

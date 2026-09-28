@@ -22,6 +22,7 @@ import {
   claudeManagedSection,
   codexManagedSection,
   patchManagedSection,
+  type CliApprovalPolicy,
 } from "@agent-bridge/adapters";
 import { compileContext, redactSecrets } from "@agent-bridge/core";
 
@@ -76,6 +77,14 @@ export type BridgeConfig = {
     // Capture clearly repo-wide Claude instructions, constraints, and decisions
     // into the reviewable inbox. Ordinary prompts stay scoped to their task.
     autoCapture?: boolean;
+  };
+  // Provider-level CLI permission behavior used by every spawned agent of
+  // that provider. Keeping this outside RegisteredAgent makes the safety
+  // choice consistent across model presets.
+  cliApprovalPolicies?: {
+    codex?: "default" | "auto-review" | "never" | "bypass";
+    antigravity?: "default" | "accept-edits" | "plan" | "bypass";
+    claude?: "manual" | "auto" | "accept-edits" | "dont-ask" | "plan" | "bypass";
   };
   // Knowledge-graph settings. injectRepoMap controls whether `context compile`
   // adds the compact repo map; repoMapLimit caps how many files it lists.
@@ -167,6 +176,11 @@ export function defaultConfig(): BridgeConfig {
     },
     repoMemory: {
       autoCapture: true,
+    },
+    cliApprovalPolicies: {
+      codex: "default",
+      antigravity: "bypass",
+      claude: "bypass",
     },
     graph: {
       injectRepoMap: true,
@@ -1030,6 +1044,14 @@ export function findContinuationTask(
   }
 
   return best && best.score >= 3 ? best : undefined;
+}
+
+export function readCliApprovalPolicy(cwd: string, provider: string): CliApprovalPolicy | undefined {
+  const policies = readConfig(cwd).cliApprovalPolicies;
+  if (provider === "codex") return policies?.codex;
+  if (provider === "antigravity") return policies?.antigravity;
+  if (provider === "claude") return policies?.claude;
+  return undefined;
 }
 
 function significantTerms(text: string): Set<string> {

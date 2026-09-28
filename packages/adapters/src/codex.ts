@@ -1,4 +1,4 @@
-import { orchestratedRunSection, permissionEscalationSection } from "./managed-section.js";
+import { orchestratedRunSection, permissionEscalationSection, temporaryArtifactCleanupSection } from "./managed-section.js";
 
 export function codexManagedSection(): string {
   return `<!-- agent-bridge:start -->
@@ -29,6 +29,10 @@ Do not start a new task just because the user sends a new prompt inside an activ
 ## Runtime Goal Rules
 When the first substantive user prompt for a task arrives, decide whether the work
 needs a durable Codex runtime goal:
+- If the compiled context contains the task note \`Task intentionally has no runtime goal.\`,
+  the Work Board has disabled goal creation for that task. Keep the runtime goal as
+  \`none\`, do not call \`create_goal\`, and keep the Work Board task goal empty unless
+  the user explicitly asks to create a goal.
 - Create a goal with \`create_goal\` before starting work when the user asks for an
   implementation, change, build, or other sustained action with a verifiable end
   state. Before calling the tool, derive a complete goal contract from the user's
@@ -75,6 +79,8 @@ work, then again only when:
 - the user refers to another agent's work, a handoff, or an earlier decision;
 - you are about to edit and no longer hold this task's constraints and handoff.
 Within one task, keep working from what you already read.
+
+${temporaryArtifactCleanupSection()}
 
 ${permissionEscalationSection()}
 

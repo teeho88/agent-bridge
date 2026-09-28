@@ -30,10 +30,22 @@ export type AgentAdapter = {
   buildInvocation(agent: RegisteredAgent, promptArtifactPath: string, cwd: string): AgentInvocation;
 };
 
+export type CliApprovalPolicy =
+  | "default"
+  | "auto-review"
+  | "never"
+  | "manual"
+  | "auto"
+  | "accept-edits"
+  | "dont-ask"
+  | "plan"
+  | "bypass";
+
 export function buildSpawnPreview(
   agent: RegisteredAgent,
   promptArtifactPath: string,
   cwd: string,
+  approvalPolicy?: CliApprovalPolicy,
 ): AgentInvocation {
   const base = {
     adapter: agent.provider,
@@ -57,22 +69,35 @@ export function buildSpawnPreview(
       // database". workspace-write is the narrowest mode that lets an
       // implementer actually do its job — deliberately NOT
       // danger-full-access, so writes stay confined to the project.
+      const codexPolicy = approvalPolicy ?? "default";
+      const codexApprovalArgs = codexPolicy === "auto-review"
+        ? [
+            "--sandbox", "workspace-write",
+            "-c", 'approval_policy="on-request"',
+            "-c", 'approvals_reviewer="auto_review"',
+          ]
+        : codexPolicy === "never"
+          ? ["--sandbox", "workspace-write", "-c", 'approval_policy="never"']
+        : codexPolicy === "bypass"
+          ? ["--dangerously-bypass-approvals-and-sandbox"]
+          : [
+              "--sandbox", "workspace-write",
+              "-c", 'approval_policy="on-request"',
+              "-c", 'approvals_reviewer="user"',
+            ];
       const args = [
         "exec",
-        "--sandbox",
-        "workspace-write",
+        ...codexApprovalArgs,
         ...(agent.model ? ["--model", agent.model] : []),
         ...(agent.reasoningEffort ? ["-c", `model_reasoning_effort=\"${agent.reasoningEffort}\"`] : []),
         "-",
       ];
-      return { ...base, executable, args, stdinFilePath: promptArtifactPath, command: `${executable} ${args.map(quoteCommandArg).join(" ")}`, description: `Codex CLI run for ${agent.name} using ${agent.model ?? "default model"}${agent.reasoningEffort ? ` (${agent.reasoningEffort})` : ""}. Approval is required unless dispatch auto-run was selected.` };
+      return { ...base, executable, args, stdinFilePath: promptArtifactPath, command: `${executable} ${args.map(quoteCommandArg).join(" ")}`, description: `Codex CLI run for ${agent.name} using ${agent.model ?? "default model"}${agent.reasoningEffort ? ` (${agent.reasoningEffort})` : ""}. Approval policy: ${codexPolicy}.` };
     }
     if (agent.provider === "claude") {
-      // Headless `claude --print` cannot prompt for tool-use approval — with
-      // no bypass flag it just describes what it would write/run and stops,
-      // which looks indistinguishable from a hung or silently-failed spawn.
-      // Codex's own `exec` subcommand already defaults to unattended
-      // (approval: never); this brings claude to the same unattended parity.
+      // Headless `claude --print` cannot display an interactive permission
+      // prompt. Bypass remains the compatibility default for unattended runs,
+      // while the Work Board can deliberately select a stricter mode.
       //
       // --output-format stream-json --verbose is not cosmetic: plain --print
       // output is fully buffered by the CLI until the process exits when
@@ -81,16 +106,20 @@ export function buildSpawnPreview(
       // would sit blank the entire run. stream-json emits one event per turn
       // as it happens; process-runner.ts's isClaudeStreamJson formatter turns
       // that into a readable progress line without touching the final result.
+      const claudePolicy = approvalPolicy ?? "bypass";
+      const claudeApprovalArgs = claudePolicy === "bypass"
+        ? ["--dangerously-skip-permissions"]
+        : ["--permission-mode", claudePermissionMode(claudePolicy)];
       const args = [
         "--print",
-        "--dangerously-skip-permissions",
+        ...claudeApprovalArgs,
         "--output-format",
         "stream-json",
         "--verbose",
         ...(agent.model ? ["--model", agent.model] : []),
         ...(agent.reasoningEffort ? ["--effort", agent.reasoningEffort] : []),
       ];
-      return { ...base, executable, args, stdinFilePath: promptArtifactPath, command: `${executable} ${args.map(quoteCommandArg).join(" ")}`, description: `Claude Code run for ${agent.name} using ${agent.model ?? "default model"}${agent.reasoningEffort ? ` (${agent.reasoningEffort})` : ""}. Runs unattended with tool-use permission checks bypassed (--dangerously-skip-permissions) and streams progress live (--output-format stream-json).` };
+      return { ...base, executable, args, stdinFilePath: promptArtifactPath, command: `${executable} ${args.map(quoteCommandArg).join(" ")}`, description: `Claude Code run for ${agent.name} using ${agent.model ?? "default model"}${agent.reasoningEffort ? ` (${agent.reasoningEffort})` : ""}. Approval policy: ${claudePolicy}; streams progress live (--output-format stream-json).` };
     }
     if (agent.provider === "antigravity") {
       // `--print` TAKES the prompt as its value (`--prompt` is documented as
@@ -108,14 +137,20 @@ export function buildSpawnPreview(
       // guards — and past that limit readPromptArtifact hands over a short
       // pointer that tells agy to read the artifact off disk instead.
       //
-      // --dangerously-skip-permissions matches what claude already runs with:
-      // without it a spawned run stalls on a tool-approval prompt nobody can
-      // answer. --add-dir puts the project inside the agent's workspace, and
-      // --print-timeout lifts the 5-minute default that would otherwise cut a
-      // long implementer turn off mid-edit.
+      // Bypass remains the compatibility default because a headless spawned
+      // run cannot answer a tool prompt. The Work Board can instead request
+      // accept-edits, plan, or provider-default behavior. --add-dir puts the
+      // project inside the agent's workspace, and --print-timeout lifts the
+      // 5-minute default that would otherwise cut a long turn off mid-edit.
       const effort = agent.reasoningEffort && AGY_EFFORT_LEVELS.has(agent.reasoningEffort) ? agent.reasoningEffort : undefined;
+      const agyPolicy = approvalPolicy ?? "bypass";
+      const agyApprovalArgs = agyPolicy === "bypass"
+        ? ["--dangerously-skip-permissions"]
+        : agyPolicy === "accept-edits" || agyPolicy === "plan"
+          ? ["--mode", agyPolicy]
+          : [];
       const args = [
-        "--dangerously-skip-permissions",
+        ...agyApprovalArgs,
         "--print-timeout",
         "60m",
         "--add-dir",
@@ -142,7 +177,7 @@ export function buildSpawnPreview(
         // The prompt is left out of the preview string on purpose: it is an
         // entire leader turn, and inlining it would bury every actual flag.
         command: `${executable} ${args.slice(0, -1).map(quoteCommandArg).join(" ")} "<prompt from ${promptArtifactPath}>"`,
-        description: `Antigravity (agy) run for ${agent.name} using ${agent.model ?? "default model"}${effort ? ` (${effort})` : ""}. Runs unattended with tool approvals auto-accepted (--dangerously-skip-permissions), streams progress live (--output-format stream-json); the prompt is passed inline from ${promptArtifactPath}.`,
+        description: `Antigravity (agy) run for ${agent.name} using ${agent.model ?? "default model"}${effort ? ` (${effort})` : ""}. Approval policy: ${agyPolicy}; streams progress live (--output-format stream-json); the prompt is passed inline from ${promptArtifactPath}.`,
       };
     }
     const args = ["--prompt-file", promptArtifactPath];
@@ -167,6 +202,14 @@ export function buildSpawnPreview(
     ...base,
     description: `Manual spawn preview for ${agent.name}. Open the prompt artifact and run the agent manually after approval.`,
   };
+}
+
+function claudePermissionMode(policy: CliApprovalPolicy): string {
+  if (policy === "accept-edits") return "acceptEdits";
+  if (policy === "dont-ask") return "dontAsk";
+  if (policy === "auto") return "auto";
+  if (policy === "plan") return "plan";
+  return "manual";
 }
 
 export function renderInvocationPrompt(input: {

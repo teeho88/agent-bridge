@@ -22,6 +22,7 @@ import { registerSession } from "./commands/session.js";
 import { registerSubtask } from "./commands/subtask.js";
 import { registerTask } from "./commands/task.js";
 import { registerUi } from "./commands/ui.js";
+import { registerUpgrade } from "./commands/upgrade.js";
 import { registerWatch } from "./commands/watch.js";
 import { registerOrchestration } from "./commands/workforce.js";
 import { installSpawnedRunGuard } from "./spawned-guard.js";
@@ -31,6 +32,7 @@ const program = new Command();
 program.name("agent-bridge").description("Local memory and handoff sidecar for coding agents").version("0.1.0");
 
 registerInit(program);
+registerUpgrade(program);
 registerAgent(program);
 registerClaude(program);
 registerCodex(program);
