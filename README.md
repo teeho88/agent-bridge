@@ -30,21 +30,24 @@ API-mode and manual agents can also be registered without a local provider CLI.
 
 ## Install from source
 
+For a new Windows machine, or when moving the repository to a different path, use the clean installer:
+
 ```powershell
 git clone https://github.com/teeho88/agent-bridge.git
 cd agent-bridge
-corepack pnpm install
-corepack pnpm -r build
-powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -AddToUserPath
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows-clean.ps1
 ```
 
-Open a new terminal after adding the wrapper to `PATH`, then verify the installation:
+The clean installer removes stale global `agent-bridge` npm shims, clears local dependency/build output, installs from the lockfile, rebuilds all packages, creates portable wrappers under `bin`, and places that directory first in your User `PATH`.
+
+Open a new terminal, then verify that Windows resolves the command from this repository:
 
 ```powershell
+where.exe agent-bridge
 agent-bridge --help
 ```
 
-Without changing `PATH`, call the generated wrapper directly:
+You can also call the generated wrapper directly:
 
 ```powershell
 & "\path\to\agent-bridge\bin\agent-bridge.ps1" --help
