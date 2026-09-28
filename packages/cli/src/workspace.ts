@@ -178,9 +178,9 @@ export function defaultConfig(): BridgeConfig {
       autoCapture: true,
     },
     cliApprovalPolicies: {
-      codex: "default",
-      antigravity: "bypass",
-      claude: "bypass",
+      codex: "never",
+      antigravity: "accept-edits",
+      claude: "auto",
     },
     graph: {
       injectRepoMap: true,

@@ -416,9 +416,9 @@ function renderState(state) {
   }
   if (!cliApprovalSettingsTouched) {
     const policies = (state.config && state.config.cliApprovalPolicies) || {};
-    els.codexApprovalPolicy.value = policies.codex || 'default';
-    els.antigravityApprovalPolicy.value = policies.antigravity || 'bypass';
-    els.claudeApprovalPolicy.value = policies.claude || 'bypass';
+    els.codexApprovalPolicy.value = policies.codex || 'never';
+    els.antigravityApprovalPolicy.value = policies.antigravity || 'accept-edits';
+    els.claudeApprovalPolicy.value = policies.claude || 'auto';
   }
   renderCliApprovalPolicyDescriptions();
 }

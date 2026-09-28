@@ -41,14 +41,13 @@ describe("agent invocation previews", () => {
       args: [
         "exec",
         "--sandbox", "workspace-write",
-        "-c", 'approval_policy="on-request"',
-        "-c", 'approvals_reviewer="user"',
+        "-c", 'approval_policy="never"',
         "-",
       ],
       stdinFilePath: ".agent-memory/artifacts/assignments/a.md",
-      command: 'codex exec --sandbox workspace-write -c "approval_policy=\\"on-request\\"" -c "approvals_reviewer=\\"user\\"" -',
+      command: 'codex exec --sandbox workspace-write -c "approval_policy=\\"never\\"" -',
     });
-    expect(preview.description).toContain("Approval policy: default");
+    expect(preview.description).toContain("Approval policy: never");
   });
 
   it("never grants codex full disk access, only workspace writes", () => {
@@ -81,10 +80,10 @@ describe("agent invocation previews", () => {
     expect(preview.executable).toBe("claude");
   });
 
-  it("passes model and effort to Claude Code, unattended and streaming live progress", () => {
+  it("passes model and effort to Claude Code with auto permissions and streaming live progress", () => {
     const preview = buildSpawnPreview(registeredAgent({ provider: "claude", command: "claude", model: "opus", reasoningEffort: "high" }), "assignment.md", "C:/repo");
     expect(preview).toMatchObject({
-      args: ["--print", "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose", "--model", "opus", "--effort", "high"],
+      args: ["--print", "--permission-mode", "auto", "--output-format", "stream-json", "--verbose", "--model", "opus", "--effort", "high"],
       stdinFilePath: "assignment.md",
     });
   });
@@ -112,7 +111,8 @@ describe("agent invocation previews", () => {
       adapter: "antigravity",
       executable: "agy",
       args: [
-        "--dangerously-skip-permissions",
+        "--mode",
+        "accept-edits",
         // The 5-minute --print-timeout default would cut a long implementer
         // turn off mid-edit.
         "--print-timeout",

@@ -69,7 +69,7 @@ export function buildSpawnPreview(
       // database". workspace-write is the narrowest mode that lets an
       // implementer actually do its job — deliberately NOT
       // danger-full-access, so writes stay confined to the project.
-      const codexPolicy = approvalPolicy ?? "default";
+      const codexPolicy = approvalPolicy ?? "never";
       const codexApprovalArgs = codexPolicy === "auto-review"
         ? [
             "--sandbox", "workspace-write",
@@ -106,7 +106,7 @@ export function buildSpawnPreview(
       // would sit blank the entire run. stream-json emits one event per turn
       // as it happens; process-runner.ts's isClaudeStreamJson formatter turns
       // that into a readable progress line without touching the final result.
-      const claudePolicy = approvalPolicy ?? "bypass";
+      const claudePolicy = approvalPolicy ?? "auto";
       const claudeApprovalArgs = claudePolicy === "bypass"
         ? ["--dangerously-skip-permissions"]
         : ["--permission-mode", claudePermissionMode(claudePolicy)];
@@ -143,7 +143,7 @@ export function buildSpawnPreview(
       // project inside the agent's workspace, and --print-timeout lifts the
       // 5-minute default that would otherwise cut a long turn off mid-edit.
       const effort = agent.reasoningEffort && AGY_EFFORT_LEVELS.has(agent.reasoningEffort) ? agent.reasoningEffort : undefined;
-      const agyPolicy = approvalPolicy ?? "bypass";
+      const agyPolicy = approvalPolicy ?? "accept-edits";
       const agyApprovalArgs = agyPolicy === "bypass"
         ? ["--dangerously-skip-permissions"]
         : agyPolicy === "accept-edits" || agyPolicy === "plan"
