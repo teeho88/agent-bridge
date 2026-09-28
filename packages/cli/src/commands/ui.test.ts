@@ -666,6 +666,31 @@ describe("dashboard overview", () => {
     expect(html).not.toContain("select-request-task");
   });
 
+  it("wires Git self-update status, apply, dismissal, polling, and escaping", () => {
+    const html = renderDashboardPage();
+    expect(html).toContain('id="applicationUpdateBanner"');
+    expect(html).toContain('id="applicationUpdateApply"');
+    expect(html).toContain('id="applicationUpdateLater"');
+    expect(html).toContain('id="applicationUpdateCheck"');
+    expect(clientJs).toContain("agent-bridge.update.notifiedVersion");
+    expect(clientJs).toContain("agent-bridge.update.dismissedVersion");
+    expect(clientJs).toContain("localStorageValue(applicationUpdateNotifiedVersionKey) === version");
+    expect(clientJs).toContain("els.applicationUpdateBanner.hidden = !visible");
+    expect(clientJs).toContain("state === 'available'\n    ? !dismissed");
+    expect(clientJs).toContain("els.applicationUpdateApply.disabled = state !== 'available' || !status.canApply");
+    expect(clientJs).toContain("notes.map(note => '<li>' + escapeHtml(note) + '</li>')");
+    expect(clientJs).toContain("escapeHtml(version) + ' is available</strong>'");
+    expect(clientJs).toContain("api('/api/update/status' + (force ? '?refresh=1' : ''))");
+    expect(clientJs).toContain("api('/api/update/apply', { method: 'POST', body: '{}' })");
+    expect(clientJs).toContain("api('/api/update/progress')");
+    expect(clientJs).toContain("Work Board is restarting; reconnecting...");
+    expect(clientJs).toContain("on('applicationUpdateLater', 'click'");
+    expect(clientJs).toContain("on('applicationUpdateCheck', 'click', () => checkApplicationUpdate(true))");
+    expect(clientJs).toContain("void checkApplicationUpdate(false)");
+    expect(clientJs).toContain("30 * 60 * 1000");
+    expect(clientJs).toContain("setInterval(() => { if (live) load(false); }, 2000)");
+  });
+
   it("renders the Team Board (Orchestrator) view wired to the workforce API", () => {
     const html = renderDashboardPage();
     expect(html).toContain('data-view="orchestrator"');

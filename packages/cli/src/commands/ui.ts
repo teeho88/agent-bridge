@@ -21,6 +21,11 @@ import {
   routeGetState,
 } from "./routes/state.js";
 import {
+  routeGetApplicationUpdateProgress,
+  routeGetApplicationUpdateStatus,
+  routePostApplicationUpdateApply,
+} from "./routes/application-update.js";
+import {
   routeGetCacheReport,
   routePostAntigravityInstallHooks,
   routePostClaudeInstallHooks,
@@ -153,6 +158,7 @@ type BrowserLauncher = (
 // The watcher runs as a child of the UI server so the dashboard can start/stop it.
 // Tracked at module scope; killed when the UI process exits to avoid orphans.
 let uiWorkspace = process.cwd();
+let uiPort = defaultUiPort;
 
 
 
@@ -284,6 +290,7 @@ function listenUiServer(
     const address = server.address();
     const boundPort =
       typeof address === "object" && address ? address.port : port;
+    uiPort = boundPort;
     const url = `http://127.0.0.1:${boundPort}`;
     console.log(`agent-bridge UI running at ${url}`);
     console.log(`Workspace: ${project}`);
@@ -449,6 +456,9 @@ async function routeGetRoot(ctx: RouteContext): Promise<void> {
 const ROUTES: RouteTable = {
   "GET /": routeGetRoot,
   "GET /api/state": routeGetState,
+  "GET /api/update/status": routeGetApplicationUpdateStatus,
+  "POST /api/update/apply": routePostApplicationUpdateApply,
+  "GET /api/update/progress": routeGetApplicationUpdateProgress,
   "POST /api/task/start": routePostTaskStart,
   "POST /api/workforce/agent": routePostWorkforceAgent,
   "POST /api/workforce/agent/toggle": routePostWorkforceAgentToggle,
@@ -544,7 +554,7 @@ export async function handleRequest(
 
   const handler = ROUTES[`${method} ${url.pathname ?? "/"}`];
   if (handler) {
-    await handler({ req, res, url, method, cwd });
+    await handler({ req, res, url, method, cwd, port: uiPort });
     return;
   }
 

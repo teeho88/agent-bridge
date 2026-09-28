@@ -12,6 +12,7 @@ export interface RouteContext {
   url: UrlWithParsedQuery;
   method: string;
   cwd: string;
+  port: number;
 }
 
 export type RouteHandler = (ctx: RouteContext) => Promise<void> | void;

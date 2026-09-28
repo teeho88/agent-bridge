@@ -309,6 +309,13 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       width: 28px; height: 28px; min-height: 0; padding: 0; flex: 0 0 auto;
       background: rgba(255,255,255,0.75); color: var(--text); border-color: #fedf89;
     }
+    .update-banner { max-width: 1440px; margin: 12px auto 0; padding: 0 16px; }
+    .update-banner[hidden] { display: none; }
+    .update-banner-card { display: grid; gap: 8px; padding: 12px 14px; border: 1px solid #bfdbfe; border-left: 4px solid var(--blue); border-radius: 8px; background: var(--blue-bg); box-shadow: var(--shadow); }
+    .update-banner-card.is-blocked { border-color: #fedf89; border-left-color: #b54708; background: #fffbeb; }
+    .update-banner-card.is-failed { border-color: #fecdca; border-left-color: #b42318; background: #fef3f2; }
+    .update-banner-notes { margin: 0; padding-left: 20px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .update-banner-command { margin: 0; min-height: 0; max-height: 88px; }
     label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 650; }
     /* label is a grid, so a bare help bubble next to the caption drops onto its
        own row. This keeps the two on one line. */
@@ -422,6 +429,24 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       <button class="ghost" id="toggleLiveButton" type="button">Pause Live</button>
     </div>
   </header>
+
+  <section class="update-banner" id="applicationUpdateBanner" role="status" aria-live="polite" hidden>
+    <div class="update-banner-card" id="applicationUpdateBannerCard">
+      <div class="toolbar" style="justify-content:space-between;align-items:flex-start">
+        <div class="stack" style="gap:4px">
+          <strong id="applicationUpdateTitle">Agent Bridge update</strong>
+          <div class="muted" id="applicationUpdateMessage"></div>
+        </div>
+        <div class="toolbar">
+          <button id="applicationUpdateApply" type="button">Update now</button>
+          <button class="ghost" id="applicationUpdateLater" type="button">Later</button>
+        </div>
+      </div>
+      <ul class="update-banner-notes" id="applicationUpdateNotes" hidden></ul>
+      <pre class="update-banner-command" id="applicationUpdateDiagnostic" hidden></pre>
+      <div class="meta" id="applicationUpdateLog" hidden></div>
+    </div>
+  </section>
 
   <div id="helpTooltip" role="tooltip"></div>
   <div class="modal-backdrop" id="githubTokenHelpModal" hidden>
@@ -1250,6 +1275,15 @@ agent-bridge ui</pre>
           <div class="list" id="tokenStack"></div>
           <h3>Optional CLIs</h3>
           <div class="list" id="tools"></div>
+          <div class="card stack">
+            <div class="toolbar" style="justify-content:space-between">
+              <div>
+                <h3>Agent Bridge updates</h3>
+                <div class="muted" id="applicationUpdateToolsStatus">Checks stable Git release tags without changing this workspace.</div>
+              </div>
+              <button class="secondary" id="applicationUpdateCheck" type="button">Check for updates</button>
+            </div>
+          </div>
           <div class="card">
             <h3>Install command</h3>
             <pre style="min-height: 0; max-height: 120px;">powershell -ExecutionPolicy Bypass -File .\\scripts\\install-token-tools.ps1 -InstallGlobal -CloneRepos</pre>

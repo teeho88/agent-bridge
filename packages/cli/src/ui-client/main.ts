@@ -163,6 +163,17 @@ const els: Record<string, any> = {
   claudeApprovalPolicy: elById('claudeApprovalPolicy'),
   claudeApprovalPolicyDescription: elById('claudeApprovalPolicyDescription'),
   cliApprovalSettingsStatus: elById('cliApprovalSettingsStatus'),
+  applicationUpdateBanner: elById('applicationUpdateBanner'),
+  applicationUpdateBannerCard: elById('applicationUpdateBannerCard'),
+  applicationUpdateTitle: elById('applicationUpdateTitle'),
+  applicationUpdateMessage: elById('applicationUpdateMessage'),
+  applicationUpdateApply: elById('applicationUpdateApply'),
+  applicationUpdateLater: elById('applicationUpdateLater'),
+  applicationUpdateNotes: elById('applicationUpdateNotes'),
+  applicationUpdateDiagnostic: elById('applicationUpdateDiagnostic'),
+  applicationUpdateLog: elById('applicationUpdateLog'),
+  applicationUpdateToolsStatus: elById('applicationUpdateToolsStatus'),
+  applicationUpdateCheck: elById('applicationUpdateCheck'),
   taskDetailModal: elById('taskDetailModal'),
   taskDetailTitle: elById('taskDetailTitle'),
   taskDetailBody: elById('taskDetailBody'),
@@ -183,6 +194,13 @@ let selectedLiveTaskId = '';
 let graphAnim = null;
 let selectedGraphPath = '';
 const workboardCreateGoalStorageKey = 'agent-bridge.workboardCreateGoal';
+const applicationUpdateNotifiedVersionKey = 'agent-bridge.update.notifiedVersion';
+const applicationUpdateDismissedVersionKey = 'agent-bridge.update.dismissedVersion';
+const applicationUpdateCheckIntervalMs = 30 * 60 * 1000;
+const applicationUpdateProgressPollMs = 1500;
+let applicationUpdateStatus: any = null;
+let applicationUpdateProgressTimer: number | undefined;
+let applicationUpdateCheckInFlight = false;
 try {
   const savedCreateGoal = window.localStorage.getItem(workboardCreateGoalStorageKey);
   const input = elById('workboardCreateGoal');
@@ -230,8 +248,174 @@ const suggestedImportanceByType = {
 async function api(path, options: any = {}) {
   const res = await fetch(path, { ...options, headers: { 'content-type': 'application/json', ...(options.headers || {}) } });
   const data = await res.json();
-  if (!res.ok) throw new Error(data.error || 'Request failed');
+  if (!res.ok) {
+    const error = Object.assign(new Error(data.error || data.reason || 'Request failed'), { data, status: res.status });
+    throw error;
+  }
   return data;
+}
+
+function localStorageValue(key: string): string {
+  try { return window.localStorage.getItem(key) || ''; } catch { return ''; }
+}
+
+function setLocalStorageValue(key: string, value: string): void {
+  try { window.localStorage.setItem(key, value); } catch {}
+}
+
+function applicationUpdateCheckedLabel(status: any): string {
+  if (!status?.checkedAt) return '';
+  const date = new Date(status.checkedAt);
+  return Number.isNaN(date.getTime()) ? '' : ' Last checked ' + date.toLocaleString() + '.';
+}
+
+function applicationUpdateDiagnostic(state: string): string {
+  if (state === 'dirty') return 'agent-bridge update --check --json\n# Inspect the Agent Bridge installation checkout and clean/stash local changes before retrying.';
+  if (state === 'diverged') return 'agent-bridge update --check --json\n# Restore the Agent Bridge installation checkout to its tracked release branch before retrying.';
+  return '';
+}
+
+function showApplicationUpdateToast(status: any): void {
+  const version = String(status?.latestVersion || '');
+  if (!version || !els.requestToastStack || localStorageValue(applicationUpdateNotifiedVersionKey) === version) return;
+  setLocalStorageValue(applicationUpdateNotifiedVersionKey, version);
+  const toast = document.createElement('div');
+  toast.className = 'request-toast application-update-toast';
+  toast.dataset.version = version;
+  toast.setAttribute('role', 'status');
+  toast.innerHTML =
+    '<div class="toolbar" style="justify-content:space-between;align-items:flex-start;flex-wrap:nowrap">' +
+      '<strong class="request-toast-title">Agent Bridge ' + escapeHtml(version) + ' is available</strong>' +
+      '<button class="request-toast-close" type="button" aria-label="Dismiss update notification">X</button>' +
+    '</div>' +
+    '<div class="request-toast-meta">Open the update banner or Tools to review and apply it.</div>';
+  const close = () => toast.remove();
+  qs(toast, '.request-toast-close')?.addEventListener('click', event => {
+    event.stopPropagation();
+    close();
+  });
+  toast.addEventListener('click', () => {
+    if (els.applicationUpdateBanner) els.applicationUpdateBanner.hidden = false;
+    close();
+  });
+  els.requestToastStack.appendChild(toast);
+  window.setTimeout(close, 15000);
+}
+
+function renderApplicationUpdateStatus(status: any, progress?: any): void {
+  if (!status || !els.applicationUpdateBanner) return;
+  applicationUpdateStatus = status;
+  const state = String(status.state || 'failed');
+  const version = String(status.latestVersion || progress?.targetVersion || '');
+  const current = String(status.currentVersion || progress?.fromVersion || '');
+  const blocked = state === 'dirty' || state === 'diverged' || state === 'unsupported';
+  const failed = state === 'failed';
+  const dismissed = version && localStorageValue(applicationUpdateDismissedVersionKey) === version;
+  const visible = state === 'available'
+    ? !dismissed
+    : ['dirty', 'diverged', 'updating', 'restart-required', 'failed'].includes(state);
+
+  els.applicationUpdateBanner.hidden = !visible;
+  els.applicationUpdateBannerCard.className = 'update-banner-card' + (blocked ? ' is-blocked' : '') + (failed ? ' is-failed' : '');
+  els.applicationUpdateBanner.setAttribute('role', failed ? 'alert' : 'status');
+  els.applicationUpdateTitle.textContent = version && current
+    ? 'Agent Bridge ' + current + ' → ' + version
+    : 'Agent Bridge update';
+
+  const reason = progress?.step || status.reason || '';
+  if (state === 'available') els.applicationUpdateMessage.textContent = 'A stable release is ready to install.';
+  else if (state === 'updating') els.applicationUpdateMessage.textContent = reason || 'Updating Agent Bridge...';
+  else if (state === 'restart-required') els.applicationUpdateMessage.textContent = reason || 'Update installed. Reconnecting to Work Board...';
+  else if (state === 'dirty' || state === 'diverged') els.applicationUpdateMessage.textContent = reason || 'The installation checkout is not safe to update.';
+  else if (state === 'failed') els.applicationUpdateMessage.textContent = progress?.error || reason || 'The update failed.';
+  else els.applicationUpdateMessage.textContent = reason;
+
+  const notes = Array.isArray(status.releaseNotes) ? status.releaseNotes.slice(0, 5) : [];
+  els.applicationUpdateNotes.hidden = notes.length === 0;
+  els.applicationUpdateNotes.innerHTML = notes.map(note => '<li>' + escapeHtml(note) + '</li>').join('');
+
+  const diagnostic = applicationUpdateDiagnostic(state);
+  els.applicationUpdateDiagnostic.hidden = !diagnostic;
+  els.applicationUpdateDiagnostic.textContent = diagnostic;
+
+  const logFile = progress?.logFile || '';
+  els.applicationUpdateLog.hidden = !logFile;
+  els.applicationUpdateLog.textContent = logFile ? 'Update log: ' + logFile : '';
+
+  els.applicationUpdateApply.hidden = !['available', 'updating', 'restart-required'].includes(state);
+  els.applicationUpdateApply.disabled = state !== 'available' || !status.canApply;
+  els.applicationUpdateApply.textContent = state === 'available' ? 'Update now' : (state === 'restart-required' ? 'Reconnecting...' : 'Updating...');
+  els.applicationUpdateLater.hidden = state !== 'available';
+
+  let toolsText = '';
+  if (state === 'current') toolsText = 'Agent Bridge ' + current + ' is up to date.';
+  else if (state === 'available') toolsText = 'Agent Bridge ' + version + ' is available' + (dismissed ? ' (banner dismissed).' : '.');
+  else if (state === 'offline') toolsText = 'Update check could not reach the Git remote. ' + (status.reason || '');
+  else if (state === 'unsupported') toolsText = status.reason || 'This installation cannot self-update from Git.';
+  else if (state === 'dirty' || state === 'diverged') toolsText = status.reason || 'Update is blocked by the installation checkout state.';
+  else if (state === 'failed') toolsText = progress?.error || status.reason || 'Update failed.';
+  else toolsText = reason || 'Update in progress.';
+  els.applicationUpdateToolsStatus.textContent = toolsText + applicationUpdateCheckedLabel(status);
+}
+
+async function checkApplicationUpdate(force = false): Promise<any> {
+  if (applicationUpdateCheckInFlight) return applicationUpdateStatus;
+  applicationUpdateCheckInFlight = true;
+  if (els.applicationUpdateCheck) {
+    els.applicationUpdateCheck.disabled = true;
+    els.applicationUpdateCheck.textContent = 'Checking...';
+  }
+  try {
+    const status = await api('/api/update/status' + (force ? '?refresh=1' : ''));
+    renderApplicationUpdateStatus(status);
+    if (status.state === 'available') showApplicationUpdateToast(status);
+    return status;
+  } catch (error) {
+    if (els.applicationUpdateToolsStatus) {
+      els.applicationUpdateToolsStatus.textContent = 'Update check failed: ' + String((error as Error).message || error);
+    }
+    return applicationUpdateStatus;
+  } finally {
+    applicationUpdateCheckInFlight = false;
+    if (els.applicationUpdateCheck) {
+      els.applicationUpdateCheck.disabled = false;
+      els.applicationUpdateCheck.textContent = 'Check for updates';
+    }
+  }
+}
+
+function stopApplicationUpdateProgressPolling(): void {
+  if (applicationUpdateProgressTimer !== undefined) window.clearTimeout(applicationUpdateProgressTimer);
+  applicationUpdateProgressTimer = undefined;
+}
+
+async function pollApplicationUpdateProgress(): Promise<void> {
+  stopApplicationUpdateProgressPolling();
+  try {
+    const data = await api('/api/update/progress');
+    const progress = data.progress;
+    if (progress) {
+      const progressState = progress.state === 'failed'
+        ? 'failed'
+        : (progress.state === 'restart-required' || progress.state === 'complete' ? 'restart-required' : 'updating');
+      renderApplicationUpdateStatus({
+        ...(applicationUpdateStatus || {}),
+        state: progressState,
+        canApply: false,
+        currentVersion: applicationUpdateStatus?.currentVersion || progress.fromVersion,
+        latestVersion: applicationUpdateStatus?.latestVersion || progress.targetVersion,
+      }, progress);
+      if (progress.state === 'failed') return;
+      if (progress.state === 'complete') {
+        const refreshed = await checkApplicationUpdate(true);
+        if (refreshed?.state === 'current') return;
+      }
+    }
+  } catch {
+    if (els.applicationUpdateMessage) els.applicationUpdateMessage.textContent = 'Work Board is restarting; reconnecting...';
+    if (els.applicationUpdateToolsStatus) els.applicationUpdateToolsStatus.textContent = 'Reconnecting after Agent Bridge update...';
+  }
+  applicationUpdateProgressTimer = window.setTimeout(pollApplicationUpdateProgress, applicationUpdateProgressPollMs);
 }
 
 async function load(force = false) {
@@ -713,7 +897,7 @@ function renderAgentRequest(request, options: any = {}) {
 function syncRequestToasts(requests) {
   if (!els.requestToastStack) return;
   const pendingIds = new Set((requests || []).filter(request => request.taskId).map(request => request.id));
-  qsa(els.requestToastStack, '.request-toast').forEach(toast => {
+  qsa(els.requestToastStack, '.request-toast:not(.run-toast):not(.application-update-toast)').forEach(toast => {
     if (!pendingIds.has(toast.dataset.requestId || '')) closeRequestToast(toast.dataset.requestId || '');
   });
   (requests || []).filter(request => request.taskId).forEach(request => {
@@ -2886,6 +3070,37 @@ on('searchButton', 'click', async () => {
 });
 
 on('refreshButton', 'click', () => load(true));
+on('applicationUpdateCheck', 'click', () => checkApplicationUpdate(true));
+on('applicationUpdateLater', 'click', () => {
+  const version = String(applicationUpdateStatus?.latestVersion || '');
+  if (version) setLocalStorageValue(applicationUpdateDismissedVersionKey, version);
+  if (els.applicationUpdateBanner) els.applicationUpdateBanner.hidden = true;
+  if (els.applicationUpdateToolsStatus && version) {
+    els.applicationUpdateToolsStatus.textContent = 'Agent Bridge ' + version + ' is available (banner dismissed).';
+  }
+});
+on('applicationUpdateApply', 'click', async () => {
+  if (!applicationUpdateStatus?.canApply || applicationUpdateStatus?.state !== 'available') return;
+  els.applicationUpdateApply.disabled = true;
+  els.applicationUpdateApply.textContent = 'Starting...';
+  try {
+    const started = await api('/api/update/apply', { method: 'POST', body: '{}' });
+    renderApplicationUpdateStatus(started.status, started.progress);
+    void pollApplicationUpdateProgress();
+  } catch (error) {
+    const payload = (error as any)?.data;
+    if (payload?.state) {
+      renderApplicationUpdateStatus(payload);
+    } else {
+      renderApplicationUpdateStatus({
+        ...(applicationUpdateStatus || {}),
+        state: 'failed',
+        canApply: false,
+        reason: String((error as Error).message || error),
+      });
+    }
+  }
+});
 on('installClaudeHookButton', 'click', async event => {
   const confirmed = confirm('Install Claude Code hooks for this project? Restart Claude Code after installing.');
   if (!confirmed) return;
@@ -3633,6 +3848,8 @@ els.githubSkillResults.addEventListener('click', async event => {
 
 setInterval(() => { if (live) load(false); }, 2000);
 load(true);
+void checkApplicationUpdate(false);
+setInterval(() => { void checkApplicationUpdate(true); }, applicationUpdateCheckIntervalMs);
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[char]));

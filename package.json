@@ -9,7 +9,9 @@
     "test": "corepack pnpm -r test",
     "lint": "corepack pnpm -r lint",
     "format": "prettier --write .",
-    "dev": "corepack pnpm --filter @agent-bridge/cli dev"
+    "dev": "corepack pnpm --filter @agent-bridge/cli dev",
+    "release:check": "node scripts/release-version.mjs check",
+    "release:version": "node scripts/release-version.mjs version"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

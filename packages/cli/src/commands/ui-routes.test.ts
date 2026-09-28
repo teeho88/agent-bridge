@@ -437,6 +437,7 @@ const SWEEPABLE_ROUTES: Array<[string, string]> = [
   ["GET", "/api/skills/github/search"],
   ["POST", "/api/skills/save"],
   ["GET", "/api/state"],
+  ["GET", "/api/update/progress"],
   ["POST", "/api/task/delete"],
   ["POST", "/api/task/prompt"],
   ["POST", "/api/task/start"],
@@ -473,6 +474,7 @@ const SWEEPABLE_ROUTES: Array<[string, string]> = [
 // and /api/workforce/catalog probes each agent CLI binary.
 const SIDE_EFFECTING_ROUTES: Array<[string, string]> = [
   ["GET", "/api/cache-report"],
+  ["GET", "/api/update/status"],
   ["GET", "/api/workforce/catalog"],
   ["POST", "/api/antigravity/install-hooks"],
   ["POST", "/api/claude/install-hooks"],
@@ -480,6 +482,7 @@ const SIDE_EFFECTING_ROUTES: Array<[string, string]> = [
   ["POST", "/api/session/focus"],
   ["POST", "/api/session/terminal"],
   ["POST", "/api/tools/install"],
+  ["POST", "/api/update/apply"],
   ["POST", "/api/watch/start"],
   ["POST", "/api/workforce/orchestration/approve-spawn"],
   ["POST", "/api/workforce/orchestration/auto-run"],

@@ -53,6 +53,34 @@ You can also call the generated wrapper directly:
 & "\path\to\agent-bridge\bin\agent-bridge.ps1" --help
 ```
 
+## Git self-update and releases
+
+Git source installations can check and apply stable Agent Bridge releases without replacing the existing `agent-bridge upgrade` migration command:
+
+```powershell
+agent-bridge update --check
+agent-bridge update --check --json
+agent-bridge update --apply
+```
+
+Self-update uses the Agent Bridge installation checkout, not the project currently open in Work Board. Only stable tags in the form `vMAJOR.MINOR.PATCH` are considered releases. Prerelease and malformed tags are ignored, and the tagged root `package.json` version must match the tag. Apply is blocked when the installation checkout is dirty, detached, diverged from its tracked release branch, cannot fast-forward, another update is already running, or an active orchestration/agent run makes restart unsafe. An unreachable Git remote is reported as offline without moving the checkout.
+
+The detached update worker targets the exact release commit selected by the check, installs from the frozen lockfile, rebuilds the monorepo, verifies `agent-bridge --version`, and restarts the UI with the same workspace and port. If install, build, or smoke verification fails after the fast-forward, it resets to the exact previous commit and rebuilds that version. Progress and logs live under the installation `.agent-memory/update/`; worker logs use `.agent-memory/update/update-<id>.log`.
+
+Work Board checks for updates when the page opens, when **Check for updates** is pressed, and every 30 minutes. Its normal `/api/state` refresh continues every two seconds and does not perform Git or updater network work.
+
+The root `package.json` is the canonical application version. Maintainers can validate a release or prepare a synchronized version change with:
+
+```powershell
+corepack pnpm release:check
+corepack pnpm release:version -- patch
+corepack pnpm release:version -- minor
+corepack pnpm release:version -- major
+corepack pnpm release:version -- 1.2.3
+```
+
+`release:version` updates the synchronized package versions and runs release checks; it never creates a Git tag or pushes. After reviewing and committing the version change, the maintainer creates and pushes the stable release tag manually.
+
 ## Quick start
 
 Run these commands inside the project that the agents will work on:
