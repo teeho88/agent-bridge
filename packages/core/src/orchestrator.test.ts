@@ -2041,6 +2041,55 @@ describe("orchestrator", () => {
     });
   });
 
+  it("removes stale terminal reviews from adjudication before asking for decisions", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const prompts = new Map<string, string>();
+      const deps = makeDeps(store, logs, prompts);
+      const leader = createWorkerLeader(store);
+      const task = store.createTask({ title: "Recover stale adjudication", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
+
+      const planRunId = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
+      finishRun(store, logs, planRunId, fenced({
+        version: 1,
+        phase: "plan",
+        complexity: "small",
+        planMarkdown: "# Plan",
+        subtasks: [{ key: "s1", title: "Fix migration ordering", acceptanceCriteria: [], dependsOn: [], files: [] }],
+        reviewers: [],
+        questions: [],
+      }));
+      stepOrchestration(store, orchestration.id, deps);
+
+      const subtask = store.listSubtasks({ parentTaskId: task.id })[0]!;
+      store.updateSubtask(subtask.id, { status: "cancelled", statusReason: "Superseded." });
+      const staleReview = store.createReview({
+        taskId: task.id,
+        subtaskId: subtask.id,
+        verdict: "rework",
+        summary: "This stale review must not require another decision.",
+      });
+      store.updateOrchestration(orchestration.id, { status: "adjudicating", cycle: 1 });
+
+      let step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.spawnedRunIds).toHaveLength(1);
+      expect(store.listReviews({ taskId: task.id, consumed: true }).map((review) => review.id)).toContain(staleReview.id);
+      expect(prompts.get(step.spawnedRunIds[0]!)!).not.toContain(staleReview.summary);
+
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "adjudicate",
+        decisions: [],
+        projectComplete: true,
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.orchestration.status).toBe("reporting");
+      expect(step.orchestration.lastError).toBeFalsy();
+    });
+  });
+
   it("replays the leader's own draft and asked questions into the next planning turn", () => {
     withStore((store) => {
       const logs = new Map<string, string>();

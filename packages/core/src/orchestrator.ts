@@ -1417,6 +1417,8 @@ function stepAdjudicating(
   const dropped = applyOpenSubtaskDrop(store, orchestration);
   if (dropped) return dropped;
 
+  consumeTerminalPendingReviews(store, orchestration);
+
   const adjudicateRuns = store
     .listAgentRuns({ orchestrationId: orchestration.id, limit: 100 })
     .filter((run) => run.phase === "adjudicate");
@@ -1520,6 +1522,22 @@ function stepAdjudicating(
     actor: isLeader ? "Leader" : "Adjudicator",
     contextStore: ctx,
   });
+}
+
+function consumeTerminalPendingReviews(store: MemoryStore, orchestration: Orchestration): void {
+  const terminalSubtaskIds = new Set(
+    store
+      .listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 })
+      .filter((subtask) => ["done", "cancelled"].includes(subtask.status))
+      .map((subtask) => subtask.id),
+  );
+  if (!terminalSubtaskIds.size) return;
+
+  for (const review of store.listReviews({ taskId: orchestration.taskId, consumed: false })) {
+    if (review.subtaskId && terminalSubtaskIds.has(review.subtaskId)) {
+      store.markReviewConsumed(review.id);
+    }
+  }
 }
 
 function validateAdjudicationTurn(
