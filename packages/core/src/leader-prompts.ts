@@ -590,6 +590,9 @@ export function renderAdjudicatePrompt(input: {
   const repeated = input.reviews.filter(
     (review) => review.priorReviews?.length || review.context?.prior.length,
   );
+  const exampleSubtaskKey = input.reviews[0]?.subtaskKey ?? input.subtasks.find(
+    (subtask) => !["done", "cancelled"].includes(subtask.status),
+  )?.key;
   // Anything not done and not cancelled blocks completion, whether or not it
   // ever produced a review. Naming these is what turns "projectComplete was
   // rejected" into something the leader can actually act on.
@@ -652,28 +655,13 @@ export function renderAdjudicatePrompt(input: {
     "Reply with EXACTLY one fenced ```json block and nothing else outside it:",
     "",
     "```json",
-    JSON.stringify(
-      {
-        version: 1,
-        phase: "adjudicate",
-        decisions: [
-          {
-            subtaskKey: "s1",
-            verdict: "rework",
-            rework: {
-              title: "Fix migration ordering",
-              goal: "TASK\nFix migration ordering.\n\nGOAL\nThe agent-runs index exists before any query depends on it.\n\nCONSTRAINTS\n- Preserve the accepted schema behavior from the earlier attempt.\n- Change only the migration ordering defect identified by review.\n\nSUCCESS CRITERIA\n- idx_agent_runs_task exists\n- roundtrip test passes",
-              acceptanceCriteria: ["idx_agent_runs_task exists", "roundtrip test passes"],
-              agentPreference: { provider: "codex", mode: "cli", model: "gpt-5.6-sol", reasoningEffort: "xhigh" },
-            },
-          },
-        ],
-        projectComplete: false,
-        questions: [],
-      },
-      null,
-      2,
-    ),
+    JSON.stringify({
+      version: 1,
+      phase: "adjudicate",
+      decisions: exampleSubtaskKey ? [{ subtaskKey: exampleSubtaskKey, verdict: "accept" }] : [],
+      projectComplete: false,
+      questions: [],
+    }, null, 2),
     "```",
   );
   return `${lines.join("\n")}\n`;

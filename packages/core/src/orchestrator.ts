@@ -1467,6 +1467,17 @@ function stepAdjudicating(
   }
 
   const isLeader = finished.agentId === orchestration.leaderAgentId;
+  const validationError = validateAdjudicationTurn(store, orchestration, parsed.turn);
+  if (validationError) {
+    return retryInvalidAdjudicationTurn(
+      store,
+      orchestration,
+      deps,
+      finished,
+      isLeader ? "leader" : "adjudicator",
+      validationError,
+    );
+  }
   if (!isLeader && requiresLeaderAdjudication(store, orchestration, parsed.turn)) {
     const leader = mustGetAgent(store, orchestration.leaderAgentId);
     const gated = gateSpawn(
@@ -1509,6 +1520,75 @@ function stepAdjudicating(
     actor: isLeader ? "Leader" : "Adjudicator",
     contextStore: ctx,
   });
+}
+
+function validateAdjudicationTurn(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  turn: LeaderAdjudicateTurn,
+): string | undefined {
+  const subtasks = new Map(
+    store.listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 }).map((subtask) => [subtask.id, subtask]),
+  );
+  const decided = new Set<string>();
+  for (const decision of turn.decisions) {
+    if (decided.has(decision.subtaskKey)) return `Duplicate decision for subtask key: ${decision.subtaskKey}`;
+    decided.add(decision.subtaskKey);
+    const meta = findSubtaskMetaByKey(store, orchestration.id, decision.subtaskKey);
+    const subtask = meta ? subtasks.get(meta.subtaskId) : undefined;
+    if (!subtask) return `Unknown subtask key: ${decision.subtaskKey}`;
+    if (["done", "cancelled"].includes(subtask.status)) {
+      return `Cannot ${decision.verdict} terminal subtask: ${decision.subtaskKey}`;
+    }
+    if (decision.verdict === "rework") {
+      if (!decision.rework) return `Rework decision is missing replacement details for: ${decision.subtaskKey}`;
+      if (orchestration.cycle >= orchestration.maxCycles) {
+        return `Cannot rework ${decision.subtaskKey}: rework cycle limit ${orchestration.maxCycles} has been reached`;
+      }
+    }
+  }
+  return undefined;
+}
+
+function retryInvalidAdjudicationTurn(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  deps: OrchestratorDeps,
+  failedRun: AgentRun,
+  actor: "leader" | "adjudicator",
+  error: string,
+): OrchestrationStepResult {
+  const priorFailures = store
+    .listOrchestrationEvents({ orchestrationId: orchestration.id, limit: 500 })
+    .filter((event) => event.phase === "adjudicate" && event.kind === "error" && event.summary?.startsWith("Invalid adjudication decision:"));
+  if (priorFailures.length >= 1) {
+    recordEvent(store, orchestration, "adjudicate", "error", `Invalid adjudication decision: ${error}`);
+    consumeRun(store, orchestration, "adjudicate", failedRun, `had an invalid decision (${error})`);
+    createQuestion(store, orchestration, { question: `Adjudication returned invalid decisions after retrying: ${error}`, options: [] });
+    const updated = store.updateOrchestration(orchestration.id, { status: "paused", lastError: error }) ?? orchestration;
+    return result(updated, "Adjudication returned invalid decisions twice; paused for user input.", []);
+  }
+  const agent = mustGetAgent(store, failedRun.agentId);
+  const gated = gateSpawn(
+    store,
+    orchestration,
+    `adjudicate:validation-retry:${failedRun.id}`,
+    `Retry the ${actor} adjudication turn with ${describeAgent(agent)} after invalid decisions`,
+    agent.id,
+  );
+  if (gated) return gated;
+  recordEvent(store, orchestration, "adjudicate", "error", `Invalid adjudication decision: ${error}`);
+  consumeRun(store, orchestration, "adjudicate", failedRun, `had an invalid decision (${error})`);
+  const prompt = [
+    buildAdjudicationPrompt(store, orchestration, deps, actor),
+    "",
+    "## Correct Your Previous Output",
+    `Your previous output was rejected before any state changed: ${error}`,
+    "Return a complete replacement adjudication JSON using only current, non-terminal subtask keys.",
+  ].join("\n");
+  const run = spawnTurn(deps, store, orchestration, agent, prompt, "adjudicate");
+  recordEvent(store, orchestration, "adjudicate", "spawn", `Retried ${actor} adjudication after invalid decision (${run.id}).`);
+  return result(orchestration, "Retrying adjudication after invalid decisions.", [run.id]);
 }
 
 // A decision needs its own document, and an accepted subtask needs the

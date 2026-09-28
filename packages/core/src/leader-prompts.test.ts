@@ -94,6 +94,22 @@ describe("renderAdjudicatePrompt", () => {
     expect(prompt).toContain("s2 (Add high score): verdict=pass score=100");
   });
 
+  it("uses only current input in its adjudication output example", () => {
+    const prompt = renderAdjudicatePrompt({
+      taskTitle: "Add levels 4 and 5",
+      cycle: 1,
+      maxCycles: 8,
+      reviews: [{ subtaskKey: "level-config", subtaskTitle: "Add level configs", verdict: "pass", summary: "Looks good." }],
+      subtasks: [{ key: "level-config", title: "Add level configs", status: "review", acceptanceCriteria: ["5 levels exist"] }],
+    });
+
+    expect(prompt).toContain('"subtaskKey": "level-config"');
+    expect(prompt).not.toContain("Fix migration ordering");
+    expect(prompt).not.toContain("idx_agent_runs_task");
+    expect(prompt).not.toContain("roundtrip test passes");
+    expect(prompt).not.toContain('"subtaskKey": "s1"');
+  });
+
   it("explains first-pass adjudication and includes an escalated proposal for the leader", () => {
     const firstPass = renderAdjudicatePrompt({ ...base, actor: "adjudicator" });
     expect(firstPass).toContain("# Adjudicator Turn");

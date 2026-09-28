@@ -2196,6 +2196,28 @@ describe("orchestrator", () => {
       expect(secondAdjudicatePrompt).toContain("GOAL\nHandle an empty netlist");
       expect(secondAdjudicatePrompt).toContain("SUCCESS CRITERIA\n- edge case handled");
       expect(secondAdjudicatePrompt).toContain("Do not re-issue a rework you already ordered");
+
+      // A copied stale key must not create a second sibling replacement from
+      // the cancelled original. The whole turn is rejected before it consumes
+      // the current review or changes the rework cycle.
+      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "adjudicate",
+        decisions: [{
+          subtaskKey: "s1",
+          verdict: "rework",
+          rework: { title: "Repeat stale work", acceptanceCriteria: ["never applied"] },
+        }],
+        projectComplete: false,
+        questions: [],
+      }));
+      step = stepOrchestration(store, orchestration.id, deps);
+
+      expect(step.spawnedRunIds).toHaveLength(1);
+      expect(store.getOrchestration(orchestration.id)?.cycle).toBe(2);
+      expect(store.listSubtasks({ parentTaskId: task.id }).map((subtask) => subtask.title)).not.toContain("Repeat stale work");
+      expect(store.listSubtasks({ parentTaskId: task.id }).find((subtask) => subtask.title === "Fix the edge case")?.status).toBe("review");
+      expect(prompts.get(step.spawnedRunIds[0]!)!).toContain("Cannot rework terminal subtask: s1");
     });
   });
 
