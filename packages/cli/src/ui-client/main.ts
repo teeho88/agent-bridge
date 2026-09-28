@@ -2134,6 +2134,7 @@ async function refreshOrchestratorBoard() {
     renderAutoRunState(Boolean(data.autoRun));
     renderAutonomySelect(orchestration.autonomy);
     renderPauseToggle(orchestration.status);
+    renderAddCycles(orchestration);
     renderLeaderQuestions(data.questions || []);
     renderOrchestrationLeader(orchestration, data.leaderAgent);
     renderSpawnApprovals(data.approvals || [], data.registeredAgents || []);
@@ -2146,6 +2147,9 @@ async function refreshOrchestratorBoard() {
     summaryEl.innerHTML = heading + fellBack +
       'status: <strong>' + escapeHtml(orchestration.status) + '</strong> · <span title="Rework rounds used. Only a rework decision advances this; accepted work costs nothing.">rework cycle ' +
       escapeHtml(String(orchestration.cycle)) + '/' + escapeHtml(String(orchestration.maxCycles)) + '</span>' +
+      (orchestration.cycle >= orchestration.maxCycles && orchestration.status === 'adjudicating'
+        ? ' · <strong title="No new rework is allowed. Open work must be accepted or dropped and recorded in the report.">finalization cycle</strong>'
+        : '') +
       (orchestration.complexity ? ' · ' + escapeHtml(orchestration.complexity) : '') +
 
       (orchestration.lastError ? ' · <span class="error">' + escapeHtml(orchestration.lastError) + '</span>' : '') +
@@ -2635,6 +2639,35 @@ on('orchestratorStepButton', 'click', async () => {
     alert(error.message);
   }
   await refreshOrchestratorBoard();
+});
+
+function renderAddCycles(orchestration) {
+  const button = elById('orchestratorAddCyclesButton');
+  const input = elById('orchestratorAddCyclesInput');
+  const allowed = ['planning', 'executing', 'adjudicating', 'paused'].includes(orchestration.status);
+  if (button) button.disabled = !allowed;
+  if (input) input.disabled = !allowed;
+}
+
+on('orchestratorAddCyclesButton', 'click', async event => {
+  const taskId = currentOrchestratorTaskId();
+  if (!taskId) return;
+  const button = event.currentTarget;
+  const input = elById('orchestratorAddCyclesInput');
+  const status = elById('orchestratorAddCyclesStatus');
+  button.disabled = true;
+  try {
+    const result = await api('/api/workforce/orchestration/add-cycles', {
+      method: 'POST',
+      body: JSON.stringify({ taskId, additionalCycles: Number(input.value) })
+    });
+    status.textContent = result.previousMaxCycles + ' -> ' + result.orchestration.maxCycles;
+    await refreshOrchestratorBoard();
+  } catch (error) {
+    status.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
 });
 
 // One button, two directions: which one it is follows the orchestration's

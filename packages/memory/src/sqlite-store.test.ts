@@ -1793,4 +1793,22 @@ describe("agent run cycle", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("increments orchestration cycle budgets atomically and enforces bounds", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-bridge-cycle-budget-"));
+    const store = new SQLiteMemoryStore(join(dir, "memories.db"));
+    try {
+      const task = store.createTask({ title: "Budget", ownerAgent: "codex" });
+      const leader = store.createRegisteredAgent({ name: "leader", provider: "codex", mode: "cli", command: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id, maxCycles: 8 });
+      expect(store.incrementOrchestrationMaxCycles(orchestration.id, 2)?.maxCycles).toBe(10);
+      expect(store.incrementOrchestrationMaxCycles(orchestration.id, 3)?.maxCycles).toBe(13);
+      expect(() => store.incrementOrchestrationMaxCycles(orchestration.id, 0)).toThrow("integer from 1 to 100");
+      store.updateOrchestration(orchestration.id, { maxCycles: 995 });
+      expect(() => store.incrementOrchestrationMaxCycles(orchestration.id, 6)).toThrow("cannot exceed 1000");
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

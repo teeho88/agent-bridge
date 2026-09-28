@@ -2429,6 +2429,45 @@ describe("finishing with open subtasks", () => {
     });
   });
 
+  it("forces finalization after one invalid retry at the cycle limit", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const prompts = new Map<string, string>();
+      const deps = makeDeps(store, logs, prompts);
+      const { task, orchestration } = planOneOpenSubtask(store, logs, deps, "Bounded finalization");
+      store.updateOrchestration(orchestration.id, { maxCycles: 1 });
+
+      const firstRunId = stepOrchestration(store, orchestration.id, deps).spawnedRunIds[0]!;
+      finishRun(store, logs, firstRunId, fenced({
+        version: 1,
+        phase: "adjudicate",
+        decisions: [{ subtaskKey: "s1", verdict: "rework", rework: { title: "Again", acceptanceCriteria: ["done"] } }],
+        projectComplete: false,
+        questions: [],
+      }));
+      const retry = stepOrchestration(store, orchestration.id, deps);
+      expect(retry.spawnedRunIds).toHaveLength(1);
+      expect(prompts.get(retry.spawnedRunIds[0]!)).toContain("Finalization contract violated");
+
+      finishRun(store, logs, retry.spawnedRunIds[0]!, fenced({
+        version: 1,
+        phase: "adjudicate",
+        decisions: [],
+        projectComplete: false,
+        questions: [{ question: "Continue?", options: [] }],
+      }));
+      const finalized = stepOrchestration(store, orchestration.id, deps);
+
+      expect(finalized.orchestration.status).toBe("reporting");
+      expect(store.listSubtasks({ parentTaskId: task.id })[0]).toMatchObject({
+        status: "cancelled",
+        statusReason: expect.stringContaining("Dropped at cycle limit"),
+      });
+      expect(store.listOrchestrationEvents({ orchestrationId: orchestration.id, kind: "forced_finalization" })).toHaveLength(1);
+      expect(store.listAgentRequests({ taskId: task.id, status: "pending" })).toHaveLength(0);
+    });
+  });
+
   it("drops the open subtasks itself when the user picks that answer on the completion guard", () => {
     withStore((store) => {
       const logs = new Map<string, string>();

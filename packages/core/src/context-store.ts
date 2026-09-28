@@ -108,6 +108,7 @@ export type ContextStore = {
   appendAssignment(entry: AssignmentLogEntry): void;
   writeIndex(input: IndexInput): void;
   writeSummary(contextKey: string, markdown: string): string;
+  writeTurn(kind: TurnKind, contextKey: string, round: number, markdown: string): string;
 
   // The gate: a turn may only advance the state machine once its document
   // exists and carries a Summary. Prompts alone do not get files written.
@@ -200,6 +201,12 @@ export function createContextStore(
 
     writeSummary(contextKey, markdown) {
       const path = summaryPath(contextKey);
+      io.write(path, `${markdown.trimEnd()}\n`);
+      return path;
+    },
+
+    writeTurn(kind, contextKey, round, markdown) {
+      const path = turnPath(kind, contextKey, round);
       io.write(path, `${markdown.trimEnd()}\n`);
       return path;
     },

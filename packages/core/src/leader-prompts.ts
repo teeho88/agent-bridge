@@ -459,6 +459,7 @@ export function renderAdjudicatePrompt(input: {
   approvalNotes?: Array<{ approved: string; note: string }>;
 }): string {
   const actor = input.actor ?? "leader";
+  const finalization = input.cycle >= input.maxCycles;
   const lines = [
     actor === "leader" ? "# Leader Adjudication Turn" : "# Adjudicator Turn",
     "",
@@ -468,6 +469,14 @@ export function renderAdjudicatePrompt(input: {
     // against a budget it is not actually spending.
     `Rework cycle ${input.cycle} of at most ${input.maxCycles}. Only a rework decision advances this counter — accepting work costs nothing.`,
   ];
+  if (finalization) {
+    lines.push(
+      "",
+      "## FINALIZATION CYCLE — MANDATORY",
+      "This is the last allowed rework cycle. You must close every open subtask in this turn with `accept` or `drop`, set `projectComplete` to true, and return no questions.",
+      "`rework` and `block` are forbidden. Use `drop` for any unmet work and record the remaining defect or risk in its decision file so the final report remains honest.",
+    );
+  }
   if (actor === "adjudicator") {
     lines.push(
       "",
@@ -535,7 +544,9 @@ export function renderAdjudicatePrompt(input: {
             // orchestration with nothing for the user to act on either.
             `${stuck.length} subtask(s) above are STRANDED or BLOCKED. They are the outstanding work, and only you can clear them — decide each one below.`,
           ]
-        : ["Return an empty `decisions` array and decide `projectComplete` on the subtask statuses above."]),
+        : [finalization && input.subtasks.some((subtask) => !["done", "cancelled"].includes(subtask.status))
+            ? "No reviews remain, but finalization still requires a decision for every open subtask above."
+            : "Return an empty `decisions` array and decide `projectComplete` on the subtask statuses above."]),
     );
   }
   for (const review of input.reviews) {
@@ -606,8 +617,10 @@ export function renderAdjudicatePrompt(input: {
           "- If they tell you to stop, cut scope, or finish now regardless of outstanding defects, that is a decision you must execute here: accept or cancel whatever is left, name every unresolved defect in your decision files so the report carries it, and set `projectComplete` to true. Do not order more rework the user has ruled out, and do not park the run on another question to confirm what they already said.",
         ]
       : []),
-    "- For each subtask with a pending review, decide accept, rework, or block.",
-    "- Use rework when the acceptance criteria are not fully met yet; give the replacement a complete TASK / GOAL / CONSTRAINTS / SUCCESS CRITERIA contract so the next implementer knows its exact scope and finish line.",
+    finalization
+      ? "- FINALIZATION: decide every open subtask with accept or drop; rework, block, and questions are forbidden."
+      : "- For each subtask with a pending review, decide accept, rework, or block.",
+    ...(finalization ? [] : ["- Use rework when the acceptance criteria are not fully met yet; give the replacement a complete TASK / GOAL / CONSTRAINTS / SUCCESS CRITERIA contract so the next implementer knows its exact scope and finish line."]),
     ...(contextual.length
       ? [
           `- Write the decision file for every subtask you decide. A decision whose file is missing or has an empty \`## Summary\` is rejected and the turn is retried.`,
@@ -624,11 +637,13 @@ export function renderAdjudicatePrompt(input: {
           "- When a finding repeats, either write a materially different instruction that says exactly what to change (file, function, expected behaviour), or block it and ask the user. Do not re-issue the same rework in new words.",
         ]
       : []),
-    "- Use block only when the subtask cannot proceed without user input; explain why in `questions`.",
+    ...(finalization ? [] : ["- Use block only when the subtask cannot proceed without user input; explain why in `questions`."]),
     "- Use `drop` to cancel a subtask outright: the work is no longer wanted, or the user has told you to stop. A dropped subtask is closed for good and needs no review, no rework and no question — say in your decision file what is being left undone so the report carries it.",
     ...(open.length
       ? [
-          `- \`projectComplete: true\` is REJECTED while any subtask is still open, and the turn comes straight back to you. ${open.length} are open now: ${open.map((subtask) => subtask.key).join(", ")}. To finish, give EVERY one of them a decision in this same turn — \`accept\` if its criteria are in fact met, \`rework\` if it must still be done, or \`drop\` if it will not be. Marking the project complete without deciding them is what loops the run.`,
+          finalization
+            ? `- ${open.length} subtask(s) are open now: ${open.map((subtask) => subtask.key).join(", ")}. Give EVERY one an \`accept\` or \`drop\` decision in this turn, then set \`projectComplete: true\`.`
+            : `- \`projectComplete: true\` is REJECTED while any subtask is still open, and the turn comes straight back to you. ${open.length} are open now: ${open.map((subtask) => subtask.key).join(", ")}. To finish, give EVERY one of them a decision in this same turn — \`accept\` if its criteria are in fact met, \`rework\` if it must still be done, or \`drop\` if it will not be. Marking the project complete without deciding them is what loops the run.`,
         ]
       : []),
     "- Ignore [cancelled] subtasks: they were superseded by a later subtask and are not outstanding work.",
@@ -659,7 +674,7 @@ export function renderAdjudicatePrompt(input: {
       version: 1,
       phase: "adjudicate",
       decisions: exampleSubtaskKey ? [{ subtaskKey: exampleSubtaskKey, verdict: "accept" }] : [],
-      projectComplete: false,
+      projectComplete: finalization,
       questions: [],
     }, null, 2),
     "```",

@@ -157,6 +157,7 @@ export interface MemoryStore {
   getOrchestration(id: string): Orchestration | undefined;
   getOrchestrationByTask(taskId: string): Orchestration | undefined;
   updateOrchestration(id: string, input: UpdateOrchestrationInput): Orchestration | undefined;
+  incrementOrchestrationMaxCycles(id: string, delta: number): Orchestration | undefined;
   listOrchestrations(options?: { status?: OrchestrationStatus; leaderAgentId?: string; limit?: number }): Orchestration[];
   recordOrchestrationEvent(input: RecordOrchestrationEventInput): OrchestrationEvent;
   listOrchestrationEvents(options?: {

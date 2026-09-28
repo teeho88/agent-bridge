@@ -178,6 +178,52 @@ describe("task routes", () => {
   });
 });
 
+describe("orchestration cycle budget route", () => {
+  it("adds cycles without changing a paused orchestration's phase", async () => {
+    const store = openStore(root);
+    let taskId = "";
+    try {
+      const task = store.createTask({ title: "Add budget", ownerAgent: "codex" });
+      taskId = task.id;
+      const leader = store.createRegisteredAgent({ name: "leader", provider: "codex", mode: "cli", command: "codex" });
+      const orchestration = store.createOrchestration({ taskId, leaderAgentId: leader.id, maxCycles: 4 });
+      store.updateOrchestration(orchestration.id, { status: "paused", cycle: 4 });
+    } finally {
+      store.close();
+    }
+
+    const response = await call("POST", "/api/workforce/orchestration/add-cycles", { taskId, additionalCycles: 3 });
+    expect(response.status).toBe(200);
+    expect(response.json<{ orchestration: { status: string; cycle: number; maxCycles: number }; previousMaxCycles: number }>()
+      .orchestration).toEqual(expect.objectContaining({ status: "paused", cycle: 4, maxCycles: 7 }));
+
+    const verify = openStore(root);
+    try {
+      const orchestration = verify.getOrchestrationByTask(taskId)!;
+      expect(verify.listOrchestrationEvents({ orchestrationId: orchestration.id })[0]?.summary)
+        .toContain("cycle_budget_increased: 4 -> 7 (+3)");
+    } finally {
+      verify.close();
+    }
+  });
+
+  it("rejects invalid deltas and terminal orchestrations", async () => {
+    const store = openStore(root);
+    let taskId = "";
+    try {
+      const task = store.createTask({ title: "Closed budget", ownerAgent: "codex" });
+      taskId = task.id;
+      const leader = store.createRegisteredAgent({ name: "leader", provider: "codex", mode: "cli", command: "codex" });
+      const orchestration = store.createOrchestration({ taskId, leaderAgentId: leader.id });
+      store.updateOrchestration(orchestration.id, { status: "done" });
+    } finally {
+      store.close();
+    }
+    expect((await call("POST", "/api/workforce/orchestration/add-cycles", { taskId, additionalCycles: 0 })).status).toBe(500);
+    expect((await call("POST", "/api/workforce/orchestration/add-cycles", { taskId, additionalCycles: 1 })).status).toBe(500);
+  });
+});
+
 describe("memory routes", () => {
   it("stores a memory and finds it again through search", async () => {
     await call("POST", "/api/task/start", { title: "Memory host", agent: "claude" });
@@ -408,6 +454,7 @@ const SWEEPABLE_ROUTES: Array<[string, string]> = [
   ["POST", "/api/workforce/default-agent/restore"],
   ["POST", "/api/workforce/default-agent/toggle"],
   ["POST", "/api/workforce/orchestration/answer-questions"],
+  ["POST", "/api/workforce/orchestration/add-cycles"],
   ["POST", "/api/workforce/orchestration/leader"],
   ["POST", "/api/workforce/orchestration/pause"],
   ["POST", "/api/workforce/orchestration/report"],

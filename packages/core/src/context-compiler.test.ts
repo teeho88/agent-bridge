@@ -699,6 +699,9 @@ function baseStore(
     updateOrchestration() {
       return undefined;
     },
+    incrementOrchestrationMaxCycles() {
+      return undefined;
+    },
     listOrchestrations() {
       return [];
     },

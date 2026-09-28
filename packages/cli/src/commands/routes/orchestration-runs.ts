@@ -513,6 +513,40 @@ export async function routePostWorkforceOrchestrationPause(ctx: RouteContext): P
   return;
 }
 
+export async function routePostWorkforceOrchestrationAddCycles(ctx: RouteContext): Promise<void> {
+  const { req, res, cwd } = ctx;
+  const body = await readJson(req);
+  const store = openStore(cwd);
+  try {
+    const orchestration = mustGetOrchestrationForUi(store, requiredString(body.taskId, "taskId"));
+    const additionalCycles = Number(body.additionalCycles);
+    if (!Number.isInteger(additionalCycles) || additionalCycles < 1 || additionalCycles > 100) {
+      throw new Error("additionalCycles must be an integer from 1 to 100.");
+    }
+    if (!["planning", "executing", "adjudicating", "paused"].includes(orchestration.status)) {
+      throw new Error(`Cannot add cycles while orchestration is ${orchestration.status}.`);
+    }
+    const updated = store.incrementOrchestrationMaxCycles(orchestration.id, additionalCycles);
+    if (!updated) throw new Error(`Orchestration not found: ${orchestration.id}`);
+    store.recordOrchestrationEvent({
+      orchestrationId: orchestration.id,
+      cycle: orchestration.cycle,
+      phase: orchestration.status,
+      kind: "user_action",
+      summary: `cycle_budget_increased: ${orchestration.maxCycles} -> ${updated.maxCycles} (+${additionalCycles}).`,
+      payload: JSON.stringify({ previousMaxCycles: orchestration.maxCycles, maxCycles: updated.maxCycles, additionalCycles }),
+    });
+    sendJson(res, 200, {
+      orchestration: updated,
+      previousMaxCycles: orchestration.maxCycles,
+      additionalCycles,
+      autoRun: isAutoRunning(orchestration.id),
+    });
+  } finally {
+    store.close();
+  }
+}
+
 export async function routePostWorkforceOrchestrationResume(ctx: RouteContext): Promise<void> {
   const { req, res, cwd } = ctx;
   const body = await readJson(req);

@@ -775,6 +775,7 @@ export type OrchestrationEventKind =
   | "run_ended"
   | "verdict"
   | "rework"
+  | "forced_finalization"
   | "error"
   | "user_action";
 

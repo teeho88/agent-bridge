@@ -107,6 +107,10 @@ const TERMINAL_RUN_STATUSES = new Set(["done", "failed", "detached", "stopped"])
 // How much of an implementer's log is kept as its assignment summary.
 const ASSIGNMENT_SUMMARY_CHARS = 800;
 
+export function isFinalizationCycle(orchestration: Pick<Orchestration, "cycle" | "maxCycles">): boolean {
+  return orchestration.cycle >= orchestration.maxCycles;
+}
+
 // Advances an orchestration by exactly one step. Callers (CLI `workforce
 // step`/`watch`) are expected to have already called reapAgentRuns for this
 // task so run statuses reflect reality before this is called.
@@ -1478,6 +1482,7 @@ function stepAdjudicating(
       finished,
       isLeader ? "leader" : "adjudicator",
       validationError,
+      parsed.turn,
     );
   }
   if (!isLeader && requiresLeaderAdjudication(store, orchestration, parsed.turn)) {
@@ -1560,10 +1565,25 @@ function validateAdjudicationTurn(
     }
     if (decision.verdict === "rework") {
       if (!decision.rework) return `Rework decision is missing replacement details for: ${decision.subtaskKey}`;
-      if (orchestration.cycle >= orchestration.maxCycles) {
+      if (orchestration.cycle >= orchestration.maxCycles && !isFinalizationCycle(orchestration)) {
         return `Cannot rework ${decision.subtaskKey}: rework cycle limit ${orchestration.maxCycles} has been reached`;
       }
     }
+  }
+  if (isFinalizationCycle(orchestration)) {
+    const openKeys = [...subtasks.values()]
+      .filter((subtask) => !["done", "cancelled"].includes(subtask.status))
+      .map((subtask) => findSubtaskKey(store, orchestration.id, subtask.id) ?? subtask.id);
+    const missing = openKeys.filter((key) => !decided.has(key));
+    const forbidden = turn.decisions
+      .filter((decision) => !["accept", "drop"].includes(decision.verdict))
+      .map((decision) => `${decision.subtaskKey}:${decision.verdict}`);
+    const errors: string[] = [];
+    if (missing.length) errors.push(`missing decisions for ${missing.join(", ")}`);
+    if (forbidden.length) errors.push(`forbidden finalization verdicts ${forbidden.join(", ")}`);
+    if (!turn.projectComplete) errors.push("projectComplete must be true");
+    if (turn.questions.length) errors.push("questions must be empty");
+    if (errors.length) return `Finalization contract violated: ${errors.join("; ")}`;
   }
   return undefined;
 }
@@ -1575,6 +1595,7 @@ function retryInvalidAdjudicationTurn(
   failedRun: AgentRun,
   actor: "leader" | "adjudicator",
   error: string,
+  invalidTurn: LeaderAdjudicateTurn,
 ): OrchestrationStepResult {
   const priorFailures = store
     .listOrchestrationEvents({ orchestrationId: orchestration.id, limit: 500 })
@@ -1582,6 +1603,9 @@ function retryInvalidAdjudicationTurn(
   if (priorFailures.length >= 1) {
     recordEvent(store, orchestration, "adjudicate", "error", `Invalid adjudication decision: ${error}`);
     consumeRun(store, orchestration, "adjudicate", failedRun, `had an invalid decision (${error})`);
+    if (isFinalizationCycle(orchestration)) {
+      return forceFinalization(store, orchestration, failedRun.id, error, deps.contextStoreFor?.(orchestration.id), invalidTurn);
+    }
     createQuestion(store, orchestration, { question: `Adjudication returned invalid decisions after retrying: ${error}`, options: [] });
     const updated = store.updateOrchestration(orchestration.id, { status: "paused", lastError: error }) ?? orchestration;
     return result(updated, "Adjudication returned invalid decisions twice; paused for user input.", []);
@@ -1607,6 +1631,57 @@ function retryInvalidAdjudicationTurn(
   const run = spawnTurn(deps, store, orchestration, agent, prompt, "adjudicate");
   recordEvent(store, orchestration, "adjudicate", "spawn", `Retried ${actor} adjudication after invalid decision (${run.id}).`);
   return result(orchestration, "Retrying adjudication after invalid decisions.", [run.id]);
+}
+
+function forceFinalization(
+  store: MemoryStore,
+  orchestration: Orchestration,
+  finishedRunId: string,
+  reason: string,
+  contextStore?: ContextStore,
+  invalidTurn?: LeaderAdjudicateTurn,
+): OrchestrationStepResult {
+  const openSubtasks = store
+    .listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 })
+    .filter((subtask) => !["done", "cancelled"].includes(subtask.status))
+  const validByKey = new Map(
+    (invalidTurn?.decisions ?? [])
+      .filter((decision) => decision.verdict === "accept" || decision.verdict === "drop")
+      .map((decision) => [decision.subtaskKey, decision]),
+  );
+  const decisions: LeaderAdjudicateTurn["decisions"] = openSubtasks.map((subtask) => {
+    const subtaskKey = findSubtaskKey(store, orchestration.id, subtask.id) ?? subtask.id;
+    return validByKey.get(subtaskKey) ?? { subtaskKey, verdict: "drop" as const };
+  });
+  if (contextStore) {
+    for (const decision of decisions) {
+      const meta = findSubtaskMetaByKey(store, orchestration.id, decision.subtaskKey);
+      const subtask = openSubtasks.find((candidate) => candidate.id === meta?.subtaskId);
+      if (!subtask) continue;
+      const target = contextTargetFor(store, orchestration, subtask);
+      contextStore.writeTurn(
+        "adjudication",
+        target.contextKey,
+        target.round,
+        `# Adjudication — ${decision.subtaskKey} round ${target.round}\n\n## Summary\n${decision.verdict === "accept" ? "Accepted from the leader's valid final-cycle decision." : `Dropped at the cycle limit: ${reason}`}\n\n## Detail\nForced finalization closed this subtask without further rework.`,
+      );
+    }
+  }
+  recordEvent(
+    store,
+    orchestration,
+    "adjudicate",
+    "forced_finalization",
+    `forced_finalization: dropped ${decisions.length} open subtask(s) after invalid final-cycle adjudication.`,
+    JSON.stringify({ reason, droppedSubtasks: decisions.map((decision) => decision.subtaskKey) }),
+  );
+  return applyAdjudicateTurn(store, orchestration, {
+    turn: { version: 1, phase: "adjudicate", decisions, projectComplete: true, questions: [] },
+    finishedRunId,
+    actor: "Leader",
+    contextStore,
+    forcedDropReason: `Dropped at cycle limit after adjudication failed: ${reason}`,
+  });
 }
 
 // A decision needs its own document, and an accepted subtask needs the
@@ -1795,6 +1870,7 @@ function applyAdjudicateTurn(
     finishedRunId: string;
     actor: "Leader" | "Adjudicator";
     contextStore?: ContextStore;
+    forcedDropReason?: string;
   },
 ): OrchestrationStepResult {
   const { turn, finishedRunId, actor } = input;
@@ -1885,7 +1961,7 @@ function applyAdjudicateTurn(
       // is what kept a run the user asked to finish from ever finishing.
       store.updateSubtask(subtaskId, {
         status: "cancelled",
-        statusReason: "Dropped by the leader during adjudication.",
+        statusReason: input.forcedDropReason ?? "Dropped by the leader during adjudication.",
       });
       if (targetAssignment) store.updateAssignment(targetAssignment.id, { status: "cancelled" });
     } else if (decision.verdict === "block") {
@@ -2346,6 +2422,9 @@ function handleLeaderParseFailure(
   if (priorParseFailures.length >= 1) {
     recordEvent(store, orchestration, phase, "error", `Leader ${phase} output could not be parsed: ${error}`);
     if (failedRun) consumeRun(store, orchestration, phase, failedRun, `could not be parsed (${error})`);
+    if (phase === "adjudicate" && failedRun && isFinalizationCycle(orchestration)) {
+      return forceFinalization(store, orchestration, failedRun.id, error, deps.contextStoreFor?.(orchestration.id));
+    }
     createQuestion(store, orchestration, { question: `Leader ${phase} output could not be parsed after retrying: ${error}`, options: [] });
     const updated = store.updateOrchestration(orchestration.id, { status: "paused", lastError: error }) ?? orchestration;
     const ctx = deps.contextStoreFor?.(orchestration.id);
@@ -3066,10 +3145,11 @@ function recordEvent(
   store: MemoryStore,
   orchestration: Orchestration,
   phase: string,
-  kind: "leader_turn" | "spawn" | "run_ended" | "verdict" | "rework" | "error" | "user_action",
+  kind: "leader_turn" | "spawn" | "run_ended" | "verdict" | "rework" | "forced_finalization" | "error" | "user_action",
   summary: string,
+  payload?: string,
 ): void {
-  store.recordOrchestrationEvent({ orchestrationId: orchestration.id, cycle: orchestration.cycle, phase, kind, summary });
+  store.recordOrchestrationEvent({ orchestrationId: orchestration.id, cycle: orchestration.cycle, phase, kind, summary, payload });
 }
 
 function latestByCreatedAt<T extends { createdAt: string }>(items: T[]): T | undefined {

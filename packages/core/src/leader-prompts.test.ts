@@ -252,3 +252,29 @@ describe("user directives in the adjudicate prompt", () => {
     expect(prompt).not.toContain("outrank your reading of the reviews");
   });
 });
+
+describe("finalization cycle prompt", () => {
+  it("requires accept/drop decisions and completion at the cycle limit", () => {
+    const prompt = renderAdjudicatePrompt({
+      taskTitle: "Finish bounded work",
+      cycle: 3,
+      maxCycles: 3,
+      reviews: [],
+      subtasks: [{ key: "s1", title: "Open work", status: "blocked", acceptanceCriteria: ["done"] }],
+    });
+    expect(prompt).toContain("FINALIZATION CYCLE — MANDATORY");
+    expect(prompt).toContain("`rework` and `block` are forbidden");
+    expect(prompt).toContain('"projectComplete": true');
+  });
+
+  it("does not apply the finalization contract before the limit", () => {
+    const prompt = renderAdjudicatePrompt({
+      taskTitle: "Continue work",
+      cycle: 2,
+      maxCycles: 3,
+      reviews: [],
+      subtasks: [],
+    });
+    expect(prompt).not.toContain("FINALIZATION CYCLE — MANDATORY");
+  });
+});

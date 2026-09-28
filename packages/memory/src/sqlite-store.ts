@@ -2430,6 +2430,25 @@ export class SQLiteMemoryStore implements MemoryStore {
     return this.getOrchestration(id);
   }
 
+  incrementOrchestrationMaxCycles(id: string, delta: number): Orchestration | undefined {
+    if (!Number.isInteger(delta) || delta < 1 || delta > 100) {
+      throw new Error("Cycle increment must be an integer from 1 to 100.");
+    }
+    const result = this.db
+      .prepare(
+        `UPDATE orchestrations
+         SET max_cycles = max_cycles + @delta, updated_at = @updatedAt
+         WHERE id = @id AND max_cycles + @delta <= 1000`,
+      )
+      .run({ id, delta, updatedAt: now() });
+    if (result.changes === 0) {
+      const current = this.getOrchestration(id);
+      if (!current) return undefined;
+      throw new Error("Total cycle limit cannot exceed 1000.");
+    }
+    return this.getOrchestration(id);
+  }
+
   listOrchestrations(
     options: { status?: OrchestrationStatus; leaderAgentId?: string; limit?: number } = {},
   ): Orchestration[] {
@@ -3370,5 +3389,4 @@ function taskRelevance(
   );
   return terms.filter((term) => text.includes(term)).length / terms.length;
 }
-
 

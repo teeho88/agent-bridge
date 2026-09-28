@@ -768,6 +768,11 @@ agent-bridge ui</pre>
               <span class="help" data-tip="Live setting: change it at any point during the run. Auto and Approve each both keep the server stepping this orchestration; Approve each stops at every agent call until you answer, and you can hand the task to a different agent when you do. Manual leaves the stepping to you.">?</span>
               <span class="meta" id="orchestratorAutoRunState"></span>
               <button type="button" class="secondary" id="orchestratorStepButton">Step</button>
+              <label style="display:flex; align-items:center; gap:6px; margin:0">Add cycles
+                <input id="orchestratorAddCyclesInput" type="number" value="1" min="1" max="100" style="width:72px">
+              </label>
+              <button type="button" class="secondary" id="orchestratorAddCyclesButton">Add cycles</button>
+              <span class="meta" id="orchestratorAddCyclesStatus"></span>
               <button type="button" class="ghost" id="orchestratorPauseToggle">Pause</button>
               <button type="button" class="ghost" id="orchestratorStopButton">Stop</button>
               <button type="button" class="secondary" id="orchestratorReportButton">Generate report</button>
@@ -1268,7 +1273,6 @@ function escapeStaticHtml(value: string): string {
     "'": '&#039;',
   }[char] ?? char));
 }
-
 
 
 

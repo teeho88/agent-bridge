@@ -778,6 +778,8 @@ describe("dashboard overview", () => {
     // Autonomy is a live control on the running orchestration, not a field you
     // can only set at launch — and it is the only switch now.
     expect(html).toContain('id="orchestratorAutonomy"');
+    expect(html).toContain('id="orchestratorAddCyclesButton"');
+    expect(html).toContain('id="orchestratorAddCyclesInput"');
     expect(html).toContain("/api/workforce/orchestration/autonomy");
     // Providers are enabled/disabled per agent in the Agents tab now; the
     // per-orchestration Team providers allowlist is gone.

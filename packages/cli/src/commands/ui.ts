@@ -97,6 +97,7 @@ import {
 } from "./routes/workforce.js";
 import {
   routePostWorkforceOrchestrationAnswerQuestions,
+  routePostWorkforceOrchestrationAddCycles,
   routePostWorkforceOrchestrationApproveSpawn,
   routePostWorkforceOrchestrationAutoRun,
   routePostWorkforceOrchestrationAutonomy,
@@ -506,6 +507,7 @@ const ROUTES: RouteTable = {
   "POST /api/workforce/orchestration/step": routePostWorkforceOrchestrationStep,
   "POST /api/workforce/orchestration/report": routePostWorkforceOrchestrationReport,
   "POST /api/workforce/orchestration/answer-questions": routePostWorkforceOrchestrationAnswerQuestions,
+  "POST /api/workforce/orchestration/add-cycles": routePostWorkforceOrchestrationAddCycles,
   "POST /api/workforce/orchestration/approve-spawn": routePostWorkforceOrchestrationApproveSpawn,
   "POST /api/workforce/orchestration/auto-run": routePostWorkforceOrchestrationAutoRun,
   "POST /api/workforce/orchestration/autonomy": routePostWorkforceOrchestrationAutonomy,
