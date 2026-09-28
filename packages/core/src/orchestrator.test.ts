@@ -670,6 +670,29 @@ describe("orchestrator", () => {
     });
   });
 
+  it("moves directly to reporting when every subtask is finished or cancelled", () => {
+    withStore((store) => {
+      const logs = new Map<string, string>();
+      const deps = makeDeps(store, logs);
+      const leader = store.createRegisteredAgent({ name: "leader-terminal", provider: "codex", mode: "cli", command: "codex" });
+      const task = store.createTask({ title: "Already terminal", ownerAgent: "codex" });
+      const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
+      store.createSubtask({ parentTaskId: task.id, title: "Accepted work", status: "done" });
+      store.createSubtask({ parentTaskId: task.id, title: "Dropped work", status: "cancelled" });
+      store.updateOrchestration(orchestration.id, {
+        status: "adjudicating",
+        lastError: "Leader returned no decisions and did not mark the project complete.",
+      });
+
+      const step = stepOrchestration(store, orchestration.id, deps);
+
+      expect(step.spawnedRunIds).toEqual([]);
+      expect(step.orchestration.status).toBe("reporting");
+      expect(step.orchestration.lastError).toBeUndefined();
+      expect(store.listAgentRequests({ taskId: task.id, status: "pending" })).toHaveLength(0);
+    });
+  });
+
   it("sends a detached implementer to review, but blocks a failed one", () => {
     withStore((store) => {
       for (const [runStatus, expected] of [["detached", "review"], ["failed", "blocked"], ["stopped", "blocked"]] as const) {
@@ -2041,11 +2064,10 @@ describe("orchestrator", () => {
     });
   });
 
-  it("removes stale terminal reviews from adjudication before asking for decisions", () => {
+  it("removes stale terminal reviews and reports without another leader turn", () => {
     withStore((store) => {
       const logs = new Map<string, string>();
-      const prompts = new Map<string, string>();
-      const deps = makeDeps(store, logs, prompts);
+      const deps = makeDeps(store, logs);
       const leader = createWorkerLeader(store);
       const task = store.createTask({ title: "Recover stale adjudication", ownerAgent: "codex" });
       const orchestration = store.createOrchestration({ taskId: task.id, leaderAgentId: leader.id });
@@ -2072,19 +2094,9 @@ describe("orchestrator", () => {
       });
       store.updateOrchestration(orchestration.id, { status: "adjudicating", cycle: 1 });
 
-      let step = stepOrchestration(store, orchestration.id, deps);
-      expect(step.spawnedRunIds).toHaveLength(1);
+      const step = stepOrchestration(store, orchestration.id, deps);
+      expect(step.spawnedRunIds).toHaveLength(0);
       expect(store.listReviews({ taskId: task.id, consumed: true }).map((review) => review.id)).toContain(staleReview.id);
-      expect(prompts.get(step.spawnedRunIds[0]!)!).not.toContain(staleReview.summary);
-
-      finishRun(store, logs, step.spawnedRunIds[0]!, fenced({
-        version: 1,
-        phase: "adjudicate",
-        decisions: [],
-        projectComplete: true,
-        questions: [],
-      }));
-      step = stepOrchestration(store, orchestration.id, deps);
       expect(step.orchestration.status).toBe("reporting");
       expect(step.orchestration.lastError).toBeFalsy();
     });

@@ -1429,6 +1429,24 @@ function stepAdjudicating(
   const active = adjudicateRuns.find((run) => ACTIVE_STATUSES.has(run.status));
   if (active) return noop(orchestration, `Adjudication is still running (run ${active.id}).`);
 
+  const subtasks = store.listSubtasks({ parentTaskId: orchestration.taskId, limit: 500 });
+  if (subtasks.length > 0 && subtasks.every((subtask) => ["done", "cancelled"].includes(subtask.status))) {
+    recordEvent(
+      store,
+      orchestration,
+      "adjudicate",
+      "verdict",
+      "All subtasks are finished or cancelled; proceeding to reporting without another leader decision.",
+    );
+    const updated = store.updateOrchestration(orchestration.id, {
+      status: "reporting",
+      lastError: null,
+    }) ?? orchestration;
+    const ctx = deps.contextStoreFor?.(orchestration.id);
+    if (ctx) refreshContextIndex(store, updated, ctx);
+    return result(updated, "All subtasks are terminal; ready for reporting.", []);
+  }
+
   const finished = latestByCreatedAt(
     adjudicateRuns.filter(
       (run) => TERMINAL_RUN_STATUSES.has(run.status) && !isRunConsumed(store, orchestration.id, run.id),

@@ -50,6 +50,11 @@ describe("extractJsonBlock", () => {
     const text = `${fenced({ a: "example" })}\ntokens used\n1234\n${fenced({ a: "reply" })}`;
     expect(extractJsonBlock(text)).toBe(JSON.stringify({ a: "reply" }, null, 2));
   });
+
+  it("prefers a final bare fence over a json-tagged schema example", () => {
+    const text = `${fenced({ a: "schema" })}\ntokens used\n1234\n\`\`\`\n${JSON.stringify({ a: "reply" }, null, 2)}\n\`\`\``;
+    expect(extractJsonBlock(text)).toBe(JSON.stringify({ a: "reply" }, null, 2));
+  });
 });
 
 describe("parseLeaderTurn (plan)", () => {
@@ -264,6 +269,18 @@ describe("parseLeaderTurn (adjudicate)", () => {
     expect(result.ok).toBe(true);
     if (result.ok && result.turn.phase === "adjudicate") {
       expect(result.turn.decisions).toEqual([]);
+      expect(result.turn.projectComplete).toBe(true);
+    }
+  });
+
+  it("parses projectComplete from a bare-fenced reply after the prompt schema", () => {
+    const schema = fenced({ ...validAdjudicate, decisions: [], projectComplete: false });
+    const reply = JSON.stringify({ ...validAdjudicate, decisions: [], projectComplete: true }, null, 2);
+    const log = `${schema}\ncodex\n\`\`\`\n${reply}\n\`\`\`\ntokens used\n44,215\n\`\`\`\n${reply}\n\`\`\``;
+
+    const result = parseLeaderTurn(log, "adjudicate");
+    expect(result.ok).toBe(true);
+    if (result.ok && result.turn.phase === "adjudicate") {
       expect(result.turn.projectComplete).toBe(true);
     }
   });

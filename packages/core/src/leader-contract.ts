@@ -160,25 +160,41 @@ function extractBalancedObject(text: string, from: number): string | undefined {
   return text.slice(start);
 }
 
-// Returns the leader's reply object, anchored on the LAST ```json fence.
+// Returns the leader's reply object from the last JSON-capable fenced block.
 //
 // A run log is not just the model's answer: the codex CLI echoes the whole
 // prompt back to stdout, and our own plan/adjudicate prompts embed a ```json
 // schema example — a retry prompt then embeds a second copy. A real log
-// therefore holds three ```json fences of which only the last is the reply,
-// so anchoring on the first (or spanning first-to-last) yields garbage and
-// stalls the orchestration at `planning` forever.
+// therefore holds several fenced blocks. Some providers also omit the `json`
+// language from the final answer, so looking only for ```json can silently
+// select the prompt's schema example instead of the reply.
 //
 // Deliberately no fallback to an earlier fence when the last one is broken:
 // the earlier ones are the echoed schema example, and "successfully" planning
 // from placeholder subtasks is far worse than reporting a parse failure and
 // letting the leader retry.
 export function extractJsonBlock(text: string): string | undefined {
-  const fence = /```json/gi;
-  let start = 0;
+  const fence = /^```([a-z0-9_-]*)[ \t]*\r?$/gim;
+  let opening: { language: string; contentStart: number } | undefined;
+  let lastJsonBlock: string | undefined;
   let match: RegExpExecArray | null;
-  while ((match = fence.exec(text))) start = match.index + match[0].length;
-  return extractBalancedObject(text, start);
+  while ((match = fence.exec(text))) {
+    if (!opening) {
+      opening = {
+        language: (match[1] ?? "").toLowerCase(),
+        contentStart: fence.lastIndex + (text[fence.lastIndex] === "\n" ? 1 : 0),
+      };
+      continue;
+    }
+    if (!opening.language || opening.language === "json") {
+      lastJsonBlock = text.slice(opening.contentStart, match.index);
+    }
+    opening = undefined;
+  }
+  if (opening && (!opening.language || opening.language === "json")) {
+    lastJsonBlock = text.slice(opening.contentStart);
+  }
+  return extractBalancedObject(lastJsonBlock ?? text, 0);
 }
 
 export function parseLeaderTurn(text: string, expectedPhase: "plan"): ParseLeaderPlanResult;
