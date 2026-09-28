@@ -7,6 +7,7 @@ $RepoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $PackagesDir = Join-Path $RepoRoot "packages"
 $BinDir = Join-Path $RepoRoot "bin"
 $CliEntry = Join-Path $RepoRoot "packages\cli\dist\index.js"
+$RemoveDirectoryScript = Join-Path $RepoRoot "scripts\remove-windows-directory.ps1"
 
 function Invoke-Checked {
   param(
@@ -20,12 +21,21 @@ function Invoke-Checked {
   }
 }
 
-function Remove-PathIfPresent {
+function Remove-DirectoryIfPresent {
   param([Parameter(Mandatory = $true)][string]$Path)
 
   if (Test-Path -LiteralPath $Path) {
     Write-Host "Removing: $Path"
-    Remove-Item -LiteralPath $Path -Recurse -Force
+    & $RemoveDirectoryScript -Path $Path
+  }
+}
+
+function Remove-FileIfPresent {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  if (Test-Path -LiteralPath $Path) {
+    Write-Host "Removing: $Path"
+    Remove-Item -LiteralPath $Path -Force
   }
 }
 
@@ -37,6 +47,10 @@ Set-Location $RepoRoot
 
 if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot "package.json"))) {
   throw "package.json was not found at the repository root."
+}
+
+if (-not (Test-Path -LiteralPath $RemoveDirectoryScript)) {
+  throw "Windows directory cleanup helper was not found: $RemoveDirectoryScript"
 }
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
@@ -76,17 +90,17 @@ if ($LASTEXITCODE -eq 0 -and $NpmPrefix) {
 
 Write-Host ""
 Write-Host "Removing local dependencies and build output..."
-Remove-PathIfPresent (Join-Path $RepoRoot "node_modules")
+Remove-DirectoryIfPresent (Join-Path $RepoRoot "node_modules")
 
 if (Test-Path -LiteralPath $PackagesDir) {
   foreach ($PackageDir in Get-ChildItem -LiteralPath $PackagesDir -Directory) {
-    Remove-PathIfPresent (Join-Path $PackageDir.FullName "node_modules")
-    Remove-PathIfPresent (Join-Path $PackageDir.FullName "dist")
+    Remove-DirectoryIfPresent (Join-Path $PackageDir.FullName "node_modules")
+    Remove-DirectoryIfPresent (Join-Path $PackageDir.FullName "dist")
   }
 }
 
-Remove-PathIfPresent (Join-Path $BinDir "agent-bridge.cmd")
-Remove-PathIfPresent (Join-Path $BinDir "agent-bridge.ps1")
+Remove-FileIfPresent (Join-Path $BinDir "agent-bridge.cmd")
+Remove-FileIfPresent (Join-Path $BinDir "agent-bridge.ps1")
 
 Write-Host ""
 Write-Host "Activating pnpm 11.6.0 through Corepack..."
