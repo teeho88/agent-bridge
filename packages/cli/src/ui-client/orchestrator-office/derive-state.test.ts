@@ -94,6 +94,17 @@ describe('Pixel Office state', () => {
     expect(state.actors[0]).toMatchObject({ zone: 'entrance', origin: 'adopted' });
   });
 
+  it('carries safe agent metadata and active log tails into run actors without inventing a leader run', () => {
+    const state = deriveOfficeState(board({
+      leaderAgent: { id: 'leader-1', name: 'Ada', provider: 'codex', model: 'gpt-5', reasoningEffort: 'high' },
+      registeredAgents: [{ id: 'worker-1', name: 'Lin', provider: 'codex', model: 'gpt-5', reasoningEffort: 'medium', mode: 'auto', capabilities: ['review'] }],
+      runs: [{ id: 'run-1', agentId: 'worker-1', phase: 'implement', status: 'running', logTail: 'building…' }],
+    }));
+    expect(state.actors[0]).toMatchObject({ provider: 'codex', reasoningEffort: 'medium', mode: 'auto', capabilities: ['review'], run: { logTail: 'building…' } });
+    expect(state.leader).toMatchObject({ provider: 'codex', reasoningEffort: 'high' });
+    expect(state.leader?.run).toBeUndefined();
+  });
+
   it('emits verdict and activity transitions without replaying a first snapshot', () => {
     const previous = deriveOfficeState(board({
       runs: [{ id: 'run-1', agentId: 'worker-1', subtaskId: 'sub-1', phase: 'implement', status: 'running' }],

@@ -504,7 +504,7 @@ describe("dashboard overview", () => {
     const builtClient = new URL("../../dist/ui-client/main.js", import.meta.url);
     if (existsSync(builtClient)) {
       const compiled = readFileSync(builtClient, "utf8");
-      expect(() => new Function(compiled)).not.toThrow();
+      expect(compiled).toContain("from './orchestrator-office/derive-state.js'");
     }
     expect(html).toContain('class="secondary open-agent-terminal" data-agent="claude"');
     expect(html).toContain('class="secondary open-agent-terminal" data-agent="codex"');
@@ -664,7 +664,9 @@ describe("dashboard overview", () => {
     expect(html).toContain('data-office-zone="review"');
     expect(html).toContain('data-office-zone="decision"');
     expect(html).toContain('data-office-zone="gate"');
-    expect(html).toContain('data-office-inspector');
+    expect(html).toContain('data-office-thought-cloud');
+    expect(html).not.toContain('data-office-inspector');
+    expect(html).toContain('.office-thought-cloud');
     expect(html).toContain('id="officeReducedEffects"');
     expect(html).toContain('@media (prefers-reduced-motion: reduce)');
     expect(clientJs).toContain("deriveOfficeState(data)");

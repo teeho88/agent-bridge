@@ -25,10 +25,23 @@ export class PixelOfficeSceneController {
   constructor(private root: HTMLElement) {
     root.addEventListener('click', event => {
       const actor = (event.target as Element | null)?.closest?.('[data-office-actor]') as HTMLElement | null;
-      if (!actor) return;
-      this.selectedActorId = actor.dataset.officeActor || '';
-      this.renderInspector();
+      if (actor) {
+        const actorId = actor.dataset.officeActor || '';
+        this.selectedActorId = this.selectedActorId === actorId ? '' : actorId;
+        this.renderThoughtCloud();
+        return;
+      }
+      if (!(event.target as Element | null)?.closest?.('[data-office-thought-cloud]')) {
+        this.selectedActorId = '';
+        this.renderThoughtCloud();
+      }
     });
+    root.addEventListener('keydown', event => {
+      if (event.key !== 'Escape' || !this.selectedActorId) return;
+      this.selectedActorId = '';
+      this.renderThoughtCloud();
+    });
+    window.addEventListener('resize', () => this.positionThoughtCloud());
   }
 
   apply(state: PixelOfficeSceneState, transitions: PixelTransition[]): void {
@@ -59,7 +72,7 @@ export class PixelOfficeSceneController {
     this.renderNotifications(state);
     this.renderActivityList(state);
     if (this.selectedActorId && !this.actorState.has(this.selectedActorId)) this.selectedActorId = '';
-    this.renderInspector();
+    this.renderThoughtCloud();
     this.enqueue(transitions);
   }
 
@@ -70,7 +83,7 @@ export class PixelOfficeSceneController {
     this.selectedActorId = '';
     const status = this.root.querySelector('[data-office-status]');
     if (status) status.textContent = 'idle';
-    this.renderInspector();
+    this.renderThoughtCloud();
   }
 
   private ensureActor(actor: PixelActorState): HTMLButtonElement {
@@ -89,6 +102,8 @@ export class PixelOfficeSceneController {
     node.dataset.activity = actor.activity;
     node.dataset.pose = actor.pose;
     node.dataset.status = actor.status || '';
+    node.classList.toggle('is-selected', actor.id === this.selectedActorId);
+    node.setAttribute('aria-expanded', String(actor.id === this.selectedActorId));
     node.style.setProperty('--actor-hue', String(hueFor(actor.agentId)));
     node.setAttribute('aria-label', `${actor.name}, ${actor.role}, ${actor.activity}${actor.taskLabel ? `, ${actor.taskLabel}` : ''}`);
     const title = node.querySelector('strong');
@@ -117,18 +132,23 @@ export class PixelOfficeSceneController {
     host.replaceChildren(...state.activities.map(activity => textElement('li', `is-${activity.activity}`, activity.label)));
   }
 
-  private renderInspector(): void {
-    const host = this.root.querySelector('[data-office-inspector]');
+  private renderThoughtCloud(): void {
+    const host = this.root.querySelector<HTMLElement>('[data-office-thought-cloud]');
     if (!host) return;
     const actor = this.actorState.get(this.selectedActorId);
     if (!actor) {
-      host.replaceChildren(textElement('div', 'muted', 'Select an agent or desk to inspect its run.'));
+      host.hidden = true;
+      host.replaceChildren();
+      for (const node of this.actors.values()) {
+        node.classList.remove('is-selected');
+        node.setAttribute('aria-expanded', 'false');
+      }
       return;
     }
-    const heading = textElement('div', 'office-inspector-title', actor.name);
-    const meta = textElement('div', 'meta', [actor.role, actor.model, actor.status, actor.activity].filter(Boolean).join(' · '));
-    const task = textElement('div', 'office-inspector-task', actor.taskLabel || 'No task label');
-    const progress = textElement('div', 'meta', actor.progressNote || (actor.progressPercent != null ? `Progress: ${actor.progressPercent}%` : 'No progress note'));
+    const heading = textElement('div', 'office-thought-cloud-header', actor.name);
+    const meta = textElement('div', 'office-thought-cloud-meta', [actor.role, actor.provider, actor.model, actor.reasoningEffort && `reasoning ${actor.reasoningEffort}`, actor.mode, actor.status, actor.activity].filter(Boolean).join(' · '));
+    const task = textElement('div', 'office-thought-cloud-task', actor.taskLabel || 'No task label');
+    const progress = textElement('div', 'office-thought-cloud-meta', actor.progressNote || (actor.progressPercent != null ? `Progress: ${actor.progressPercent}%` : 'No progress note'));
     const runDetails = actor.run ? textElement('div', 'meta', [
       actor.runId ? `Run ${actor.runId}` : '',
       actor.origin ? `origin ${actor.origin}` : '',
@@ -137,11 +157,12 @@ export class PixelOfficeSceneController {
       actor.run.startedAt ? `started ${actor.run.startedAt}` : '',
       actor.run.endedAt ? `ended ${actor.run.endedAt}` : '',
     ].filter(Boolean).join(' · ')) : null;
-    const logTail = actor.run?.logTail ? textElement('pre', 'run-card-log office-inspector-log', actor.run.logTail) : null;
+    const active = actor.status === 'starting' || actor.status === 'running' || actor.status === 'waiting';
+    const logTail = actor.run ? textElement('pre', 'office-thought-cloud-log', actor.run.logTail || (active ? 'Waiting for output…' : 'Finished — open Full log to read it.')) : null;
     const actions = document.createElement('div');
-    actions.className = 'toolbar';
+    actions.className = 'office-thought-cloud-actions';
     if (actor.runId) {
-      if (actor.status === 'starting' || actor.status === 'running' || actor.status === 'waiting') {
+      if (active) {
         const stop = textElement('button', 'ghost run-stop', 'Stop') as HTMLButtonElement;
         stop.type = 'button';
         stop.dataset.runId = actor.runId;
@@ -157,6 +178,38 @@ export class PixelOfficeSceneController {
       actions.append(log);
     }
     host.replaceChildren(heading, meta, task, progress, ...(runDetails ? [runDetails] : []), ...(logTail ? [logTail] : []), actions);
+    host.hidden = false;
+    for (const [id, node] of this.actors) {
+      node.classList.toggle('is-selected', id === actor.id);
+      node.setAttribute('aria-expanded', String(id === actor.id));
+    }
+    this.positionThoughtCloud();
+  }
+
+  private positionThoughtCloud(): void {
+    const host = this.root.querySelector<HTMLElement>('[data-office-thought-cloud]');
+    const actor = this.actors.get(this.selectedActorId);
+    if (!host || host.hidden || !actor) return;
+    const rootRect = this.root.getBoundingClientRect();
+    const actorRect = actor.getBoundingClientRect();
+    const cloudRect = host.getBoundingClientRect();
+    const margin = 10;
+    let side = 'top-right';
+    let left = actorRect.right - rootRect.left + 8;
+    let top = actorRect.top - rootRect.top - cloudRect.height - 12;
+    if (left + cloudRect.width > rootRect.width - margin) {
+      left = actorRect.left - rootRect.left - cloudRect.width - 8;
+      side = 'top-left';
+    }
+    if (top < margin) {
+      top = actorRect.bottom - rootRect.top + 12;
+      side = side === 'top-left' ? 'bottom-left' : 'bottom-right';
+    }
+    left = Math.max(margin, Math.min(left, rootRect.width - cloudRect.width - margin));
+    top = Math.max(margin, Math.min(top, rootRect.height - cloudRect.height - margin));
+    host.style.left = `${left}px`;
+    host.style.top = `${top}px`;
+    host.dataset.cloudSide = side;
   }
 
   private animateActorMoves(previousPositions: Map<string, DOMRect>): void {

@@ -50,6 +50,10 @@ export interface PixelActorState {
   name: string;
   role: string;
   model: string;
+  provider?: string;
+  reasoningEffort?: string;
+  mode?: string;
+  capabilities?: string[];
   activity: WorkflowActivity;
   pose: string;
   zone: OfficeZone;

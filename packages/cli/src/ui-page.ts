@@ -193,6 +193,7 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
       box-shadow: 4px 4px 0 rgba(15,23,42,.32); transform: translate3d(0,0,0); transition: transform 260ms steps(4), opacity 180ms linear;
     }
     .pixel-actor:hover, .pixel-actor:focus-visible { transform: translate3d(0,-3px,0); outline: 3px solid #fde68a; outline-offset: 1px; }
+    .pixel-actor.is-selected { outline: 3px solid #38bdf8; outline-offset: 2px; }
     .pixel-actor.is-transitioning { animation: office-hop 360ms steps(4); }
     .pixel-actor[data-pose="type"] .pixel-body { animation: office-type 480ms steps(2) infinite; }
     .pixel-actor[data-pose="inspect"] .pixel-avatar { animation: office-inspect 900ms steps(3) infinite; }
@@ -219,6 +220,18 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     .office-transition { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .office-notifications { position: absolute; left: 12px; top: 10px; z-index: 7; display: flex; gap: 5px; flex-wrap: wrap; }
     .office-notification { padding: 4px 6px; border: 2px solid #7c2d12; background: #ffedd5; color: #7c2d12; font: 800 9px/1 ui-monospace, monospace; }
+    .office-thought-cloud { position: absolute; z-index: 8; width: min(330px, calc(100% - 20px)); padding: 11px; border: 3px solid #172033; border-radius: 20px; background: #eff6ff; color: #172033; box-shadow: 5px 5px 0 rgba(15,23,42,.38); display: grid; gap: 7px; }
+    .office-thought-cloud[hidden] { display: none; }
+    .office-thought-cloud::after { content: ''; position: absolute; width: 11px; height: 11px; border: 3px solid #172033; border-radius: 50%; background: #eff6ff; }
+    .office-thought-cloud[data-cloud-side="top-right"]::after { right: 20px; bottom: -14px; }
+    .office-thought-cloud[data-cloud-side="top-left"]::after { left: 20px; bottom: -14px; }
+    .office-thought-cloud[data-cloud-side="bottom-right"]::after { right: 20px; top: -14px; }
+    .office-thought-cloud[data-cloud-side="bottom-left"]::after { left: 20px; top: -14px; }
+    .office-thought-cloud-header { font: 850 13px/1.2 ui-monospace, monospace; }
+    .office-thought-cloud-meta { color: #475569; font-size: 11px; overflow-wrap: anywhere; }
+    .office-thought-cloud-task { font-size: 12px; font-weight: 700; overflow-wrap: anywhere; }
+    .office-thought-cloud-log { margin: 0; max-height: 128px; overflow: auto; border-radius: 7px; padding: 8px; background: #0f172a; color: #e2e8f0; font: 10px/1.4 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .office-thought-cloud-actions { display: flex; gap: 6px; flex-wrap: wrap; }
     .office-sidebar { min-width: 0; display: grid; grid-template-rows: auto minmax(0,1fr); background: #f8fafc; border-left: 1px solid var(--line); color: var(--text); }
     .office-inspector, .office-status-fallback { padding: 12px; min-width: 0; }
     .office-inspector { border-bottom: 1px solid var(--line); display: grid; gap: 8px; align-content: start; }
@@ -243,7 +256,7 @@ export function renderDashboardHtml(initialWorkspace = "Workspace"): string {
     @keyframes office-error { 0%,100% { transform: translateX(-2px); } 50% { transform: translateX(2px); } }
     @keyframes office-effect { 0% { opacity: 0; transform: translate(-50%,-35%) scale(.7); } 35%,75% { opacity: 1; transform: translate(-50%,-50%) scale(1); } 100% { opacity: 0; transform: translate(-50%,-65%) scale(.9); } }
     @media (max-width: 1050px) { .pixel-office-shell { overflow-x: auto; grid-template-columns: 760px 260px; } }
-    @media (max-width: 760px) { .pixel-office-shell { grid-template-columns: 680px 240px; } .pixel-office { min-width: 680px; } }
+    @media (max-width: 760px) { .pixel-office-shell { grid-template-columns: 680px 240px; } .pixel-office { min-width: 680px; } .office-thought-cloud { position: sticky; left: 10px !important; top: auto !important; bottom: 10px; width: calc(100% - 20px); max-height: 45%; overflow: auto; } }
     @media (prefers-reduced-motion: reduce) { .pixel-actor, .pixel-actor *, .pixel-actor.is-transitioning, .office-effect { animation: none; transition: none; } }
     .pixel-office.reduced-effects .pixel-actor, .pixel-office.reduced-effects .pixel-actor *, .pixel-office.reduced-effects .office-effect { animation: none; transition-duration: 20ms; }
     .task-card-section { min-width: 0; display: grid; gap: 7px; align-content: start; }
@@ -764,6 +777,7 @@ agent-bridge ui</pre>
           <div class="pixel-office" id="orchestratorOffice" role="region" aria-live="polite">
             <div class="office-notifications" data-office-notifications></div>
             <div class="office-hud"><span class="office-state" data-office-status>idle</span><span class="office-transition" data-office-transition>Waiting for orchestration activity</span></div>
+            <div class="office-thought-cloud" data-office-thought-cloud hidden role="dialog" aria-live="polite"></div>
             <section class="office-zone" data-office-zone="leader"><h3>Leader Office</h3><div class="office-zone-actors" data-zone-actors></div></section>
             <section class="office-zone" data-office-zone="gate"><h3>User Gate / Approval</h3><div class="office-zone-actors" data-zone-actors></div></section>
             <section class="office-zone" data-office-zone="report"><h3>Report / Archive</h3><div class="office-zone-actors" data-zone-actors></div></section>
@@ -774,7 +788,6 @@ agent-bridge ui</pre>
             <section class="office-zone" data-office-zone="entrance"><h3>External</h3><div class="office-zone-actors" data-zone-actors></div></section>
           </div>
           <aside class="office-sidebar">
-            <div class="office-inspector" data-office-inspector><div class="muted">Select an agent or desk to inspect its run.</div></div>
             <div class="office-status-fallback"><strong>Current activity</strong><ul class="office-status-list" data-office-activity-list></ul></div>
           </aside>
         </div>
