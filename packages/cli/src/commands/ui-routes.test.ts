@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -339,6 +339,51 @@ describe("workforce routes", () => {
     const res = await call("GET", "/api/workforce/board");
     expect(res.status).toBe(200);
     expect(res.body.startsWith("{")).toBe(true);
+  });
+
+  it("includes reasons for failed and detached run notifications", async () => {
+    const store = openStore(root);
+    let taskId: string;
+    try {
+      const agent = store.createRegisteredAgent({
+        name: "failed-worker",
+        provider: "codex",
+        mode: "auto",
+        capabilities: ["implement"],
+      });
+      const task = store.createTask({ title: "Failure notification", ownerAgent: "codex" });
+      taskId = task.id;
+      const orchestration = store.createOrchestration({ taskId, leaderAgentId: agent.id });
+      const failedLog = join(root, "failed-run.log");
+      writeFileSync(failedLog, "setup\nPermission denied while writing output\n", "utf8");
+      store.createAgentRun({
+        orchestrationId: orchestration.id,
+        taskId,
+        agentId: agent.id,
+        cycle: orchestration.cycle,
+        phase: "implement",
+        status: "failed",
+        logPath: failedLog,
+      });
+      store.createAgentRun({
+        orchestrationId: orchestration.id,
+        taskId,
+        agentId: agent.id,
+        cycle: orchestration.cycle,
+        phase: "implement",
+        status: "detached",
+      });
+    } finally {
+      store.close();
+    }
+
+    const board = (await call("GET", `/api/workforce/board?task=${taskId}`)).json<{
+      runs: Array<{ status: string; failureReason?: string }>;
+    }>();
+    expect(board.runs.find((run) => run.status === "failed")?.failureReason).toContain("Permission denied");
+    expect(board.runs.find((run) => run.status === "detached")?.failureReason).toBe(
+      "Agent process detached before reporting a clean exit.",
+    );
   });
 
   it("reports a failure as JSON rather than throwing out of the handler", async () => {

@@ -949,15 +949,23 @@ function showRunCompletionToast(run, agentName) {
   if (!els.requestToastStack) return;
   const succeeded = run.status === 'done';
   const stopped = run.status === 'stopped';
+  const detached = run.status === 'detached';
   const toast = document.createElement('div');
   toast.className = 'request-toast run-toast ' + (succeeded ? 'is-success' : 'is-failure');
   toast.dataset.runId = run.id;
   toast.setAttribute('role', 'button');
   toast.setAttribute('tabindex', '0');
-  const outcome = succeeded ? 'completed' : (stopped ? 'stopped' : 'failed');
+  const outcome = succeeded ? 'completed' : (stopped ? 'stopped' : (detached ? 'detached' : 'failed'));
+  const failureReason = String(run.failureReason || '').trim();
   const detail = succeeded
     ? 'Process exited successfully; subtask is awaiting review.'
-    : (run.exitCode == null ? 'Open Runs for details.' : 'Exit code ' + run.exitCode + '. Open Runs for details.');
+    : failureReason
+      ? clampText(failureReason, 400)
+      : stopped
+        ? 'Process was stopped.'
+        : detached
+          ? 'Agent process detached before reporting a clean exit.'
+          : (run.exitCode == null ? 'Agent process failed before reporting an exit code.' : 'Agent process exited with code ' + run.exitCode + '.');
   toast.innerHTML =
     '<div class="toolbar" style="justify-content:space-between;align-items:flex-start;flex-wrap:nowrap">' +
       '<strong class="request-toast-title">' + escapeHtml(agentName + ' ' + outcome) + '</strong>' +
@@ -972,7 +980,8 @@ function syncRunCompletionToasts(runs, agentsById) {
   (runs || []).forEach(run => {
     const previous = runStatusById.get(run.id);
     const wasActive = previous === 'starting' || previous === 'running' || previous === 'waiting' || previous === 'stopping';
-    if (wasActive && !isRunActive(run) && run.status !== 'stopping') {
+    const newlySeenFailure = previous == null && (run.status === 'failed' || run.status === 'detached');
+    if ((wasActive && !isRunActive(run) && run.status !== 'stopping') || newlySeenFailure) {
       const agent = agentsById[run.agentId];
       showRunCompletionToast(run, agent ? agent.name : run.agentId);
     }

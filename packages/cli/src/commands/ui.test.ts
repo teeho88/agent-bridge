@@ -896,7 +896,10 @@ describe("dashboard overview", () => {
     expect(html).toContain("let runsFilter = 'active';");
     expect(html).toContain("Finished — open Full log to read it.");
     expect(html).toContain("function syncRunCompletionToasts(runs, agentsById)");
+    expect(html).toContain("const newlySeenFailure = previous == null");
     expect(html).toContain("Process exited successfully; subtask is awaiting review.");
+    expect(html).toContain("run.failureReason");
+    expect(html).toContain("Agent process detached before reporting a clean exit.");
     expect(html).toContain("subtask.statusReason");
     expect(html).toContain("<strong>Reason:</strong>");
     expect(html).toContain(".run-toast.is-success");

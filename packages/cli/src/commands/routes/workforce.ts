@@ -359,6 +359,14 @@ export async function routeGetWorkforceBoard(ctx: RouteContext): Promise<void> {
         // never changes, and re-sending all of them was ~19KB per poll.
         // Finished cards link to the full log instead.
         logTail: ACTIVE_RUN_STATUSES.has(run.status) ? readLogTail(run.logPath) : undefined,
+        failureReason: run.status === "failed" || run.status === "detached"
+          ? readLogTail(run.logPath, 3, 8_000).trim()
+            || (run.status === "detached"
+              ? "Agent process detached before reporting a clean exit."
+              : run.exitCode == null
+                ? "Agent process failed before reporting an exit code."
+                : `Agent process exited with code ${run.exitCode}.`)
+          : undefined,
       })),
       // So the board can say "3 of 37" even when it was only sent 3.
       runsTotal: allRuns.length,

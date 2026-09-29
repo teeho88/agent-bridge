@@ -87,11 +87,12 @@ describe('Pixel Office state', () => {
     expect(second.actors.map(actor => [actor.id, actor.deskId])).toEqual(first.actors.map(actor => [actor.id, actor.deskId]));
   });
 
-  it('places adopted and detached sessions at the entrance', () => {
+  it.each(['failed', 'detached'])('keeps %s runs out of the animated office', status => {
     const state = deriveOfficeState(board({
-      runs: [{ id: 'run-1', agentId: 'worker-1', phase: 'implement', status: 'detached', origin: 'adopted' }],
+      runs: [{ id: 'run-1', agentId: 'worker-1', phase: 'implement', status, origin: 'adopted' }],
     }));
-    expect(state.actors[0]).toMatchObject({ zone: 'entrance', origin: 'adopted' });
+    expect(state.actors).toEqual([]);
+    expect(state.activities.some(activity => activity.actorId === 'worker-1')).toBe(false);
   });
 
   it('carries safe agent metadata and active log tails into run actors without inventing a leader run', () => {

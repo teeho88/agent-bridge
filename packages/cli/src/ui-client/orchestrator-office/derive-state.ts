@@ -89,7 +89,7 @@ export function deriveOfficeState(payload: any): PixelOfficeSceneState {
   snapshot.runs.filter(run => ACTIVE_RUN_STATUSES.has(run.status)).forEach(run => {
     activeByAgent.set(run.agentId, (activeByAgent.get(run.agentId) || 0) + 1);
   });
-  const actors = snapshot.runs.map(run => {
+  const actors = snapshot.runs.filter(run => run.status !== 'failed' && run.status !== 'detached').map(run => {
     const agent = agents.get(run.agentId) || {};
     const subtask = subtasks.get(run.subtaskId);
     const activity = runActivity(run, subtask);
