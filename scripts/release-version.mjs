@@ -12,6 +12,11 @@ const packageFiles = [
   "packages/memory/package.json",
 ];
 const stableSemver = /^(\d+)\.(\d+)\.(\d+)$/;
+const corepackCommand = process.platform === "win32" ? process.execPath : "corepack";
+const corepackPrefix =
+  process.platform === "win32"
+    ? [join(dirname(process.execPath), "node_modules", "corepack", "dist", "corepack.js")]
+    : [];
 
 function readJson(path) {
   return JSON.parse(readFileSync(join(root, path), "utf8"));
@@ -32,6 +37,10 @@ function run(command, args) {
     stdio: "inherit",
     windowsHide: true,
   });
+}
+
+function runCorepack(args) {
+  run(corepackCommand, [...corepackPrefix, ...args]);
 }
 
 function assertCleanTree() {
@@ -90,14 +99,14 @@ function writeVersions(version) {
 }
 
 function checkLockfile() {
-  run("corepack", ["pnpm", "install", "--lockfile-only", "--frozen-lockfile"]);
+  runCorepack(["pnpm", "install", "--lockfile-only", "--frozen-lockfile"]);
 }
 
 function validateRelease(version) {
   assertTagAbsent(version);
   checkLockfile();
-  run("corepack", ["pnpm", "-r", "build"]);
-  run("corepack", ["pnpm", "-r", "test"]);
+  runCorepack(["pnpm", "-r", "build"]);
+  runCorepack(["pnpm", "-r", "test"]);
 }
 
 const [mode, requested] = process.argv.slice(2);
@@ -115,10 +124,10 @@ try {
     if (target === current) throw new Error("Target version must differ from current version.");
     assertTagAbsent(target);
     writeVersions(target);
-    run("corepack", ["pnpm", "install", "--lockfile-only"]);
+    runCorepack(["pnpm", "install", "--lockfile-only"]);
     assertSynchronized();
-    run("corepack", ["pnpm", "-r", "build"]);
-    run("corepack", ["pnpm", "-r", "test"]);
+    runCorepack(["pnpm", "-r", "build"]);
+    runCorepack(["pnpm", "-r", "test"]);
     console.log(`Version updated to ${target}. Review and commit the changes, then create tag v${target} intentionally.`);
   } else {
     throw new Error("Usage: release-version.mjs check | version <major|minor|patch|x.y.z>");
