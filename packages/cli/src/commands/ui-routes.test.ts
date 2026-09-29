@@ -348,7 +348,7 @@ describe("workforce routes", () => {
       const agent = store.createRegisteredAgent({
         name: "failed-worker",
         provider: "codex",
-        mode: "auto",
+        mode: "cli",
         capabilities: ["implement"],
       });
       const task = store.createTask({ title: "Failure notification", ownerAgent: "codex" });

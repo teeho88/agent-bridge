@@ -2,6 +2,7 @@ import { deriveOfficeState } from './orchestrator-office/derive-state.js';
 import { PixelOfficeSceneController } from './orchestrator-office/scene-controller.js';
 import { diffOfficeState } from './orchestrator-office/transitions.js';
 import type { PixelOfficeSceneState } from './orchestrator-office/types.js';
+import { loadReadRunToastIds, rememberReadRunToastId } from './run-toast-state.js';
 
 // Dashboard client. Runs in the browser as an ES module served from
 // /ui-client/main.js - it is no longer a string inside ui-page.ts, so tsc
@@ -236,6 +237,11 @@ const seenRequestToastIds = new Set();
 const requestToastTimers = new Map();
 const runStatusById = new Map();
 const runToastTimers = new Map();
+const runToastStorage = {
+  getItem: (key: string) => localStorageValue(key),
+  setItem: (key: string, value: string) => setLocalStorageValue(key, value),
+};
+const readRunToastIds = loadReadRunToastIds(runToastStorage);
 const suggestedImportanceByType = {
   note: 3,
   bug: 4,
@@ -937,7 +943,9 @@ function closeRequestToast(requestId) {
 }
 
 function closeRunToast(runId) {
-  if (!runId || !els.requestToastStack) return;
+  if (!runId) return;
+  rememberReadRunToastId(runToastStorage, readRunToastIds, runId);
+  if (!els.requestToastStack) return;
   const timer = runToastTimers.get(runId);
   if (timer) window.clearTimeout(timer);
   runToastTimers.delete(runId);
@@ -980,7 +988,9 @@ function syncRunCompletionToasts(runs, agentsById) {
   (runs || []).forEach(run => {
     const previous = runStatusById.get(run.id);
     const wasActive = previous === 'starting' || previous === 'running' || previous === 'waiting' || previous === 'stopping';
-    const newlySeenFailure = previous == null && (run.status === 'failed' || run.status === 'detached');
+    const newlySeenFailure = previous == null
+      && (run.status === 'failed' || run.status === 'detached')
+      && !readRunToastIds.has(run.id);
     if ((wasActive && !isRunActive(run) && run.status !== 'stopping') || newlySeenFailure) {
       const agent = agentsById[run.agentId];
       showRunCompletionToast(run, agent ? agent.name : run.agentId);
