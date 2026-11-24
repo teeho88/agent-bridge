@@ -1,4 +1,4 @@
-import { execFile, spawnSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import {
@@ -65,16 +65,17 @@ export async function discoverProviderCatalog(
   provider: string,
   command: string,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<CatalogOverride> {
-  if (provider === "codex") return parseCodexCatalog(await run(command, ["debug", "models"], timeoutMs));
+  if (provider === "codex") return parseCodexCatalog(await run(command, ["debug", "models"], timeoutMs, signal));
   if (provider === "antigravity") {
     const needsWindowsShell = process.platform === "win32" && command === "agy";
     const output = needsWindowsShell
-      ? runWindowsShell(command, ["models"], timeoutMs)
-      : await run(command, ["models"], timeoutMs);
+      ? await runWindowsShell(command, ["models"], timeoutMs, signal)
+      : await run(command, ["models"], timeoutMs, signal);
     return { models: parseAntigravityModels(output) };
   }
-  if (provider === "claude") return parseClaudeCatalog(await run(command, ["--help"], timeoutMs));
+  if (provider === "claude") return parseClaudeCatalog(await run(command, ["--help"], timeoutMs, signal));
   throw new Error(`Provider does not support model discovery: ${provider}`);
 }
 
@@ -166,9 +167,9 @@ function writeCatalogCache(cache: CatalogCache): void {
   writeFileSync(path, JSON.stringify(cache, null, 2), "utf8");
 }
 
-function run(command: string, args: string[], timeoutMs: number): Promise<string> {
+function run(command: string, args: string[], timeoutMs: number, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(command, args, { encoding: "utf8", timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+    execFile(command, args, { encoding: "utf8", timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024, signal },
       (error, stdout, stderr) => {
         const output = stdout.trim() ? stdout : stderr;
         // Some CLIs (notably agy) print a valid model table and still exit
@@ -180,17 +181,17 @@ function run(command: string, args: string[], timeoutMs: number): Promise<string
   });
 }
 
-function runWindowsShell(command: string, args: string[], timeoutMs: number): string {
-  const result = spawnSync(command, args, {
-    encoding: "utf8",
-    timeout: timeoutMs,
-    windowsHide: true,
-    maxBuffer: 8 * 1024 * 1024,
-    shell: true,
+function runWindowsShell(command: string, args: string[], timeoutMs: number, signal?: AbortSignal): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, {
+      encoding: "utf8", timeout: timeoutMs, windowsHide: true,
+      maxBuffer: 8 * 1024 * 1024, shell: true, signal,
+    }, (error, stdout, stderr) => {
+      const output = stdout.trim() ? stdout : stderr;
+      if (error && !output.trim()) reject(error);
+      else resolve(output);
+    });
   });
-  const output = result.stdout.trim() ? result.stdout : result.stderr;
-  if (result.error && !output.trim()) throw result.error;
-  return output;
 }
 
 function labelFor(value: string): string {

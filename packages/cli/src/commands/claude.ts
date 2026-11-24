@@ -1,21 +1,19 @@
-import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { effectiveWorkflowMode } from "../workflow.js";
+import { repositoryEnabled } from "../repository.js";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Command } from "commander";
 import { firstLineSummary } from "@agent-bridge/core";
-import { isGraphSourceFile } from "@agent-bridge/memory";
-import type { AgentRequest, AgentRequestType, CreateHandoffInput, Handoff } from "@agent-bridge/memory";
-import { refreshBriefs } from "../graph-brief.js";
-import { writeHandoffArtifacts } from "./handoff.js";
+import type { AgentRequest, AgentRequestType } from "@agent-bridge/memory";
+import { refreshAutoHandoff } from "../auto-handoff.js";
 import { applyTaskLabelSuggestion } from "../task-suggestions.js";
 import {
   adoptContinuationTask,
   ensureWorkspace,
   endAgentSession,
   consumePendingNewTask,
-  writeCompiledContextFor,
   openStore,
   readConfig,
   redactIfEnabled,
@@ -25,6 +23,7 @@ import {
   resolveCurrentTaskId,
   setCurrentTask,
   syncAgentSession,
+  syncTerminalNativeSession,
   writeCurrentTaskArtifact,
 } from "../workspace.js";
 
@@ -155,10 +154,13 @@ export function handleClaudeHook(
   // Normalize Claude's native session id to the launcher's stable id so the
   // first prompt fills that card instead of opening another one.
   const terminalSessionId = process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID?.trim();
+  const nativeSessionId = input.session_id;
   if (terminalSessionId) input = { ...input, session_id: terminalSessionId };
 
   const cwd = input.cwd ? resolve(input.cwd) : process.cwd();
+  if (!repositoryEnabled(cwd)) return undefined;
   ensureWorkspace(cwd);
+  if (terminalSessionId && nativeSessionId) syncTerminalNativeSession(terminalSessionId, nativeSessionId, cwd);
 
   const store = openStore(cwd);
   try {
@@ -189,7 +191,7 @@ export function handleClaudeHook(
       if (input.session_id) {
         rememberSessionWindowHandle(input.session_id, taskId, "claude", cwd);
       }
-      return contextOutput(store, cwd, eventName, taskId);
+      return undefined;
     }
 
     if (eventName === "UserPromptSubmit") {
@@ -241,7 +243,7 @@ export function handleClaudeHook(
           })
         : undefined;
       captureRepoMemory(store, cwd, prompt, "user-instruction", taskId, promptEvent?.id);
-      return contextOutput(store, cwd, eventName, taskId);
+      return undefined;
     }
 
     if (eventName === "TaskCreated") {
@@ -280,13 +282,13 @@ export function handleClaudeHook(
         sourceAgent: "claude",
         tags: ["claude-code", "task-created"],
       });
-      return contextOutput(store, cwd, eventName, task.id);
+      return undefined;
     }
 
     if (eventName === "TaskCompleted") {
       const taskId = resolveClaudeSessionTask(store, cwd, input.session_id);
       if (!taskId) return undefined;
-      const task = store.updateTaskStatus(taskId, "done");
+      const task = store.getTaskContract(taskId) ? store.getTask(taskId) : store.updateTaskStatus(taskId, "done");
       if (input.session_id) {
         store.recordSessionEvent({
           sessionId: input.session_id,
@@ -300,7 +302,6 @@ export function handleClaudeHook(
         if (resolveCurrentTaskId(cwd, undefined, "claude") === taskId) {
           writeCurrentTaskArtifact(task, cwd);
         }
-        writeCompiledContext(store, cwd, taskId);
       }
       store.addMemory({
         taskId,
@@ -343,7 +344,7 @@ export function handleClaudeHook(
       const summary =
         input.last_assistant_message?.trim() ||
         readLastAssistantMessage(input.transcript_path);
-      if (summary) {
+      if (summary && effectiveWorkflowMode(store, cwd, input.session_id) !== "single") {
         const compact =
           summary.length > 1200
             ? `${summary.slice(0, 1200).trim()}\n...[truncated]`
@@ -379,18 +380,8 @@ export function handleClaudeHook(
           : undefined;
         captureTaskFindings(store, taskId, compact);
         captureRepoMemory(store, cwd, summary, "assistant-summary", taskId, summaryEvent?.id);
-        // Mode C: auto-assemble a handoff from accumulated memory on every Stop,
-        // so the next agent inherits a populated handoff without anyone typing it.
-        // Skip if the latest handoff is a manual one — never clobber authored work.
-        const latest = store.getLatestHandoff(taskId);
-        if (!latest || latest.auto) {
-          const handoff = store.upsertAutoHandoff(
-            buildAutoHandoffInput(store, cwd, taskId, summary),
-          );
-          writeHandoffArtifacts(cwd, handoff, { task: store.getTask(taskId) });
-        }
+        refreshAutoHandoff(store, cwd, taskId, "claude", input.session_id, summary);
       }
-      writeCompiledContext(store, cwd, taskId);
       // This must be the final event for the session: a SessionEnd may include a
       // last assistant summary, but the session is no longer live afterwards.
       if (eventName === "SessionEnd" && input.session_id) {
@@ -408,7 +399,6 @@ export function handleClaudeHook(
 
     if (eventName === "PostToolUse") {
       resolveAcceptedClaudeToolRequest(store, cwd, input);
-      briefTouchedFile(store, cwd, input);
       return undefined;
     }
 
@@ -604,36 +594,6 @@ function uniqueRequests(requests: AgentRequest[]): AgentRequest[] {
   return out;
 }
 
-function contextOutput(
-  store: ReturnType<typeof openStore>,
-  cwd: string,
-  eventName: string,
-  taskId?: string,
-): Record<string, unknown> | undefined {
-  const activeTaskId = taskId ?? resolveActiveTaskId(store, cwd, undefined, "claude");
-  if (!activeTaskId) return undefined;
-  const pack = writeCompiledContext(store, cwd, activeTaskId);
-  const context = [
-    "agent-bridge synced this Claude Code session.",
-    `Current task: ${pack.task.title}`,
-    "Use .agent-memory/compiled-context.md for compact project memory.",
-    ...(pack.handoff
-      ? [
-          `This task was handed off by ${pack.handoff.fromAgent ?? "another agent"}: ${pack.handoff.summary}`,
-          "Read the Latest Handoff section of .agent-memory/compiled-context.md before continuing it.",
-        ]
-      : []),
-    "When you discover durable facts, mention them clearly so the hook can persist them.",
-  ].join("\n");
-
-  return {
-    hookSpecificOutput: {
-      hookEventName: eventName,
-      additionalContext: context,
-    },
-  };
-}
-
 function resolveClaudeSessionTask(
   store: ReturnType<typeof openStore>,
   cwd: string,
@@ -745,7 +705,7 @@ function captureTaskFindings(
 }
 
 function markTaskInProgress(store: ReturnType<typeof openStore>, taskId: string): void {
-  if (store.getTask(taskId)?.status === "todo") store.updateTaskStatus(taskId, "in_progress");
+  if (store.getTask(taskId)?.status === "todo" && !store.getTaskContract(taskId)) store.updateTaskStatus(taskId, "in_progress");
 }
 
 function activateClaudeTask(
@@ -759,21 +719,13 @@ function activateClaudeTask(
   writeCurrentTaskArtifact(task, cwd);
 }
 
-function writeCompiledContext(
-  store: ReturnType<typeof openStore>,
-  cwd: string,
-  taskId: string,
-) {
-  return writeCompiledContextFor(store, cwd, taskId, "claude");
-}
-
 function withAgentBridgeHooks(
   settings: Record<string, unknown>,
   command: string,
 ): Record<string, unknown> {
   const hooks = isObject(settings.hooks) ? settings.hooks : {};
   const matchers: Record<string, string> = {
-    SessionStart: "startup|resume",
+    SessionStart: "startup|resume|clear|compact",
     PostToolUse: "Edit|Write|MultiEdit|NotebookEdit|Read|Bash",
   };
   const events = [
@@ -848,40 +800,6 @@ function titleFromPrompt(prompt: string): string {
     .replace(/[.?!,:;]+$/g, "");
 }
 
-// On every Edit/Write/Read, regenerate the brief for the touched file so the graph
-// index stays warm for the handful of files a session works on repeatedly. Edits
-// mark the file as task-edited (importance 4, promotes the task to in_progress);
-// reads keep the lower read importance. Best-effort: any failure is swallowed so a
-// brief never disrupts the agent's tool flow.
-function briefTouchedFile(
-  store: ReturnType<typeof openStore>,
-  cwd: string,
-  input: ClaudeHookInput,
-): void {
-  const toolName = input.tool_name;
-  const filePath = input.tool_input?.file_path;
-  if (!toolName || !filePath) return;
-  if (readConfig(cwd).graph?.autoBriefOnToolUse === false) return;
-  const abs = resolve(
-    filePath.startsWith("~") ? join(homedir(), filePath.slice(1)) : filePath,
-  );
-  const rel = relative(cwd, abs).replace(/\\/g, "/");
-  if (!rel || rel.startsWith("../") || isAbsolute(rel)) return;
-  if (!isGraphSourceFile(rel) || !existsSync(abs)) return;
-  try {
-    if (statSync(abs).size > 1_000_000) return;
-  } catch {
-    return;
-  }
-  const edited = /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(toolName);
-  const taskId = resolveClaudeSessionTask(store, cwd, input.session_id) ?? undefined;
-  try {
-    refreshBriefs(store, cwd, { paths: [rel], taskId, taskEdited: edited });
-  } catch {
-    // Briefing is best-effort; never break the tool that just ran.
-  }
-}
-
 // Replace the provisional title (truncated first prompt) with Claude Code's own
 // auto-generated session title once it lands in the transcript. Never clobbers a
 // title set any other way — a manual rename or a TaskCreated subject won't match
@@ -950,94 +868,6 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function escapePowerShellPath(value: string): string {
   return value.replace(/`/g, "``").replace(/"/g, '`"');
-}
-
-// Heuristically assemble a handoff from what the store already knows about the
-// current task — no LLM. summary = the latest assistant response; done = recent
-// task title/goal; risks = recorded constraints; next = action bullets parsed
-// from the response; filesChanged = git working-tree changes (empty if no repo).
-function buildAutoHandoffInput(
-  store: ReturnType<typeof openStore>,
-  cwd: string,
-  taskId: string,
-  latestResponse: string,
-): CreateHandoffInput {
-  const memories = store.listMemoriesForTask(taskId, 120);
-  const byTimeDesc = [...memories].sort((a, b) =>
-    a.createdAt < b.createdAt ? 1 : -1,
-  );
-  const task = store.getTask(taskId);
-
-  const taskLabel = task ? oneLine(task.goal || task.title, 100) : undefined;
-  const done = taskLabel ? [`Handled task: ${taskLabel}`] : [];
-
-  const risks = dedupeStrings(
-    byTimeDesc
-      .filter((m) => m.type === "constraint")
-      .map((m) => oneLine(m.content, 120)),
-  ).slice(0, 5);
-
-  const next = nextActionsFromText(latestResponse);
-  const filesChanged = gitChangedFiles(cwd);
-  const summary =
-    latestResponse.length > 800
-      ? `${latestResponse.slice(0, 800).trim()}\n...[truncated]`
-      : latestResponse;
-
-  return {
-    taskId,
-    fromAgent: "claude",
-    summary: redactIfEnabled(summary, cwd),
-    done: done.map((d) => redactIfEnabled(d, cwd)),
-    next: next.map((n) => redactIfEnabled(n, cwd)),
-    risks: risks.map((r) => redactIfEnabled(r, cwd)),
-    filesChanged,
-  };
-}
-
-function nextActionsFromText(text: string): string[] {
-  const bullets = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => /^([-*]|\d+\.)\s+/.test(line))
-    .map((line) => line.replace(/^([-*]|\d+\.)\s+/, "").trim())
-    .filter((line) =>
-      /\b(next|todo|then|fix|add|implement|tiếp|còn|cần|sửa|làm)\b/i.test(line),
-    );
-  return dedupeStrings(bullets.map((b) => oneLine(b, 120))).slice(0, 5);
-}
-
-function gitChangedFiles(cwd: string): string[] {
-  try {
-    const out = execSync("git status --porcelain", {
-      cwd,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return out
-      .split(/\r?\n/)
-      .map((line) => line.slice(3).trim())
-      .filter(Boolean)
-      .slice(0, 20);
-  } catch {
-    return [];
-  }
-}
-
-function oneLine(text: string, max: number): string {
-  const flat = text.replace(/\s+/g, " ").trim();
-  return flat.length > max ? `${flat.slice(0, max).trim()}…` : flat;
-}
-
-function dedupeStrings(items: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const item of items) {
-    if (!item || seen.has(item)) continue;
-    seen.add(item);
-    out.push(item);
-  }
-  return out;
 }
 
 function readLastAssistantMessage(

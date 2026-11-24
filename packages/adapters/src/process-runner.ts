@@ -1,11 +1,13 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
-import { redactSecrets } from "@agent-bridge/core";
+import { checkInvocationBudget, redactSecrets, type InvocationBudget, type TokenCounterDescriptor } from "@agent-bridge/core";
 import type { AgentRun, CreateAgentRunInput, MemoryStore } from "@agent-bridge/memory";
 import type { AgentInvocation } from "./invocation.js";
+import { createRunLog, type RunLogPolicy } from "./run-log.js";
+import { createUsageObserver } from "./usage-observer.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -18,9 +20,13 @@ const liveProcesses = new Map<string, ChildProcess>();
 export type SpawnAgentRunInput = Omit<CreateAgentRunInput, "command" | "cwd" | "logPath" | "status"> & {
   preview: AgentInvocation;
   runsDir: string;
+  reservedRunId?: string;
 };
 
 export type SpawnAgentRunOptions = {
+  logPolicy?: RunLogPolicy;
+  tokenBudget?: InvocationBudget;
+  tokenCounter?: TokenCounterDescriptor;
   redact?: (text: string) => string;
   onExit?: (run: AgentRun) => void;
   // Opens a separate, visible terminal window that tails the run's log file
@@ -265,14 +271,25 @@ export function spawnAgentRun(
   input: SpawnAgentRunInput,
   options: SpawnAgentRunOptions = {},
 ): AgentRun {
-  const { preview, runsDir, ...runInput } = input;
+  const { preview, runsDir, reservedRunId, ...runInput } = input;
   if (preview.mode !== "cli" || !preview.executable) {
     throw new Error("spawnAgentRun requires a CLI-mode invocation preview with an executable.");
   }
   const redact = options.redact ?? redactSecrets;
   const showTerminal = resolveShowTerminal(options.showTerminal);
+  const stdinText = preview.stdinFilePath ? readFileSync(preview.stdinFilePath, "utf8") : undefined;
+  const configPath = join(preview.cwd || process.cwd(), ".agent-memory", "config.json");
+  const staticConfig = existsSync(configPath) ? JSON.parse(readFileSync(configPath, "utf8")) as { invocationBudget?: InvocationBudget; logs?: RunLogPolicy } : {};
+  const policy = options.tokenBudget ?? staticConfig.invocationBudget;
+  const budget = checkInvocationBudget([stdinText ?? "", ...(preview.args ?? [])].join("\n"), policy, options.tokenCounter);
 
-  let run = store.createAgentRun({
+  if (!reservedRunId && store.getTaskContract(input.taskId)) throw new Error("Managed tasks require a reserved dispatch before launch");
+  let reserved: AgentRun | undefined;
+  if (reservedRunId) {
+    if (!store.claimManagedDispatchLaunch || !input.sessionId) throw new Error("Managed launch support and session are required");
+    reserved = store.claimManagedDispatchLaunch(reservedRunId, input.taskId, input.agentId, input.sessionId, preview.provider);
+  }
+  const launchInput = {
     ...runInput,
     // Stamp what this run was actually launched with. Without it the row keeps
     // provider/model/effort empty and the board can only guess from the agent
@@ -282,13 +299,16 @@ export function spawnAgentRun(
     reasoningEffort: runInput.reasoningEffort ?? preview.reasoningEffort,
     command: preview.command,
     cwd: preview.cwd,
-    status: "starting",
+    status: reservedRunId ? "running" : "starting",
     startedAt: new Date().toISOString(),
-  });
+  } satisfies CreateAgentRunInput;
+  let run = reserved ? store.updateAgentRun(reserved.id, launchInput)! : store.createAgentRun(launchInput);
 
   const logPath = join(runsDir, `${run.id}.log`);
   mkdirSync(dirname(logPath), { recursive: true });
   writeFileSync(logPath, "", "utf8");
+  writeFileSync(join(runsDir, `${run.id}.budget.json`), `${JSON.stringify({ ...budget, provider: preview.provider,
+    model: preview.model, providerCliOverhead: "unknown" }, null, 2)}\n`, "utf8");
   run = store.updateAgentRun(run.id, { logPath }) ?? run;
 
   if (showTerminal) {
@@ -335,7 +355,7 @@ export function spawnAgentRun(
 
   if (preview.stdinFilePath) {
     try {
-      child.stdin?.end(readFileSync(preview.stdinFilePath, "utf8"));
+      child.stdin?.end(stdinText);
     } catch {
       child.stdin?.end();
     }
@@ -386,48 +406,105 @@ export function spawnAgentRun(
   // routinely non-ASCII (Vietnamese prose, box drawing, emoji) and the run log
   // is what the final report is built from, so the partial bytes have to be
   // held back until the rest of the sequence arrives.
+  let logError: Error | undefined;
+  let finalizing = false;
+  let heartbeatDirty = false;
+  const log = createRunLog(logPath, (paused) => {
+    for (const pipe of [child.stdout, child.stderr]) paused ? pipe?.pause() : pipe?.resume();
+  }, (error) => {
+    logError = error;
+    child.stdout?.resume();
+    child.stderr?.resume();
+    child.kill();
+    process.emitWarning(redact(`Agent run ${run.id} log failed: ${error.message}`));
+  }, options.logPolicy ?? staticConfig.logs);
+  const writeLog = (text: string) => { log.write(redact(text)); heartbeatDirty ||= Boolean(text); };
+  const heartbeat = setInterval(() => {
+    if (heartbeatDirty && !finalizing) {
+      safeUpdateAgentRun(run.id, { heartbeatAt: new Date().toISOString() });
+      heartbeatDirty = false;
+    }
+  }, 2000);
+  heartbeat.unref();
   const logAppender = () => {
     const decoder = new StringDecoder("utf8");
-    return (chunk: Buffer) => {
-      appendFileSync(logPath, redact(decoder.write(chunk)));
-      safeUpdateAgentRun(run.id, { heartbeatAt: new Date().toISOString() });
+    return {
+      write: (chunk: Buffer) => writeLog(decoder.write(chunk)),
+      finish: () => writeLog(decoder.end()),
     };
   };
   const appendLog = logAppender();
+  const usageObserver = createUsageObserver();
+  const telemetryStartedAt = new Date().toISOString();
+  const telemetryContract = store.getTaskContract(run.taskId);
+  const telemetryAttempt = store.listTaskAttempts(run.taskId).find(attempt => attempt.sessionId === run.sessionId && !attempt.endedAt);
+  const usagePath = join(runsDir, `${run.id}.usage.json`);
+  const persistUsage = (status: string, usage: unknown) => {
+    writeFileSync(usagePath, JSON.stringify({ schemaVersion: 2, runId: run.id, attemptId: telemetryAttempt?.id ?? null, taskId: run.taskId,
+      sessionId: run.sessionId ?? null, model: run.model ?? null, revision: telemetryContract?.version ?? null,
+      startedAt: telemetryStartedAt, endedAt: status === "running" ? undefined : new Date().toISOString(),
+      semantics: preview.provider === "claude" ? "exclusive" : preview.provider === "codex" ? "inclusive" : "unknown",
+      rawUsage: usageObserver.rawUsage(), toolCalls: usageObserver.toolCalls(),
+      provider: preview.provider, status, usage, completeness: usageObserver.completeness(), laterToolReads: "unknown" }), { flush: true });
+  };
+  persistUsage("running", null);
+  child.stdout?.on("data", (chunk: Buffer) => usageObserver.write(chunk));
   const appendStderrLog = logAppender();
   const streamFormatter = isClaudeStreamJson(preview)
     ? createClaudeStreamJsonFormatter()
     : isAgyStreamJson(preview)
       ? createAgyStreamJsonFormatter()
       : undefined;
+  let flushStdout = appendLog.finish;
   if (streamFormatter) {
     const formatChunk = streamFormatter;
     const stdoutDecoder = new StringDecoder("utf8");
     child.stdout?.on("data", (chunk: Buffer) => {
       const formatted = formatChunk(stdoutDecoder.write(chunk));
       if (formatted) {
-        appendFileSync(logPath, redact(formatted));
-        safeUpdateAgentRun(run.id, { heartbeatAt: new Date().toISOString() });
+        writeLog(formatted);
       }
     });
+    flushStdout = () => writeLog(formatChunk(`${stdoutDecoder.end()}\n`));
   } else {
-    child.stdout?.on("data", appendLog);
+    child.stdout?.on("data", appendLog.write);
   }
-  child.stderr?.on("data", appendStderrLog);
+  child.stderr?.on("data", appendStderrLog.write);
 
-  const finalize = (status: "done" | "failed", exitCode: number | undefined, note?: string) => {
+  const finalize = async (status: "done" | "failed", exitCode: number | undefined, note?: string) => {
+    if (finalizing) return;
+    finalizing = true;
+    clearInterval(heartbeat);
     liveProcesses.delete(run.id);
-    if (note) appendFileSync(logPath, redact(`\n${note}\n`));
-    const finished = recordFinalStatus(run.id, {
-      status,
+    flushStdout();
+    appendStderrLog.finish();
+    if (note) writeLog(`\n${note}\n`);
+    logError = await log.finish() ?? logError;
+    try { persistUsage(child.signalCode ? "interrupted" : logError ? "failed" : status, usageObserver.finish()); }
+    catch (error) { process.emitWarning(`Usage artifact failed for ${run.id}: ${String(error)}`); }
+    const patch = {
+      status: logError ? "failed" as const : status,
       exitCode,
       endedAt: new Date().toISOString(),
-    });
-    if (finished) options.onExit?.(finished);
+      heartbeatAt: new Date().toISOString(),
+      ...(logError ? { progressNote: redact(`Log failure: ${logError.message}`).slice(0, 2000) } : {}),
+    };
+    let finished = recordFinalStatus(run.id, patch);
+    for (let retry = 0; !finished && retry < 3; retry++) {
+      await new Promise((resolve) => setTimeout(resolve, 100 * 2 ** retry));
+      finished = recordFinalStatus(run.id, patch);
+    }
+    if (!finished) process.emitWarning(`Agent run ${run.id} final status could not be persisted`);
+    if (finished) {
+      try { options.onExit?.(finished); }
+      catch (error) { process.emitWarning(redact(`Agent run ${run.id} exit callback failed: ${error instanceof Error ? error.message : String(error)}`)); }
+    }
   };
 
-  child.on("exit", (code) => finalize(code === 0 ? "done" : "failed", code ?? undefined));
-  child.on("error", (error) => finalize("failed", -1, `[spawn error] ${error.message}`));
+  let spawnError: Error | undefined;
+  child.on("error", (error) => { spawnError = error; });
+  child.on("close", (code) => { void finalize(!spawnError && code === 0 ? "done" : "failed", code ?? undefined,
+    spawnError ? `[spawn error] ${spawnError.message}` : undefined); });
 
   return run;
 }

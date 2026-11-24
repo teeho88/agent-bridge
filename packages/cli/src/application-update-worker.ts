@@ -1,6 +1,5 @@
 import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   type ApplicationUpdateProgress,
@@ -12,7 +11,6 @@ import {
 
 export interface UpdateWorkerDependencies {
   runner?: CommandRunner;
-  spawnDetached?: (file: string, args: string[], cwd: string) => void;
 }
 
 function appendLog(path: string, message: string): void {
@@ -61,59 +59,6 @@ async function runChecked(
   return result.stdout.trim();
 }
 
-function defaultSpawnDetached(file: string, args: string[], cwd: string): void {
-  const child = spawn(file, args, {
-    cwd,
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-  });
-  child.unref();
-}
-
-function processExists(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function stopUiProcess(pid: number | undefined): Promise<void> {
-  if (!pid || pid === process.pid || !processExists(pid)) return;
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    return;
-  }
-  const deadline = Date.now() + 5_000;
-  while (processExists(pid) && Date.now() < deadline) {
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-  }
-}
-
-async function restartUi(
-  payload: UpdateWorkerPayload,
-  root: string,
-  spawnDetached: (file: string, args: string[], cwd: string) => void,
-): Promise<void> {
-  if (!payload.workspace || !payload.port) return;
-  await stopUiProcess(payload.uiPid);
-  spawnDetached(
-    process.execPath,
-    [
-      join(root, "packages", "cli", "dist", "index.js"),
-      "ui",
-      "--project",
-      payload.workspace,
-      "--port",
-      String(payload.port),
-    ],
-    root,
-  );
-}
-
 export async function runApplicationUpdateWorker(
   payload: UpdateWorkerPayload,
   dependencies: UpdateWorkerDependencies = {},
@@ -123,7 +68,6 @@ export async function runApplicationUpdateWorker(
   const logFile = join(paths.directory, `update-${payload.id}.log`);
   const writeProgress = progressWriter(payload, logFile);
   const runner = dependencies.runner ?? runBoundedCommand;
-  const spawnDetached = dependencies.spawnDetached ?? defaultSpawnDetached;
   let moved = false;
   let ownsLock = false;
 
@@ -167,8 +111,7 @@ export async function runApplicationUpdateWorker(
       throw new Error(`Updated CLI reported ${version || "(empty)"}; expected ${payload.targetVersion}.`);
     }
 
-    writeProgress("restart-required", "Updated successfully; restarting Work Board if requested");
-    await restartUi(payload, root, spawnDetached);
+    writeProgress("restart-required", "Updated successfully; reopen agent-bridge tui to load the new version");
     return writeProgress("complete", `Updated to ${payload.targetVersion}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -190,7 +133,6 @@ export async function runApplicationUpdateWorker(
         if (restored !== payload.oldVersion) {
           throw new Error(`Rollback CLI reported ${restored || "(empty)"}; expected ${payload.oldVersion}.`);
         }
-        await restartUi(payload, root, spawnDetached);
       } catch (rollbackError) {
         appendLog(
           logFile,

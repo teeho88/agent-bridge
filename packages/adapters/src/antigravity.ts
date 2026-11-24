@@ -1,5 +1,6 @@
 import type { PromptPack } from "@agent-bridge/core";
 import type { CreateRegisteredAgentInput } from "@agent-bridge/memory";
+import { compactWorkflowSection } from "./managed-section.js";
 import { orchestratedRunSection, permissionEscalationSection, temporaryArtifactCleanupSection } from "./managed-section.js";
 
 // Replaces the deprecated gemini CLI (whose geminiAgentDefaults this supersedes).
@@ -22,110 +23,8 @@ export function antigravityAgentDefaults(name = "antigravity"): CreateRegistered
 // (focus terminal, prompt, stop) because they all key off the session's agent.
 // agy also loads `.agents/rules/*.md`, which codex never reads, so the override
 // lives there and cannot leak back into a codex run.
-export function antigravityRulesSection(): string {
-  return `<!-- agent-bridge:start -->
-
-# Agent Bridge Rules for Antigravity (agy)
-
-## Your Agent Identity
-You are the **\`antigravity\`** agent, not codex.
-
-\`AGENTS.md\` in this repository is written for the codex CLI and spells out
-\`--agent codex\` in its examples. Those examples do not apply to you: whenever a
-command in \`AGENTS.md\` takes \`--agent codex\`, run it with \`--agent antigravity\`
-instead. Registering as codex makes the dashboard attach your work to a codex
-session, and every session action there (focus terminal, prompt, stop) then
-targets the wrong agent.
-
-## Session Lifecycle: Do Not Start It Yourself
-agent-bridge hooks (\`.agents/hooks.json\`) already open the task and the live
-session for this conversation before your first model call, and record your
-reply when the turn ends. Therefore:
-- Do **not** run \`agent-bridge task start\`.
-- Do **not** run \`agent-bridge session start\` or \`agent-bridge session end\`.
-Running them creates a second task and a second live session for work that is
-already on the board.
-
-## Token Rules
-- Keep answers concise.
-- Do not inspect unrelated files.
-- Prefer minimal diffs.
-- Do not paste long logs.
-- Summarize test output.
-
-## Current Task
-Read \`.agent-memory/current-task.md\`, then compile fresh context for yourself:
-\`\`\`bash
-agent-bridge context compile --agent antigravity
-\`\`\`
-Read \`.agent-memory/compiled-context.md\` and continue only the current task.
-The hook recompiles that file for antigravity on every prompt, so it is current
-whenever you open it — but reading it costs tokens. Read it once at the start of
-work, then again only when the task changes, when the user asks you to continue
-work you did not do yourself or refers to another agent's work, or when you are
-about to edit and no longer hold this task's constraints and handoff. Within one
-task, keep working from what you already read.
-Its \`## Latest Handoff\` section holds the current handoff of this task, whoever
-wrote it; when the prompt continues work another agent started, re-read that
-section — it is the context to work from, and your own handoff replaces it (one
-per task).
-Do not start a new task just because the user sends a new prompt inside an
-active task; continue the current one unless the user asks to switch.
-
-${temporaryArtifactCleanupSection()}
-
-${permissionEscalationSection()}
-
-## Work-Git Rules
-- Before editing any source/config/test/doc file for task work, acquire a write lease:
-  \`\`\`bash
-  agent-bridge file lease "<repo-relative-path>" --mode write --agent antigravity
-  \`\`\`
-- Continue editing only when the lease response has \`"acquired": true\`; if it returns \`false\`, inspect \`blockingLease\`, coordinate through handoff/request, and do not edit that file.
-- Keep the lease id from the response and release it after the edit is recorded:
-  \`\`\`bash
-  agent-bridge file release "<lease-id>"
-  \`\`\`
-- After completing a meaningful repo change and its relevant checks pass, create a Git commit so the change has a recoverable history point. Stage and commit only the files that belong to that change; never include unrelated pre-existing working-tree changes. Use a concise commit message that describes the completed change.
-
-## File Brief Rules
-- After reading any source/config/test/doc file for task work, run:
-  \`\`\`bash
-  agent-bridge graph brief-auto "<repo-relative-path>"
-  \`\`\`
-- After editing any source/config/test/doc file, run:
-  \`\`\`bash
-  agent-bridge graph brief-auto "<repo-relative-path>" --task-edited --agent antigravity
-  \`\`\`
-  The first \`--task-edited\` brief moves the task from \`todo\` to \`in_progress\`.
-  Always pass \`--agent antigravity\`; without it the lease check resolves the default agent's task and rejects your own lease.
-- You may pass multiple paths to one \`brief-auto\` call. Skip generated/vendor files and files outside the current task.
-
-## Completion Rules
-Before finishing:
-1. Summarize changed files.
-2. Summarize tests run.
-3. Save durable findings:
-   \`\`\`bash
-   agent-bridge memory add "<important fact or decision>" --type note --agent antigravity
-   \`\`\`
-   For non-ASCII text (e.g. Vietnamese) or multi-line content, pipe via stdin to avoid shell encoding loss:
-   \`\`\`bash
-   echo "<nội dung>" | agent-bridge memory add --stdin --type note --agent antigravity
-   \`\`\`
-4. Create or update handoff notes:
-   \`\`\`bash
-   agent-bridge handoff create --from antigravity --summary "<summary>" --next "<next action>"
-   \`\`\`
-   For non-ASCII summaries, pipe via stdin:
-   \`\`\`bash
-   echo "<tóm tắt>" | agent-bridge handoff create --stdin --from antigravity
-   \`\`\`
-5. Avoid including unnecessary full file contents.
-
-${orchestratedRunSection()}
-
-<!-- agent-bridge:end -->`;
+export function antigravityRulesSection(options: { hooked?: boolean } = {}): string {
+  return `<!-- agent-bridge:start -->\n\n${compactWorkflowSection("antigravity", options)}\n\n<!-- agent-bridge:end -->`;
 }
 
 export function antigravityArtifact(pack: PromptPack): Record<string, unknown> {
@@ -137,15 +36,11 @@ export function antigravityArtifact(pack: PromptPack): Record<string, unknown> {
       "You are the antigravity agent. AGENTS.md is written for codex; wherever it says --agent codex, use --agent antigravity.",
       "Read .agent-memory/current-task.md before editing.",
       "The agent-bridge hooks in .agents/hooks.json already opened the task and the live session for this conversation: do not run task start, session start, or session end.",
-      "Run: agent-bridge context compile --agent antigravity",
-      "Read .agent-memory/compiled-context.md and continue only the current task.",
-      "The hook recompiles that file every prompt, so it is always current — read it again only when the task changes, when you are asked to continue work you did not do yourself, or when you no longer hold this task's constraints and handoff. Do not re-read it every turn.",
-      "Before editing relevant source/config/test/doc files, run: agent-bridge file lease \"<repo-relative-path>\" --mode write --agent antigravity and continue only if acquired=true",
-      "After recording the edit with brief-auto --task-edited, release the lease with: agent-bridge file release \"<lease-id>\"",
-      "Work-Git leases are enforced by brief-auto --task-edited; if another task holds the file, coordinate through handoff/request and do not edit it.",
-      "After reading relevant source/config/test/doc files, run: agent-bridge graph brief-auto \"<repo-relative-path>\"",
-      "After editing relevant source/config/test/doc files, run: agent-bridge graph brief-auto \"<repo-relative-path>\" --task-edited --agent antigravity (the first --task-edited brief moves the task from todo to in_progress)",
-      "Always pass --agent antigravity with --task-edited; without it the lease check resolves the default agent's task and rejects your own lease."
+      "Use context find only when the request needs repository history; open relevant results with context query, expand, or handoff. Ask before searching history when the reference is unclear.",
+      "Before edits: agent-bridge file lease-batch <paths...> --agent antigravity --compact; continue only if acquired=true. Retain lease ids and include --session for session-owned leases. On conflict coordinate with the blocking owner.",
+      "Read relevant source ranges; briefs are navigation hints. The watcher refreshes briefs only on source content changes; reads do not refresh briefs or mark edits. Do not run brief commands after tool use.",
+      "After a group of edits: agent-bridge task checkpoint --agent antigravity --summary \"...\" --tests \"actual results or not run\" --files <edited paths...> --next \"next action\". This checks leases and refreshes briefs; it does not complete the task or commit.",
+      "After recording edits, release only your leases: agent-bridge file release-batch <leaseIds...> --agent antigravity --compact."
     ],
     plan: pack.nextActions,
     progress: pack.currentState,
@@ -153,12 +48,8 @@ export function antigravityArtifact(pack: PromptPack): Record<string, unknown> {
     next_actions: pack.nextActions,
     risks: pack.risks,
     completion_rules: [
-      "Run: agent-bridge memory add \"<important fact or decision>\" --type note --agent antigravity",
-      "For non-ASCII (e.g. Vietnamese) or multi-line text, pipe via stdin: echo \"<nội dung>\" | agent-bridge memory add --stdin --type note --agent antigravity",
-      "Run: agent-bridge handoff create --from antigravity --summary \"<summary>\" --next \"<next action>\"",
-      "For non-ASCII summaries: echo \"<tóm tắt>\" | agent-bridge handoff create --stdin --from antigravity"
+      "Save one task checkpoint with actual test results and next actions when handing off or finishing.",
+      "Repository Memory goes through Inbox unless explicitly requested; no mandatory memory add each turn."
     ]
   };
 }
-
-

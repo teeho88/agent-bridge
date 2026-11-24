@@ -16,11 +16,12 @@ import type { Command } from "commander";
 // Only the write side is blocked. Reads stay open: a sub-agent looking at
 // `task current` or `memory search` costs nothing and mixes no state.
 const BLOCKED_SUBCOMMANDS: Record<string, readonly string[]> = {
-  context: ["compile", "edit"],
+  workflow: ["set"],
+  context: ["compile", "edit", "bootstrap", "ack", "reset", "sync"],
   handoff: ["create"],
   memory: ["add", "consolidate", "prune", "reindex"],
   session: ["start", "summary", "end"],
-  task: ["start", "update", "delete", "lane", "accept", "discard", "merge"],
+  task: ["start", "update", "delete", "lane", "accept", "discard", "merge", "checkpoint"],
 };
 
 export type SpawnedRunEnv = {

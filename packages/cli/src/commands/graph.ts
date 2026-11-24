@@ -59,7 +59,7 @@ export function registerGraph(program: Command): void {
       async (
         filePath: string,
         summary: string | undefined,
-        options: { stdin?: boolean; priority?: string; ranges?: string; task?: string; agent?: AgentKind; taskEdited?: boolean }
+        options: { stdin?: boolean; priority?: string; ranges?: string; task?: string; agent?: AgentKind; taskEdited?: boolean; compact?: boolean }
       ) => {
         const root = paths().cwd;
         const normalizedPath = filePath.replace(/\\/g, "/");
@@ -96,7 +96,8 @@ export function registerGraph(program: Command): void {
     .option("--task <taskId>", "task id for task association")
     .option("--agent <agent>", "resolve the active task for this agent (defaults to the configured default agent)")
     .option("--task-edited", "mark these files as recently edited by the current task")
-    .action((filePaths: string[], options: { all?: boolean; priority?: string; task?: string; agent?: AgentKind; taskEdited?: boolean }) => {
+    .option("--compact", "return a single summary")
+    .action((filePaths: string[], options: { all?: boolean; priority?: string; task?: string; agent?: AgentKind; taskEdited?: boolean; compact?: boolean }) => {
       const root = paths().cwd;
       const store = openStore();
       try {
@@ -124,7 +125,8 @@ export function registerGraph(program: Command): void {
           taskEdited: options.taskEdited
         });
 
-        if (options.all) console.log(`Refreshed ${results.length} briefs.`);
+        if (options.compact) console.log(JSON.stringify({ refreshed: results.length }));
+        else if (options.all) console.log(`Refreshed ${results.length} briefs.`);
         else
           results.forEach((file) =>
             console.log(

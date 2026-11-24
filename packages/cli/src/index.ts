@@ -24,16 +24,22 @@ import { registerTask } from "./commands/task.js";
 import { registerUi } from "./commands/ui.js";
 import { registerUpdate } from "./commands/update.js";
 import { registerUpgrade } from "./commands/upgrade.js";
+import { registerWorkflow } from "./commands/workflow.js";
 import { registerWatch } from "./commands/watch.js";
 import { registerOrchestration } from "./commands/workforce.js";
 import { installSpawnedRunGuard } from "./spawned-guard.js";
 import { applicationVersion } from "./version.js";
+import { registerRepo } from "./commands/repo.js";
+import { registerPermissions } from "./commands/permissions.js";
+import { installRepositoryGuard } from "./repository.js";
 
 const program = new Command();
 
 program.name("agent-bridge").description("Local memory and handoff sidecar for coding agents").version(applicationVersion);
 
 registerInit(program);
+registerRepo(program);
+registerPermissions(program);
 registerUpdate(program);
 registerUpgrade(program);
 registerAgent(program);
@@ -58,9 +64,11 @@ registerUi(program);
 registerRepair(program);
 registerReport(program);
 registerWatch(program);
+registerWorkflow(program);
 registerOrchestration(program);
 
 installSpawnedRunGuard(program);
+installRepositoryGuard(program);
 
 program.parseAsync(process.argv).catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);

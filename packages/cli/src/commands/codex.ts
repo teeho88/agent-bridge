@@ -1,4 +1,6 @@
+import { refreshAutoHandoff } from "../auto-handoff.js";
 import { randomUUID } from "node:crypto";
+import { repositoryEnabled } from "../repository.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,7 +20,6 @@ import {
   startAgentSession,
   syncAgentSession,
   syncTerminalNativeSession,
-  writeCompiledContextFor,
   writeCurrentTaskArtifact
 } from "../workspace.js";
 import {
@@ -34,6 +35,7 @@ type CodexHookInput = {
   thread_id?: string;
   prompt?: string;
   user_prompt?: string;
+  last_assistant_message?: string | null;
   message?: string;
   notification?: string;
   title?: string;
@@ -63,6 +65,35 @@ export function registerCodex(program: Command): void {
   });
 }
 
+const codexHookEvents = ["SessionStart", "UserPromptSubmit", "Notification", "PermissionRequest", "PostToolUse", "Stop"];
+
+export function getCodexHookStatus(projectPath = process.cwd()): {
+  installed: boolean;
+  current: boolean;
+  hookPath: string;
+  hooksPath: string;
+} {
+  const hookPath = join(projectPath, ".codex", "hooks", "agent-bridge-codex-hook.ps1");
+  const hooksPath = join(projectPath, ".codex", "hooks.json");
+  const installed = existsSync(hookPath) && existsSync(hooksPath);
+  let current = false;
+  try {
+    const hooks = readJson(hooksPath).hooks as Record<string, unknown> | undefined;
+    current = installed && readFileSync(hookPath, "utf8") === renderPowerShellHook(currentCliEntry()) &&
+      codexHookEvents.every((event) => {
+        const entries = hooks?.[event];
+        return Array.isArray(entries) && entries.some((entry) =>
+          Array.isArray(entry?.hooks) && entry.hooks.some((hook: Record<string, unknown>) =>
+            hook.type === "command" &&
+            hook.command === `node "${currentCliEntry()}" codex hook --event ${event}` &&
+            hook.commandWindows === `powershell -NoProfile -ExecutionPolicy Bypass -File "${hookPath}" ${event}`,
+          ),
+        );
+      });
+  } catch {}
+  return { installed, current, hookPath, hooksPath };
+}
+
 export function installCodexHooks(projectPath: string): string[] {
   ensureWorkspace(projectPath);
   const codexDir = join(projectPath, ".codex");
@@ -74,7 +105,7 @@ export function installCodexHooks(projectPath: string): string[] {
   const existing = readJson(hooksPath);
   const hooks = (existing.hooks && typeof existing.hooks === "object" ? existing.hooks : {}) as Record<string, unknown>;
   const command = `powershell -NoProfile -ExecutionPolicy Bypass -File "${script}"`;
-  for (const event of ["SessionStart", "UserPromptSubmit", "Notification", "PermissionRequest", "PostToolUse", "Stop"]) {
+  for (const event of codexHookEvents) {
     const prior = Array.isArray(hooks[event]) ? hooks[event] : [];
     hooks[event] = [...prior.filter((entry) => !JSON.stringify(entry).includes("agent-bridge-codex-hook.ps1")), {
       hooks: [{
@@ -91,6 +122,7 @@ export function installCodexHooks(projectPath: string): string[] {
 
 export async function handleCodexHook(input: CodexHookInput, forcedEvent?: string): Promise<Record<string, unknown> | undefined> {
   const cwd = input.cwd ? resolve(input.cwd) : process.cwd();
+  if (!repositoryEnabled(cwd)) return undefined;
   const event = forcedEvent ?? codexHookEventName(input);
   // A Work Board launcher has already created the task/card for this terminal.
   // Keep that stable id instead of letting the CLI-native thread id fork a
@@ -112,7 +144,7 @@ export async function handleCodexHook(input: CodexHookInput, forcedEvent?: strin
             if (previousTaskId && previousTaskId !== resumedTask.id) {
               closeSupersededCodexTask(store, cwd, previousTaskId, sessionId, "/resume");
             }
-            const task = store.updateTask(resumedTask.id, { status: "in_progress" }) ?? resumedTask;
+            const task = store.getTaskContract(resumedTask.id) ? resumedTask : store.updateTask(resumedTask.id, { status: "in_progress" }) ?? resumedTask;
             startAgentSession(sessionId, task.id, cwd, "codex");
             rememberSessionTask(nativeSessionId, task.id, cwd);
             rememberSessionWindowHandle(sessionId, task.id, "codex", cwd);
@@ -194,7 +226,7 @@ export async function handleCodexHook(input: CodexHookInput, forcedEvent?: strin
         store.recordSessionEvent({ sessionId, taskId: task.id, agent: "codex", kind: "session_started", summary: "Codex session started." });
       }
       if (prompt) rememberTaskLabelSource(store, taskId, redactIfEnabled(prompt, cwd), "codex");
-      const task = store.updateTask(taskId, { status: "in_progress" });
+      const task = store.getTaskContract(taskId) ? store.getTask(taskId) : store.updateTask(taskId, { status: "in_progress" });
       rememberSessionTask(sessionId, taskId, cwd);
       if (nativeSessionId && nativeSessionId !== sessionId) {
         rememberSessionTask(nativeSessionId, taskId, cwd);
@@ -203,10 +235,6 @@ export async function handleCodexHook(input: CodexHookInput, forcedEvent?: strin
       setCurrentTask(taskId, cwd, "codex");
       store.recordSessionEvent({ sessionId, taskId, agent: "codex", kind: "prompt_submitted", summary: "Codex received a prompt." });
       if (task) writeCurrentTaskArtifact(task, cwd);
-      // Codex reads .agent-memory/compiled-context.md instead of receiving
-      // injected context, so refresh it on every prompt — otherwise it keeps
-      // the compile from session start, or whatever another agent wrote there.
-      writeCompiledContextFor(store, cwd, taskId, "codex");
       return undefined;
     }
 
@@ -229,6 +257,7 @@ export async function handleCodexHook(input: CodexHookInput, forcedEvent?: strin
         : store.getTask(taskId);
       if (task) writeCurrentTaskArtifact(task, cwd);
       store.recordSessionEvent({ sessionId, taskId, agent: "codex", kind: "assistant_summary", summary: "Codex completed a turn." });
+      refreshAutoHandoff(store, cwd, taskId, "codex", sessionId, input.last_assistant_message);
     }
     return undefined;
   } finally { store.close(); }
@@ -248,11 +277,11 @@ function closeSupersededCodexTask(
     const sessionWindow = config.sessionWindows?.[event.sessionId];
     const sharesTerminalWindow = Boolean(
       terminalWindow && sessionWindow && (
-        (terminalWindow.hwnd && terminalWindow.hwnd === sessionWindow.hwnd) ||
-        (terminalWindow.windowId && terminalWindow.windowId === sessionWindow.windowId)
+        (terminalWindow.pid && terminalWindow.pid === sessionWindow.pid &&
+          terminalWindow.processStartedAt && terminalWindow.processStartedAt === sessionWindow.processStartedAt)
       ),
     );
-    if (event.sessionId !== terminalSessionId && !sharesTerminalWindow) continue;
+    if (event.sessionId !== terminalSessionId && config.terminalNativeSessions?.[terminalSessionId] !== event.sessionId && !sharesTerminalWindow) continue;
     store.recordSessionEvent({
       sessionId: event.sessionId,
       taskId,
@@ -270,6 +299,8 @@ function closeSupersededCodexTask(
   // Another terminal may legitimately still be working on the same task.
   // In that case its card stays live; only this window's aliases are retired.
   if (store.listActiveSessionEvents(200).some((event) => event.taskId === taskId)) return;
+
+  if (store.getTaskContract(taskId)) return;
 
   const source = firstTaskLabelSource(store, taskId);
   if (source) {

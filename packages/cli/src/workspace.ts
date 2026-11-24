@@ -1,110 +1,20 @@
+import { paths, readConfig, defaultConfig, renderCurrentTask, writeConfig } from './workspace-config.js';
+import { readSessionProcessStart, sessionProcessLiveness } from "./session-process.js";
+export { paths, memoryDir, policyBudgets, readTokenPolicy, type TokenPolicy, readConfig, type BridgeConfig, defaultConfig, redactIfEnabled, renderCurrentTask, resolveTokenBudget, writeConfig } from './workspace-config.js';
+
 ﻿import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import {
-  renderRepoMap,
-  DEFAULT_CONSOLIDATE_THRESHOLD,
-  DEFAULT_DECAY_HALF_LIFE_DAYS,
-  DEFAULT_DEDUPE_THRESHOLD,
-  DEFAULT_MAX_POOL_SIZE,
-  DEFAULT_MIN_CLUSTER_SIZE,
-  loadOptionalEmbeddingProvider,
-  SQLiteMemoryStore,
-  type AgentKind,
-  type LifecycleConfig,
-  type Handoff,
-  type RecordSessionEventInput,
-  type SessionEvent,
-  type Task,
-} from "@agent-bridge/memory";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { loadOptionalEmbeddingProvider, SQLiteMemoryStore, type AgentKind, type Handoff, type RecordSessionEventInput, type SessionEvent, type Task } from "@agent-bridge/memory";
 import { shouldSeedTitle } from "./task-suggestions.js";
 import {
   claudeManagedSection,
   codexManagedSection,
   patchManagedSection,
   type CliApprovalPolicy,
+  type CliInvocationSettings,
 } from "@agent-bridge/adapters";
-import { compileContext, redactSecrets } from "@agent-bridge/core";
 
-export type BridgeConfig = {
-  version: 1;
-  currentTaskId: string | null;
-  // Per-agent current task, so claude + codex can work the same repo without
-  // clobbering each other's task. currentTaskId stays as the shared fallback
-  // for callers that do not specify an agent.
-  currentTasks?: Partial<Record<AgentKind, string>>;
-  // Last session observed for each agent. Integrations use this to avoid
-  // silently attaching a new session's first prompt to an earlier task.
-  currentSessions?: Partial<Record<AgentKind, string>>;
-  // Sessions currently running in this repository. Unlike currentSessions,
-  // this keeps every concurrent session so the dashboard can show live work.
-  activeSessions?: Record<string, AgentKind>;
-  // Which task each session opened. Lets us restore the right task when an
-  // earlier session is resumed instead of clobbering the current one or
-  // spawning a duplicate. Keyed by session id (unique across agents).
-  sessionTasks?: Record<string, string>;
-  // Native agent session currently hosted by a stable Work Board terminal.
-  // The terminal id survives commands such as Codex /clear; the native id
-  // changes and is used to decide when that window should move to a new task.
-  terminalNativeSessions?: Record<string, string>;
-  // Stable Windows Terminal ids and best-effort process/window handles used
-  // by the dashboard to track and focus an existing agent terminal.
-  sessionWindows?: Record<
-    string,
-    {
-      hwnd?: string;
-      windowId?: string;
-      pid?: number;
-      taskId: string;
-      agent: AgentKind;
-      updatedAt: string;
-    }
-  >;
-  pendingNewTasks?: Partial<Record<AgentKind, true>>;
-  defaultAgent: AgentKind;
-  tokenBudget: number;
-  memoryPath: string;
-  databasePath: string;
-  managedFiles: Record<string, boolean>;
-  security: {
-    redactSecrets: boolean;
-    ignorePaths: string[];
-  };
-  // Memory-pool tuning (dedupe/consolidate/decay/eviction/hybrid). Optional;
-  // omitted fields fall back to the library DEFAULT_* constants.
-  memory?: LifecycleConfig;
-  repoMemory?: {
-    // Capture clearly repo-wide Claude instructions, constraints, and decisions
-    // into the reviewable inbox. Ordinary prompts stay scoped to their task.
-    autoCapture?: boolean;
-  };
-  // Provider-level CLI permission behavior used by every spawned agent of
-  // that provider. Keeping this outside RegisteredAgent makes the safety
-  // choice consistent across model presets.
-  cliApprovalPolicies?: {
-    codex?: "default" | "auto-review" | "never" | "bypass";
-    antigravity?: "default" | "accept-edits" | "plan" | "bypass";
-    claude?: "manual" | "auto" | "accept-edits" | "dont-ask" | "plan" | "bypass";
-  };
-  // Knowledge-graph settings. injectRepoMap controls whether `context compile`
-  // adds the compact repo map; repoMapLimit caps how many files it lists.
-  graph?: {
-    injectRepoMap?: boolean;
-    repoMapLimit?: number;
-    includePaths?: string[];
-    ignorePaths?: string[];
-    // When true (default), Claude's PostToolUse hook auto-briefs each source file
-    // it reads/edits, keeping the graph index warm for fast search. The hook is
-    // always installed; this flag gates the behavior at runtime.
-    autoBriefOnToolUse?: boolean;
-    // When true (default), a running `agent-bridge watch` daemon auto-briefs source
-    // files as they change on disk — the agent-agnostic path (codex/antigravity).
-    // Gates the watcher's behavior so the UI can pause it without stopping it.
-    watchAutoBrief?: boolean;
-  };
-};
-
-export const memoryDir = ".agent-memory";
 const terminalSessionKinds = new Set<SessionEvent["kind"]>([
   "session_ended",
   "session_paused",
@@ -115,83 +25,6 @@ export const DEFAULT_SESSION_STALE_AFTER_MS = 15 * 60 * 1000;
 export const DEFAULT_SESSION_WINDOW_CHECK_INTERVAL_MS = 5 * 1000;
 export const DEFAULT_UNTRACKED_SESSION_STALE_AFTER_MS = 5 * 1000;
 const terminalTaskStatuses = new Set<Task["status"]>(["done", "cancelled"]);
-const sessionWindowAliveCache = new Map<
-  string,
-  { checkedAtMs: number; alive: boolean | undefined }
->();
-
-export function paths(cwd = process.cwd()) {
-  return {
-    cwd,
-    memoryDir: join(cwd, memoryDir),
-    database: join(cwd, memoryDir, "memories.db"),
-    config: join(cwd, memoryDir, "config.json"),
-    currentTask: join(cwd, memoryDir, "current-task.md"),
-    compiledContext: join(cwd, memoryDir, "compiled-context.md"),
-    tokenPolicy: join(cwd, memoryDir, "token-policy.yaml"),
-    logs: join(cwd, memoryDir, "logs"),
-    artifacts: join(cwd, memoryDir, "artifacts"),
-    tasks: join(cwd, memoryDir, "tasks"),
-  };
-}
-
-export function defaultConfig(): BridgeConfig {
-  return {
-    version: 1,
-    currentTaskId: null,
-    currentTasks: {},
-    currentSessions: {},
-    activeSessions: {},
-    sessionTasks: {},
-    sessionWindows: {},
-    pendingNewTasks: {},
-    defaultAgent: "codex",
-    tokenBudget: 4000,
-    memoryPath: ".agent-memory",
-    databasePath: ".agent-memory/memories.db",
-    managedFiles: {
-      "AGENTS.md": true,
-      "CLAUDE.md": true,
-    },
-    security: {
-      redactSecrets: true,
-      ignorePaths: [
-        ".env",
-        ".env.*",
-        "*.pem",
-        "*.key",
-        "node_modules/",
-        "dist/",
-        "build/",
-        ".git/",
-      ],
-    },
-    memory: {
-      dedupeThreshold: DEFAULT_DEDUPE_THRESHOLD,
-      consolidateThreshold: DEFAULT_CONSOLIDATE_THRESHOLD,
-      minClusterSize: DEFAULT_MIN_CLUSTER_SIZE,
-      decayHalfLifeDays: DEFAULT_DECAY_HALF_LIFE_DAYS,
-      maxPoolSize: DEFAULT_MAX_POOL_SIZE,
-      hybrid: { alpha: 0.5, beta: 0.5 },
-    },
-    repoMemory: {
-      autoCapture: true,
-    },
-    cliApprovalPolicies: {
-      codex: "never",
-      antigravity: "accept-edits",
-      claude: "auto",
-    },
-    graph: {
-      injectRepoMap: true,
-      repoMapLimit: 30,
-      includePaths: [],
-      ignorePaths: [],
-      autoBriefOnToolUse: true,
-      watchAutoBrief: true,
-    },
-  };
-}
 
 export function ensureWorkspace(cwd = process.cwd()): void {
   const p = paths(cwd);
@@ -274,102 +107,6 @@ function ensureGitRepository(cwd: string): string {
   if (existsSync(join(cwd, ".git"))) return "Git repository already initialized.";
   execFileSync("git", ["init"], { cwd, stdio: "ignore", windowsHide: true });
   return "Initialized git repository.";
-}
-
-export type TokenPolicy = {
-  maxPromptTokens?: number;
-  maxFileSnippetTokens?: number;
-  maxMemoryTokens?: number;
-  maxLogsTokens?: number;
-  maxHandoffTokens?: number;
-  maxRepoMapTokens?: number;
-  maxConstraintTokens?: number;
-  maxDecisionTokens?: number;
-  preferSummaryOverRaw?: boolean;
-};
-
-// Minimal parser for the flat token-policy.yaml we generate (one level of
-// indentation under `token_policy:`). Avoids pulling in a YAML dependency for
-// a fixed, simple shape. Unknown keys are ignored.
-function parseSimpleYaml(
-  text: string,
-): Record<string, number | boolean | string> {
-  const out: Record<string, number | boolean | string> = {};
-  for (const line of text.split(/\r?\n/)) {
-    const match = /^\s+([a-z0-9_]+):\s*(.+?)\s*$/i.exec(line);
-    if (!match) continue;
-    const [, key, rawValue] = match;
-    if (/^-?\d+$/.test(rawValue)) out[key] = Number(rawValue);
-    else if (rawValue === "true" || rawValue === "false")
-      out[key] = rawValue === "true";
-    else out[key] = rawValue.replace(/^["']|["']$/g, "");
-  }
-  return out;
-}
-
-export function readTokenPolicy(cwd = process.cwd()): TokenPolicy {
-  const p = paths(cwd);
-  if (!existsSync(p.tokenPolicy)) return {};
-  const values = parseSimpleYaml(readFileSync(p.tokenPolicy, "utf8"));
-  const num = (key: string): number | undefined =>
-    typeof values[key] === "number" ? (values[key] as number) : undefined;
-  return {
-    maxPromptTokens: num("max_prompt_tokens"),
-    maxFileSnippetTokens: num("max_file_snippet_tokens"),
-    maxMemoryTokens: num("max_memory_tokens"),
-    maxLogsTokens: num("max_logs_tokens"),
-    maxHandoffTokens: num("max_handoff_tokens"),
-    maxRepoMapTokens: num("max_repo_map_tokens"),
-    maxConstraintTokens: num("max_constraint_tokens"),
-    maxDecisionTokens: num("max_decision_tokens"),
-    preferSummaryOverRaw: values["prefer_summary_over_raw"] === true,
-  };
-}
-
-// Per-section budgets to pass into compileContext, derived from token-policy.yaml.
-// Returns undefined fields when the policy does not specify them, so the
-// compiler falls back to its default fractions of the prompt budget.
-export function policyBudgets(cwd = process.cwd()): {
-  memoryTokenBudget?: number;
-  fileTokenBudget?: number;
-  handoffTokenBudget?: number;
-  repoMapTokenBudget?: number;
-  constraintTokenBudget?: number;
-  decisionTokenBudget?: number;
-} {
-  const policy = readTokenPolicy(cwd);
-  return {
-    memoryTokenBudget: policy.maxMemoryTokens,
-    fileTokenBudget: policy.maxFileSnippetTokens,
-    handoffTokenBudget: policy.maxHandoffTokens,
-    repoMapTokenBudget: policy.maxRepoMapTokens,
-    constraintTokenBudget: policy.maxConstraintTokens,
-    decisionTokenBudget: policy.maxDecisionTokens,
-  };
-}
-
-// max_prompt_tokens is the authority for the whole pack budget; config.json's
-// tokenBudget is the fallback for workspaces without a policy file. An explicit
-// caller value (the `context --budget` flag) still wins, so the flag is never
-// silently overridden by the policy.
-export function resolveTokenBudget(
-  cwd = process.cwd(),
-  explicit?: number,
-): number {
-  if (typeof explicit === "number" && Number.isFinite(explicit)) return explicit;
-  return readTokenPolicy(cwd).maxPromptTokens ?? readConfig(cwd).tokenBudget;
-}
-
-export function readConfig(cwd = process.cwd()): BridgeConfig {
-  const p = paths(cwd);
-  if (!existsSync(p.config)) return defaultConfig();
-  return JSON.parse(readFileSync(p.config, "utf8")) as BridgeConfig;
-}
-
-export function writeConfig(config: BridgeConfig, cwd = process.cwd()): void {
-  const p = paths(cwd);
-  mkdirSync(p.memoryDir, { recursive: true });
-  writeFileSync(p.config, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 
 export function openStore(cwd = process.cwd()): SQLiteMemoryStore {
@@ -489,10 +226,6 @@ export function startAgentSession(
   const sessionTasks = { ...(config.sessionTasks ?? {}) };
   delete sessionTasks[sessionId];
   sessionTasks[sessionId] = taskId;
-  const keys = Object.keys(sessionTasks);
-  if (keys.length > 100) {
-    for (const stale of keys.slice(0, keys.length - 100)) delete sessionTasks[stale];
-  }
   writeConfig({
     ...config,
     currentTaskId: taskId,
@@ -504,9 +237,27 @@ export function startAgentSession(
   }, cwd);
 }
 
-export function endAgentSession(sessionId: string | undefined, cwd = process.cwd()): void {
+export function endAgentSession(
+  sessionId: string | undefined,
+  cwd = process.cwd(),
+  completion?: { taskId: string; agent: AgentKind; writersStopped: true; reason: string },
+): void {
   if (!sessionId) return;
   const config = readConfig(cwd);
+  if (completion) {
+    if (config.sessionTasks?.[sessionId] !== completion.taskId ||
+        (config.activeSessions?.[sessionId] && config.activeSessions[sessionId] !== completion.agent)) {
+      throw new Error("Session/task/agent ownership mismatch");
+    }
+    const pid = config.sessionWindows?.[sessionId]?.pid;
+    if (pid && isSessionProcessAlive(pid)) throw new Error("Session writers are still running");
+    const store = openStore(cwd);
+    try {
+      store.releaseSessionFileLeases({ ...completion, sessionId }, completion.reason);
+    } finally {
+      store.close();
+    }
+  }
   if (!config.activeSessions?.[sessionId]) return;
   const activeSessions = { ...config.activeSessions };
   delete activeSessions[sessionId];
@@ -531,15 +282,18 @@ export function rememberSessionWindowHandle(
 ): string | undefined {
   const config = readConfig(cwd);
   const existing = config.sessionWindows?.[sessionId];
+  const host = existing?.processStartedAt ? undefined : captureSessionHost(agent, terminalTitle(agent, taskId, sessionId));
   const capturedHwnd =
-    hwnd ?? captureForegroundWindowHandle(terminalTitle(agent, taskId, sessionId));
-  if (!capturedHwnd && !existing) return undefined;
+    hwnd ?? existing?.hwnd ?? host?.hwnd;
+  if (!capturedHwnd && !existing && !host?.pid) return undefined;
   writeConfig({
     ...config,
     sessionWindows: {
       ...(config.sessionWindows ?? {}),
       [sessionId]: {
         ...existing,
+        pid: host?.pid ?? existing?.pid,
+        processStartedAt: host?.processStartedAt ?? existing?.processStartedAt,
         hwnd: capturedHwnd ?? existing?.hwnd,
         taskId,
         agent,
@@ -550,9 +304,9 @@ export function rememberSessionWindowHandle(
   return capturedHwnd ?? existing?.hwnd;
 }
 
-function captureForegroundWindowHandle(title?: string): string | undefined {
+function captureSessionHost(agent: AgentKind, title: string): { hwnd?: string; pid?: number; processStartedAt?: string } | undefined {
   if (process.platform !== "win32") return undefined;
-  if (process.env.VITEST || process.env.VITEST_WORKER_ID) return undefined;
+  if (process.env.VITEST || process.env.VITEST_WORKER_ID || process.env.NODE_TEST_CONTEXT) return undefined;
   try {
     const script = `
 $ProgressPreference = 'SilentlyContinue'
@@ -565,10 +319,24 @@ public class AgentBridgeForegroundWindow {
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 }
 "@
-${title ? `[void][AgentBridgeForegroundWindow]::SetConsoleTitle(${psString(title)})` : ""}
+[void][AgentBridgeForegroundWindow]::SetConsoleTitle(${psString(title)})
 $hwnd = [AgentBridgeForegroundWindow]::GetForegroundWindow()
-if ($hwnd -eq [IntPtr]::Zero) { exit 2 }
-$hwnd.ToInt64()
+$agentPid = $null
+$agentStartedAt = $null
+$cursorPid = ${process.ppid}
+for ($depth = 0; $depth -lt 8 -and $cursorPid -gt 0; $depth++) {
+  $ancestor = Get-CimInstance Win32_Process -Filter "ProcessId = $cursorPid" -ErrorAction Stop
+  if (-not $ancestor) { break }
+  $nativeAgent = $ancestor.Name -ieq (${psString(agent === "antigravity" ? "agy" : agent)} + '.exe')
+  $nodeAgent = $ancestor.Name -ieq 'node.exe' -and ([string]$ancestor.CommandLine).Replace([char]92, [char]47) -match '(@openai/codex|@anthropic-ai/claude-code|antigravity)'
+  if (($nativeAgent -or $nodeAgent) -and $ancestor.CommandLine -notmatch '\\bapp-server\\b') {
+    $agentPid = [int]$ancestor.ProcessId
+    $agentStartedAt = $ancestor.CreationDate.ToUniversalTime().ToString('o')
+    break
+  }
+  $cursorPid = [int]$ancestor.ParentProcessId
+}
+@{ hwnd = if ($hwnd -ne [IntPtr]::Zero) { $hwnd.ToInt64().ToString() } else { $null }; pid = $agentPid; processStartedAt = $agentStartedAt } | ConvertTo-Json -Compress
 `;
     const output = execFileSync(
       "powershell.exe",
@@ -581,7 +349,9 @@ $hwnd.ToInt64()
       ],
       { encoding: "utf8", windowsHide: true },
     ).trim();
-    return output || undefined;
+    const host = JSON.parse(output) as { hwnd?: string; pid?: number; processStartedAt?: string };
+    return { hwnd: host.hwnd || undefined, pid: host.pid || undefined,
+      processStartedAt: host.processStartedAt ? new Date(host.processStartedAt).toISOString() : undefined };
   } catch {
     return undefined;
   }
@@ -609,27 +379,19 @@ export function cleanupStaleAgentSessions(
     windowCheckIntervalMs?: number;
     isSessionWindowAlive?: (hwnd: string) => boolean | undefined;
     isSessionProcessAlive?: (pid: number) => boolean;
+    readSessionProcessStart?: (pid: number) => string | null | undefined;
   } = {},
 ): number {
   const config = readConfig(cwd);
-  const activeSessions = config.activeSessions ?? {};
-  const staleAfterMs = options.staleAfterMs ?? DEFAULT_SESSION_STALE_AFTER_MS;
-  const untrackedStaleAfterMs =
-    options.untrackedStaleAfterMs ?? DEFAULT_UNTRACKED_SESSION_STALE_AFTER_MS;
-  const windowCheckIntervalMs =
-    options.windowCheckIntervalMs ?? DEFAULT_SESSION_WINDOW_CHECK_INTERVAL_MS;
-  const nowMs = (options.now ?? new Date()).getTime();
   let closed = 0;
 
   for (const event of store.listActiveSessionEvents(500)) {
     if (terminalSessionKinds.has(event.kind)) continue;
-    const tracked = Boolean(activeSessions[event.sessionId]);
-    const ageMs = nowMs - Date.parse(event.createdAt);
     const sessionWindow = config.sessionWindows?.[event.sessionId];
-    const processAlive = sessionWindow?.pid
-      ? (options.isSessionProcessAlive ?? isSessionProcessAlive)(sessionWindow.pid)
-      : undefined;
-    if (processAlive === true) continue;
+    const liveness = options.isSessionProcessAlive && sessionWindow?.pid
+      ? options.isSessionProcessAlive(sessionWindow.pid) ? "running" : "ended"
+      : sessionProcessLiveness(sessionWindow, options.readSessionProcessStart ?? readSessionProcessStart);
+    const processAlive = liveness === "running" ? true : liveness === "ended" ? false : undefined;
     if (processAlive === false) {
       store.recordSessionEvent({
         sessionId: event.sessionId,
@@ -642,38 +404,6 @@ export function cleanupStaleAgentSessions(
       closed += 1;
       continue;
     }
-    const hwnd = sessionWindow?.hwnd;
-    const windowAlive = hwnd
-      ? cachedSessionWindowAlive(
-          hwnd,
-          nowMs,
-          options.isSessionWindowAlive ?? isSessionWindowAlive,
-          windowCheckIntervalMs,
-        )
-      : undefined;
-    if (windowAlive === true) continue;
-    if (!tracked && ageMs > untrackedStaleAfterMs) {
-      store.recordSessionEvent({
-        sessionId: event.sessionId,
-        taskId: event.taskId,
-        agent: event.agent,
-        kind: "session_ended",
-        summary: `${agentLabel(event.agent)} session marked ended after losing active tracking.`,
-      });
-      endAgentSession(event.sessionId, cwd);
-      closed += 1;
-      continue;
-    }
-    if (windowAlive !== false && ageMs <= staleAfterMs) continue;
-    store.recordSessionEvent({
-      sessionId: event.sessionId,
-      taskId: event.taskId,
-      agent: event.agent,
-      kind: "session_ended",
-      summary: `${agentLabel(event.agent)} session marked ended after missing heartbeat.`,
-    });
-    endAgentSession(event.sessionId, cwd);
-    closed += 1;
   }
 
   return closed;
@@ -689,59 +419,7 @@ function isSessionProcessAlive(pid: number): boolean {
   }
 }
 
-function cachedSessionWindowAlive(
-  hwnd: string,
-  nowMs: number,
-  checker: (hwnd: string) => boolean | undefined,
-  cacheMs: number,
-): boolean | undefined {
-  if (cacheMs > 0) {
-    const cached = sessionWindowAliveCache.get(hwnd);
-    if (cached && nowMs - cached.checkedAtMs <= cacheMs) return cached.alive;
-  }
-  const alive = checker(hwnd);
-  if (cacheMs > 0) {
-    sessionWindowAliveCache.set(hwnd, { checkedAtMs: nowMs, alive });
-  }
-  return alive;
-}
-
-function isSessionWindowAlive(hwnd: string): boolean | undefined {
-  if (process.platform !== "win32") return undefined;
-  const numericHwnd = Number(hwnd);
-  if (!Number.isFinite(numericHwnd) || numericHwnd <= 0) return false;
-  const script = `
-$hwnd = [IntPtr]${Math.trunc(numericHwnd)}
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class AgentBridgeWindowAlive {
-  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
-}
-"@
-if ([AgentBridgeWindowAlive]::IsWindow($hwnd)) { exit 0 }
-exit 2
-`;
-  try {
-    execFileSync(
-      "powershell.exe",
-      [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-EncodedCommand",
-        Buffer.from(script, "utf16le").toString("base64"),
-      ],
-      { stdio: "ignore", windowsHide: true },
-    );
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// Record which task a session is working so a later resume of that session can
-// restore it. Bounded to the most recent 100 sessions to keep config.json small.
+// Runtime bindings are durable in SQLite so old sessions can be resumed.
 export function rememberSessionTask(
   sessionId: string | undefined,
   taskId: string,
@@ -752,11 +430,6 @@ export function rememberSessionTask(
   const sessionTasks = { ...(config.sessionTasks ?? {}) };
   delete sessionTasks[sessionId];
   sessionTasks[sessionId] = taskId;
-  const keys = Object.keys(sessionTasks);
-  if (keys.length > 100) {
-    for (const stale of keys.slice(0, keys.length - 100))
-      delete sessionTasks[stale];
-  }
   writeConfig({ ...config, sessionTasks }, cwd);
 }
 
@@ -771,10 +444,6 @@ export function syncTerminalNativeSession(
   const terminalNativeSessions = { ...(config.terminalNativeSessions ?? {}) };
   delete terminalNativeSessions[terminalSessionId];
   terminalNativeSessions[terminalSessionId] = nativeSessionId;
-  const keys = Object.keys(terminalNativeSessions);
-  if (keys.length > 100) {
-    for (const stale of keys.slice(0, keys.length - 100)) delete terminalNativeSessions[stale];
-  }
   writeConfig({ ...config, terminalNativeSessions }, cwd);
   return previous ? "changed" : "initial";
 }
@@ -867,13 +536,15 @@ export function resolveActiveTaskId(
     if (task && !terminalTaskStatuses.has(task.status)) return task.id;
   }
 
-  const fallback = store
+  const candidates = store
     .listTasks(50)
-    .find(
+    .filter(
       (task) =>
         !terminalTaskStatuses.has(task.status) &&
         (!agent || !task.ownerAgent || task.ownerAgent === agent),
     );
+  if (candidates.length > 1) throw new Error("Ambiguous active task. Pass --task or use the session binding.");
+  const fallback = candidates[0];
   if (fallback) {
     setCurrentTask(fallback.id, cwd, agent);
     writeCurrentTaskArtifact(fallback, cwd);
@@ -901,27 +572,6 @@ export function getActiveTaskId(
   return taskId;
 }
 
-export function renderCurrentTask(task: Task): string {
-  return [
-    "# Current Task",
-    "",
-    "## Title",
-    task.title,
-    "",
-    "## Status",
-    task.status,
-    "",
-    "## Goal",
-    task.goal || "No explicit goal recorded.",
-    "",
-    "## Next Actions",
-    "- Compile context for the next agent.",
-    "- Inspect relevant files.",
-    "- Run focused verification.",
-    "",
-  ].join("\n");
-}
-
 export function writeCurrentTaskArtifact(
   task: Task,
   cwd = process.cwd(),
@@ -946,38 +596,6 @@ export function syncCurrentTaskArtifact(
   if (!task) throw new Error(`Current task missing from database: ${taskId}`);
   writeCurrentTaskArtifact(task, cwd);
   return task;
-}
-
-// Recompile the shared context artifact for one agent. `.agent-memory/compiled-context.md`
-// is a single file stamped with whoever compiled it last, so every integration
-// has to call this on its own prompt event: an agent that never compiles reads
-// another agent's view of the task, or a view several turns out of date.
-export function writeCompiledContextFor(
-  store: SQLiteMemoryStore,
-  cwd: string,
-  taskId: string,
-  agent: AgentKind,
-) {
-  const config = readConfig(cwd);
-  syncCurrentTaskArtifact(store, taskId, cwd);
-  const repoMap =
-    config.graph?.injectRepoMap !== false && store.getGraphStats().files > 0
-      ? renderRepoMap(
-          store.buildRepoMap({ limit: config.graph?.repoMapLimit ?? 30 }),
-        )
-      : undefined;
-  const pack = compileContext(store, {
-    taskId,
-    agent,
-    tokenBudget: resolveTokenBudget(cwd),
-    ...policyBudgets(cwd),
-    repoMap,
-  });
-  writeFileSync(paths(cwd).compiledContext, `${pack.renderedMarkdown}\n`, "utf8");
-  const taskContextPath = join(paths(cwd).tasks, taskId, "compiled-context.md");
-  mkdirSync(dirname(taskContextPath), { recursive: true });
-  writeFileSync(taskContextPath, `${pack.renderedMarkdown}\n`, "utf8");
-  return pack;
 }
 
 // Every unfinished task can carry its own handoff, so "which handoff do I
@@ -1054,6 +672,15 @@ export function readCliApprovalPolicy(cwd: string, provider: string): CliApprova
   return undefined;
 }
 
+export function readCliInvocationSettings(cwd: string, provider: string): CliInvocationSettings {
+  const policies = readConfig(cwd).cliApprovalPolicies;
+  return {
+    policy: provider === "codex" ? policies?.codex : provider === "antigravity" ? policies?.antigravity : provider === "claude" ? policies?.claude : undefined,
+    codexSandbox: provider === "codex" ? policies?.codexSandbox : undefined,
+    antigravityMode: provider === "antigravity" ? policies?.antigravityMode : undefined,
+  };
+}
+
 function significantTerms(text: string): Set<string> {
   return new Set(
     text
@@ -1091,7 +718,8 @@ export function adoptContinuationTask(
   });
   if (!match) return { taskId: input.currentTaskId };
 
-  store.updateTask(match.task.id, { status: "in_progress" });
+  if (!store.getTaskContract(match.task.id))
+    store.updateTask(match.task.id, { status: "in_progress" });
   rememberSessionTask(input.sessionId, match.task.id, cwd);
   setCurrentTask(match.task.id, cwd, input.agent);
   writeCurrentTaskArtifact(
@@ -1111,15 +739,6 @@ export function adoptContinuationTask(
     setCurrentTask(match.task.id, cwd, input.agent);
   }
   return { taskId: match.task.id, adopted: match };
-}
-
-// Redact secrets from text before it is persisted, unless the project config
-// explicitly disables redaction. Applied at every ingestion point so secrets
-// never reach memories.db / handoff files in plaintext.
-export function redactIfEnabled(text: string, cwd = process.cwd()): string {
-  return readConfig(cwd).security?.redactSecrets === false
-    ? text
-    : redactSecrets(text);
 }
 
 // How long to wait for the FIRST byte on stdin before concluding nothing is

@@ -185,6 +185,7 @@ export type ExtractGraphOptions = {
   // Optional allowlist of repo-relative paths to scan. Empty means scan all
   // non-ignored code files.
   include?: string[];
+  knownPaths?: string[];
   maxFileBytes?: number;
 };
 
@@ -373,12 +374,14 @@ function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
+export function listGraphSourcePaths(root: string, options: ExtractGraphOptions = {}): string[] {
+  return walk(root, [...DEFAULT_IGNORE, ...(options.ignore ?? [])], options.include ?? []).filter((rel) => RULES_BY_EXT[extname(rel)]);
+}
+
 export function extractGraph(root: string, options: ExtractGraphOptions = {}): ExtractedGraph {
-  const ignore = [...DEFAULT_IGNORE, ...(options.ignore ?? [])];
-  const include = options.include ?? [];
   const maxBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
-  const relPaths = walk(root, ignore, include).filter((rel) => RULES_BY_EXT[extname(rel)]);
-  const fileSet = new Set(relPaths);
+  const relPaths = listGraphSourcePaths(root, options);
+  const fileSet = new Set([...relPaths, ...(options.knownPaths ?? [])]);
 
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];

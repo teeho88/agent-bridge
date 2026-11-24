@@ -84,9 +84,5 @@ export function writeTaskContext(
 ): void {
   const filePath = taskContextPath(taskId, cwd);
   mkdirSync(dirname(filePath), { recursive: true });
-  writeFileSync(
-    filePath,
-    content.endsWith("\n") ? content : `${content}\n`,
-    "utf8",
-  );
+  writeFileSync(filePath, content, "utf8");
 }

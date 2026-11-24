@@ -1,6 +1,6 @@
 // Optional precise token counting. The built-in estimateTokens() is a fast
-// script-aware heuristic (~20% off real tokenizers); good enough for budgeting
-// and used everywhere internally. When an exact count is wanted (e.g. reporting),
+// script-aware heuristic; its error depends on the model and input corpus.
+// When a configured count is wanted (e.g. reporting),
 // a real tokenizer can be loaded on demand from a module named by
 // AGENT_BRIDGE_TOKENIZER_MODULE — no hard dependency, so the package builds and
 // runs without it. Missing/broken module => null => callers fall back to the

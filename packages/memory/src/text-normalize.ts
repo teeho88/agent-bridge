@@ -13,3 +13,7 @@ export function foldDiacritics(text: string): string {
     .replace(/Đ/g, "D")
     .toLowerCase();
 }
+
+export function searchTerms(text: string): string[] {
+  return [...new Set(foldDiacritics(text.slice(0, 16384)).match(/[\p{L}\p{N}]+/gu) ?? [])].slice(0, 64);
+}

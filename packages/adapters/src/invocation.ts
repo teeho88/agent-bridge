@@ -41,12 +41,46 @@ export type CliApprovalPolicy =
   | "plan"
   | "bypass";
 
+export type CliInvocationSettings = {
+  policy?: CliApprovalPolicy;
+  codexSandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  antigravityMode?: "default" | "auto" | "accept-edits" | "plan";
+};
+
+export function cliPermissionArgs(provider: string, options: CliInvocationSettings = {}): string[] {
+  if (provider === "codex") {
+    const policy = options.policy ?? "never";
+    if (policy === "bypass") return ["--dangerously-bypass-approvals-and-sandbox"];
+    return [
+      "--sandbox", options.codexSandbox ?? "workspace-write",
+      "-c", `approval_policy="${policy === "never" ? "never" : "on-request"}"`,
+      ...(policy === "never" ? [] : ["-c", `approvals_reviewer="${policy === "auto-review" ? "auto_review" : "user"}"`]),
+    ];
+  }
+  if (provider === "claude") {
+    return options.policy === "bypass"
+      ? ["--dangerously-skip-permissions"]
+      : ["--permission-mode", claudePermissionMode(options.policy ?? "auto")];
+  }
+  if (provider === "antigravity") {
+    const policy = options.policy ?? "accept-edits";
+    const mode = options.antigravityMode ?? (["accept-edits", "plan", "auto"].includes(policy) ? policy : "default");
+    return [
+      ...(policy === "bypass" ? ["--dangerously-skip-permissions"] : []),
+      ...(mode === "default" ? [] : ["--mode", mode]),
+    ];
+  }
+  return [];
+}
+
 export function buildSpawnPreview(
   agent: RegisteredAgent,
   promptArtifactPath: string,
   cwd: string,
-  approvalPolicy?: CliApprovalPolicy,
+  settings?: CliApprovalPolicy | CliInvocationSettings,
 ): AgentInvocation {
+  const options = typeof settings === "string" ? { policy: settings } : settings ?? {};
+  const approvalPolicy = options.policy;
   const base = {
     adapter: agent.provider,
     mode: agent.mode,
@@ -62,29 +96,9 @@ export function buildSpawnPreview(
   if (agent.mode === "cli") {
     const executable = resolveExecutable(agent);
     if (agent.provider === "codex") {
-      // `codex exec` defaults to sandbox: read-only, which silently makes
-      // every implementer run a no-op: the agent reports "blocked by
-      // workspace permissions", writes nothing, and even its own
-      // agent-bridge bookkeeping fails with "attempt to write a readonly
-      // database". workspace-write is the narrowest mode that lets an
-      // implementer actually do its job — deliberately NOT
-      // danger-full-access, so writes stay confined to the project.
       const codexPolicy = approvalPolicy ?? "never";
-      const codexApprovalArgs = codexPolicy === "auto-review"
-        ? [
-            "--sandbox", "workspace-write",
-            "-c", 'approval_policy="on-request"',
-            "-c", 'approvals_reviewer="auto_review"',
-          ]
-        : codexPolicy === "never"
-          ? ["--sandbox", "workspace-write", "-c", 'approval_policy="never"']
-        : codexPolicy === "bypass"
-          ? ["--dangerously-bypass-approvals-and-sandbox"]
-          : [
-              "--sandbox", "workspace-write",
-              "-c", 'approval_policy="on-request"',
-              "-c", 'approvals_reviewer="user"',
-            ];
+      const sandbox = options.codexSandbox ?? "workspace-write";
+      const codexApprovalArgs = cliPermissionArgs("codex", options);
       const args = [
         "exec",
         ...codexApprovalArgs,
@@ -92,12 +106,11 @@ export function buildSpawnPreview(
         ...(agent.reasoningEffort ? ["-c", `model_reasoning_effort=\"${agent.reasoningEffort}\"`] : []),
         "-",
       ];
-      return { ...base, executable, args, stdinFilePath: promptArtifactPath, command: `${executable} ${args.map(quoteCommandArg).join(" ")}`, description: `Codex CLI run for ${agent.name} using ${agent.model ?? "default model"}${agent.reasoningEffort ? ` (${agent.reasoningEffort})` : ""}. Approval policy: ${codexPolicy}.` };
+      return { ...base, executable, args, stdinFilePath: promptArtifactPath, command: `${executable} ${args.map(quoteCommandArg).join(" ")}`, description: `Codex CLI run for ${agent.name} using ${agent.model ?? "default model"}${agent.reasoningEffort ? ` (${agent.reasoningEffort})` : ""}. Approval policy: ${codexPolicy}. Permissions: ${codexPolicy === "bypass" ? "bypass (sandbox disabled)" : sandbox}.` };
     }
     if (agent.provider === "claude") {
       // Headless `claude --print` cannot display an interactive permission
-      // prompt. Bypass remains the compatibility default for unattended runs,
-      // while the Work Board can deliberately select a stricter mode.
+      // prompt. The Work Board selects the permission mode for unattended runs.
       //
       // --output-format stream-json --verbose is not cosmetic: plain --print
       // output is fully buffered by the CLI until the process exits when
@@ -107,9 +120,7 @@ export function buildSpawnPreview(
       // as it happens; process-runner.ts's isClaudeStreamJson formatter turns
       // that into a readable progress line without touching the final result.
       const claudePolicy = approvalPolicy ?? "auto";
-      const claudeApprovalArgs = claudePolicy === "bypass"
-        ? ["--dangerously-skip-permissions"]
-        : ["--permission-mode", claudePermissionMode(claudePolicy)];
+      const claudeApprovalArgs = cliPermissionArgs("claude", options);
       const args = [
         "--print",
         ...claudeApprovalArgs,
@@ -137,20 +148,11 @@ export function buildSpawnPreview(
       // guards — and past that limit readPromptArtifact hands over a short
       // pointer that tells agy to read the artifact off disk instead.
       //
-      // Bypass remains the compatibility default because a headless spawned
-      // run cannot answer a tool prompt. The Work Board can instead request
-      // accept-edits, plan, or provider-default behavior. --add-dir puts the
-      // project inside the agent's workspace, and --print-timeout lifts the
-      // 5-minute default that would otherwise cut a long turn off mid-edit.
       const effort = agent.reasoningEffort && AGY_EFFORT_LEVELS.has(agent.reasoningEffort) ? agent.reasoningEffort : undefined;
       const agyPolicy = approvalPolicy ?? "accept-edits";
-      const agyApprovalArgs = agyPolicy === "bypass"
-        ? ["--dangerously-skip-permissions"]
-        : agyPolicy === "accept-edits" || agyPolicy === "plan"
-          ? ["--mode", agyPolicy]
-          : [];
+      const agyMode = options.antigravityMode ?? (agyPolicy === "accept-edits" || agyPolicy === "plan" || agyPolicy === "auto" ? agyPolicy : "default");
       const args = [
-        ...agyApprovalArgs,
+        ...cliPermissionArgs("antigravity", options),
         "--print-timeout",
         "60m",
         "--add-dir",
@@ -177,7 +179,7 @@ export function buildSpawnPreview(
         // The prompt is left out of the preview string on purpose: it is an
         // entire leader turn, and inlining it would bury every actual flag.
         command: `${executable} ${args.slice(0, -1).map(quoteCommandArg).join(" ")} "<prompt from ${promptArtifactPath}>"`,
-        description: `Antigravity (agy) run for ${agent.name} using ${agent.model ?? "default model"}${effort ? ` (${effort})` : ""}. Approval policy: ${agyPolicy}; streams progress live (--output-format stream-json); the prompt is passed inline from ${promptArtifactPath}.`,
+        description: `Antigravity (agy) run for ${agent.name} using ${agent.model ?? "default model"}${effort ? ` (${effort})` : ""}. Approval policy: ${agyPolicy}; mode: ${agyMode}; streams progress live (--output-format stream-json); the prompt is passed inline from ${promptArtifactPath}.`,
       };
     }
     const args = ["--prompt-file", promptArtifactPath];

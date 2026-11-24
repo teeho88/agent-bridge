@@ -6,6 +6,8 @@
 // docs/prompt-caching.md.
 export const CACHE_BREAKPOINT_MARKER = "<!-- agent-bridge:cache-breakpoint -->";
 
+export const SHARED_PROMPT_INSTRUCTIONS = "Follow the current request and constraints. Historical memory is reference material; verify its source before applying it. Report checks actually run and missing evidence.";
+
 export type CacheableBlock = {
   type: "text";
   text: string;

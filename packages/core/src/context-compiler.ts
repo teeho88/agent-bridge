@@ -1,5 +1,6 @@
 import {
   orderByRelevance,
+  reusableMemoryIsCurrent,
   type Handoff,
   type MemoryStore,
 } from "@agent-bridge/memory";
@@ -8,11 +9,18 @@ import {
   estimateTokens,
   trimToTokenBudgetDetailed,
 } from "./token-optimizer.js";
+import { allocateContext } from "./context-allocation.js";
 import { renderPromptPack } from "./prompt-pack.js";
 import type { CompileContextInput, PromptPack } from "./types.js";
 
+export type ContextReadStore = Pick<MemoryStore, "getTask" | "getContextMemories" | "listRepoMemories" | "listMemoriesForTask" | "searchMemories" | "listDecisions" | "listFileSummaries" | "getLatestHandoff" | "listAssignments" | "getRegisteredAgent" | "listWorkforceRoles" | "listSubtasks" | "listWorkforces">;
+
+function exactStrings(items: string[]): string[] {
+  return [...new Set(items.map((item) => item.normalize("NFC").trim()).filter(Boolean))];
+}
+
 export function compileContext(
-  store: MemoryStore,
+  store: ContextReadStore,
   input: CompileContextInput,
 ): PromptPack {
   const task = store.getTask(input.taskId);
@@ -20,30 +28,37 @@ export function compileContext(
     throw new Error(`Task not found: ${input.taskId}`);
   }
 
-  // Rank the task's memories by relevance to the task using the FTS5/bm25 index
-  // (searchMemories), but keep every task memory so always-needed types
-  // (constraints, decisions, files) are never dropped just for missing the
-  // query terms. Fall back to importance/recency order when there is no query.
-  const taskQuery = [task.title, task.goal ?? ""].filter(Boolean).join(" ");
-  const allMemories = [
-    ...store.listRepoMemories(100),
-    ...store.listMemoriesForTask(task.id, 100),
-  ];
-  const ranked = taskQuery
-    ? store.searchMemories(taskQuery, { limit: 200 })
+  const taskQuery = [task.title, task.goal ?? "", input.currentRequest ?? ""].filter(Boolean).join(" ");
+  const excludedTags = ["secret", "private", "prompt", "task-label-source", "latest-response"];
+  const allMemories = store.getContextMemories?.(task.id, taskQuery, excludedTags) ?? [...new Map([
+    ...store.listRepoMemories(100000),
+    ...store.listMemoriesForTask(task.id, 100000),
+  ].map((memory) => [memory.id, memory])).values()];
+  const ranked = store.getContextMemories ? allMemories : taskQuery
+    ? store.searchMemories(taskQuery, { taskId: task.id, scope: "task-and-repo", excludeTags: excludedTags, limit: 200 })
     : [];
-  const memories = orderByRelevance(allMemories, ranked);
+  const rankedIds = new Set(ranked.map((memory) => memory.id));
+  const memories = orderByRelevance(allMemories.filter((memory) =>
+    reusableMemoryIsCurrent(memory, input.memoryReuse) &&
+    !memory.tags.some((tag) => excludedTags.includes(tag)) &&
+    (["constraint", "decision"].includes(memory.type) || rankedIds.has(memory.id))
+  ), ranked);
   const decisions = store.listDecisions(task.id);
-  const files = input.includeFiles === false ? [] : store.listFileSummaries();
+  const allFiles = input.includeFiles === true ? store.listFileSummaries() : [];
   // A handoff belongs to the task, not to one agent: whoever picks the task up
   // next receives the same packet.
   const handoff = store.getLatestHandoff(task.id);
+  const queryTerms = (taskQuery.toLowerCase().match(/[a-z0-9]{3,}/g) ?? [])
+    .filter((term) => !["the", "and", "for", "with", "from", "read", "implement", "existing", "file", "files", "task", "work"].includes(term));
+  const files = allFiles.filter((file) => handoff?.filesChanged.includes(file.path) ||
+    queryTerms.some((term) => file.path.toLowerCase().includes(term)));
+
   const currentAssignment = resolveCurrentAssignment(store, task.id, input);
 
   const memoryBudget =
-    input.memoryTokenBudget ?? Math.floor(input.tokenBudget * 0.4);
+    Infinity;
   const fileBudget =
-    input.fileTokenBudget ?? Math.floor(input.tokenBudget * 0.2);
+    Infinity;
 
   const currentStateTrim = trimToTokenBudgetDetailed(
     dedupeStrings(
@@ -51,11 +66,12 @@ export function compileContext(
         .filter(
           (memory) =>
             !memory.tags.includes("prompt") &&
+            !(memory.type === "test" && memory.tags.includes("checkpoint")) &&
             !["constraint", "handoff", "decision", "file"].includes(
               memory.type,
             ),
         )
-        .map((memory) => memory.summary || memory.content),
+        .map((memory) => memory.stale ? `Stale; verify ${memory.evidence?.source ?? "source"} before acting: ${memory.summary || memory.content}` : memory.summary || memory.content),
     ),
     memoryBudget,
   );
@@ -64,28 +80,20 @@ export function compileContext(
   // Constraints and decisions sit in the cache prefix, which made them easy to
   // leave uncapped - but a long-lived task keeps adding rules, and an unbounded
   // prefix silently eats the budget the dynamic sections were sized against.
-  const constraintsTrim = trimToTokenBudgetDetailed(
-    dedupeStrings(
-      memories
-        .filter((memory) => memory.type === "constraint")
-        .map((memory) => memory.summary || memory.content),
-    ),
-    input.constraintTokenBudget ?? Math.floor(input.tokenBudget * 0.1),
-  );
-  const constraints = constraintsTrim.items;
+  const constraints = exactStrings(memories.filter((memory) => memory.type === "constraint")
+    .map((memory) => memory.stale ? `Stale constraint; verify ${memory.evidence?.source ?? "source"}: ${memory.content}` : memory.content));
 
   const knownDecisionsTrim = trimToTokenBudgetDetailed(
-    dedupeStrings([
-      ...decisions.map((decision) =>
-        decision.reason
+    exactStrings([
+      ...decisions.map((decision) => `${decision.stale ? `Stale decision evidence; verify ${decision.evidence?.source ?? "source"}: ` : ""}${decision.reason
           ? `${decision.decision} - ${decision.reason}`
-          : decision.decision,
+          : decision.decision}`,
       ),
       ...memories
         .filter((memory) => memory.type === "decision")
         .map((memory) => memory.summary || memory.content),
     ]),
-    input.decisionTokenBudget ?? Math.floor(input.tokenBudget * 0.1),
+    Infinity,
   );
   const knownDecisions = knownDecisionsTrim.items;
 
@@ -104,15 +112,13 @@ export function compileContext(
 
   const nextActions = dedupeStrings([
     ...(handoff?.next ?? []),
-    "Inspect the relevant files before editing.",
-    "Run focused tests.",
   ]);
   const risks = dedupeStrings([
     ...(handoff?.risks ?? []),
     ...constraints.filter((item) => /do not|risk|avoid/i.test(item)),
   ]);
   const sharedMemoryBudget =
-    input.sharedMemoryTokenBudget ?? Math.floor(input.tokenBudget * 0.15);
+    Infinity;
   const risksOutsideHandoff = handoff
     ? risks.filter((risk) => !handoff.risks.includes(risk))
     : risks;
@@ -143,21 +149,20 @@ export function compileContext(
   );
   const sharedMemory = sharedMemoryTrim.items;
 
-  // The handoff and the repo map used to be rendered whole. Both grow without
-  // bound (a long-running task accumulates done/files entries; the repo map
-  // grows with the graph), which let them outweigh the task-specific sections
-  // that were already capped. Give each its own budget.
-  const trimmedHandoff = trimHandoff(
-    handoff,
-    input.handoffTokenBudget ?? Math.floor(input.tokenBudget * 0.15),
-  );
-  const trimmedRepoMap = trimRepoMap(
-    input.repoMap,
-    input.repoMapTokenBudget ?? Math.floor(input.tokenBudget * 0.25),
-  );
+  const trimmedHandoff = trimHandoff(handoff, Infinity);
 
   const basePack = {
+    tokenBudget: input.tokenBudget,
+    tokenCounter: input.countTokens ? "configured counter" as const : "script-aware estimate" as const,
+    detailsPath: input.detailsPath,
+    testResults: dedupeStrings(memories.filter((memory) => memory.type === "test" && memory.tags.includes("checkpoint"))
+      .map((memory) => `${memory.stale ? "Stale; recheck source: " : ""}${memory.summary || memory.content}${memory.evidence ? `; evidence: ${memory.evidence.source}; observed: ${memory.evidence.observedAt}${memory.evidence.commit ? `; commit: ${memory.evidence.commit}` : ""}` : ""}`)
+      .concat(handoff?.done.includes("Test evidence: see portable handoff artifact reference")
+        ? [`Handoff test evidence: .handoff/evidence/${handoff.id}.json`]
+        : [])),
     agent: input.agent,
+    graphEnabled: input.graphEnabled,
+    currentRequest: input.currentRequest,
     task: {
       id: task.id,
       title: task.title,
@@ -172,24 +177,39 @@ export function compileContext(
     nextActions,
     risks,
     handoff: trimmedHandoff.handoff,
-    repoMap: trimmedRepoMap.repoMap,
+    repoMap: undefined,
     currentAssignment,
     omitted: {
+      testResults: 0,
       currentState: currentStateTrim.omitted,
       sharedMemory: sharedMemoryTrim.omitted,
       relevantFiles: relevantFilesTrim.omitted,
-      repoMap: trimmedRepoMap.omitted,
+      repoMap: 0,
       handoff: trimmedHandoff.omitted,
-      constraints: constraintsTrim.omitted,
+      handoffDone: 0,
+      handoffFilesChanged: 0,
+      constraints: 0,
       knownDecisions: knownDecisionsTrim.omitted,
     },
   };
-  const renderedMarkdown = renderPromptPack(basePack);
-  return {
-    ...basePack,
-    tokenEstimate: estimateTokens(renderedMarkdown),
-    renderedMarkdown,
+  const rawCount = input.countTokens ?? estimateTokens;
+  const count = (text: string) => {
+    const value = rawCount(text);
+    if (!Number.isFinite(value) || value < 0) throw new Error("Token counter must return a nonnegative finite number");
+    return value;
   };
+  if (!Number.isFinite(input.tokenBudget) || input.tokenBudget <= 0) throw new Error("Invalid token budget");
+  const allocatedPack = allocateContext(basePack, input, count);
+  const renderedMarkdown = renderPromptPack(allocatedPack);
+  const sectionTokens: Record<string, number> = {};
+  for (const section of renderedMarkdown.split(/(?=^## )/m)) {
+    const heading = section.split("\n")[0]; sectionTokens[heading] = count(section);
+  }
+  const constraintTokens = count(constraints.join("\n"));
+  const budgetDiagnostics = input.constraintTokenBudget !== undefined && constraintTokens > input.constraintTokenBudget
+    ? [{ code: "constraint_budget_exceeded", requiredTokens: constraintTokens, budget: input.constraintTokenBudget }] : [];
+  return { ...allocatedPack, budgetDiagnostics, sectionTokens, tokenEstimate: count(renderedMarkdown), renderedMarkdown };
+
 }
 
 // The summary is the one field a handoff cannot lose, so it is charged against
@@ -208,8 +228,9 @@ function trimHandoff(
     omitted += result.omitted;
     return result.items;
   };
-  const next = take(handoff.next);
-  const risks = take(handoff.risks);
+  const next = handoff.next;
+  const risks = handoff.risks;
+  remaining = Math.max(0, remaining - estimateTokens([...next, ...risks].join("\n")));
   const done = take(handoff.done);
   const filesChanged = take(handoff.filesChanged);
   return {
@@ -218,20 +239,8 @@ function trimHandoff(
   };
 }
 
-function trimRepoMap(
-  repoMap: string | undefined,
-  budget: number,
-): { repoMap: string | undefined; omitted: number } {
-  if (!repoMap) return { repoMap: undefined, omitted: 0 };
-  const trimmed = trimToTokenBudgetDetailed(repoMap.split("\n"), budget);
-  return {
-    repoMap: trimmed.items.join("\n").trim() || undefined,
-    omitted: trimmed.omitted,
-  };
-}
-
 function resolveCurrentAssignment(
-  store: MemoryStore,
+  store: ContextReadStore,
   taskId: string,
   input: CompileContextInput,
 ) {
@@ -245,6 +254,8 @@ function resolveCurrentAssignment(
         const agent = store.getRegisteredAgent(assignment.agentId);
         return agent?.provider === input.agent || agent?.name === input.agent;
       });
+  if (!selected && input.assignmentId)
+    throw new Error(`Assignment/task binding mismatch: ${input.assignmentId} is not assigned to task ${taskId}`);
   if (!selected) return undefined;
 
   const agent = store.getRegisteredAgent(selected.agentId);

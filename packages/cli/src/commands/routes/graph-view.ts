@@ -3,9 +3,6 @@ import { openStore } from "../../workspace.js";
 
 // Laying out the repository graph the dashboard draws.
 
-// Assemble a bounded graph view for the UI: the `limit` highest-degree files and
-// the import edges among them, plus the repo map. Keeping it degree-ranked means
-// the most architecturally central files always make the cut.
 export function buildGraphView(
   store: ReturnType<typeof openStore>,
   limit: number,
@@ -14,6 +11,7 @@ export function buildGraphView(
     task: { id: string; title: string; goal?: string };
     recentTaskFiles?: string[];
   },
+  now = Date.now(),
 ): {
   stats: ReturnType<ReturnType<typeof openStore>["getGraphStats"]>;
   nodes: Array<{
@@ -22,11 +20,18 @@ export function buildGraphView(
     language?: string;
     symbols: number;
     usedBy: number;
+    structuralScore: number;
+    editScore: number;
+    score: number;
     imports: number;
+    outgoing: string[];
+    incoming: string[];
+    external: string[];
     brief?: string;
     manualPriority?: number;
     briefStale?: boolean;
-    recentKind?: "read" | "edit";
+    recentKind?: "edit";
+    lastEditedAt?: string;
     recentRank?: number;
     recentTotal?: number;
   }>;
@@ -43,34 +48,43 @@ export function buildGraphView(
   const summaries = new Map(
     store.listFileSummaries().map((summary) => [summary.path, summary]),
   );
-  const recentLimit = Math.min(24, Math.max(6, Math.ceil(limit * 0.25)));
-  const recentRows = [...summaries.values()]
+  const activityRows = [...summaries.values()]
+    .filter((summary) => summary.lastTaskEditedAt)
     .map((summary) => ({
       path: summary.path,
-      kind: summary.lastTaskEditedAt ? ("edit" as const) : ("read" as const),
-      timestamp: summary.lastTaskEditedAt ?? summary.updatedAt,
+      kind: "edit" as const,
+      timestamp: summary.lastTaskEditedAt!,
     }))
-    .filter((item) => item.timestamp)
-    .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
-    .slice(0, recentLimit);
+    .sort((a, b) => b.timestamp.localeCompare(a.timestamp) || a.path.localeCompare(b.path));
+  const activity = new Map(activityRows.map((item) => [item.path, item]));
   const recent = new Map(
-    recentRows.map((item, index) => [
+    activityRows.map((item, index) => [
       item.path,
-      { ...item, rank: index + 1, total: recentRows.length },
+      { ...item, rank: index + 1, total: activityRows.length },
     ]),
   );
 
   const degree = new Map<string, { usedBy: number; imports: number }>();
+  const dependents = new Map<string, string[]>();
+  const incomingFor = (path: string): string[] => {
+    let incoming = dependents.get(path);
+    if (!incoming) {
+      incoming = [...new Set(store.getDependents(path))];
+      dependents.set(path, incoming);
+    }
+    return incoming;
+  };
   for (const file of files) degree.set(file.path, { usedBy: 0, imports: 0 });
   const internalEdges: Array<{ source: string; target: string }> = [];
   for (const file of files) {
     const imports = store.getImports(file.path);
     const entry = degree.get(file.path);
-    if (entry) entry.imports = imports.internal.length;
+    if (entry) {
+      entry.imports = imports.internal.length;
+      entry.usedBy = incomingFor(file.path).length;
+    }
     for (const target of imports.internal) {
       internalEdges.push({ source: file.path, target });
-      const targetEntry = degree.get(target);
-      if (targetEntry) targetEntry.usedBy += 1;
     }
   }
 
@@ -81,24 +95,26 @@ export function buildGraphView(
       needles.some((needle) => file.path.toLowerCase().includes(needle)),
     );
   }
-  ranked = [...ranked].sort((a, b) => {
-    const da = degree.get(a.path) ?? { usedBy: 0, imports: 0 };
-    const db = degree.get(b.path) ?? { usedBy: 0, imports: 0 };
-    const recentA = recent.get(a.path);
-    const recentB = recent.get(b.path);
-    const recentScoreA = recentA
-      ? 1000 - recentA.rank * 20 + (recentA.kind === "edit" ? 10 : 0)
-      : 0;
-    const recentScoreB = recentB
-      ? 1000 - recentB.rank * 20 + (recentB.kind === "edit" ? 10 : 0)
-      : 0;
+  const structuralScore = (path: string): number =>
+    10 * Math.log2(incomingFor(path).length + 1) + 2 * (summaries.get(path)?.manualPriority ?? 0);
+  const editScore = (path: string): number => {
+    const timestamp = Date.parse(summaries.get(path)?.lastTaskEditedAt ?? "");
+    if (!Number.isFinite(timestamp)) return 0;
+    const age = Math.max(0, now - timestamp);
+    if (age <= 10 * 60_000) return 20;
+    if (age <= 3 * 60 * 60_000) return 10;
+    if (age <= 24 * 60 * 60_000) return 5;
+    return 1;
+  };
+  const scores = new Map(files.map((file) => [file.path, structuralScore(file.path) + editScore(file.path)]));
+  const comparePaths = (a: string, b: string): number => {
     return (
-      recentScoreB +
-        db.usedBy +
-        db.imports -
-        (recentScoreA + da.usedBy + da.imports) || a.path.localeCompare(b.path)
+      (scores.get(b) ?? 0) - (scores.get(a) ?? 0) ||
+      (activity.get(b)?.timestamp ?? "").localeCompare(activity.get(a)?.timestamp ?? "") ||
+      a.localeCompare(b)
     );
-  });
+  };
+  ranked = [...ranked].sort((a, b) => comparePaths(a.path, b.path));
 
   const selected = ranked.slice(0, limit);
   const selectedPaths = new Set(selected.map((file) => file.path));
@@ -112,7 +128,13 @@ export function buildGraphView(
       language: file.language,
       symbols: store.getFileSymbols(file.path).length,
       usedBy: entry.usedBy,
+      structuralScore: structuralScore(file.path),
+      editScore: editScore(file.path),
+      score: scores.get(file.path) ?? 0,
       imports: entry.imports,
+      outgoing: [...store.getImports(file.path).internal].sort(comparePaths),
+      incoming: [...incomingFor(file.path)].sort(comparePaths),
+      external: store.getImports(file.path).external,
       brief: summary?.summary,
       manualPriority: summary?.manualPriority,
       briefStale: Boolean(
@@ -122,6 +144,7 @@ export function buildGraphView(
         summary.lastSeenHash !== file.contentHash,
       ),
       recentKind: recentInfo?.kind,
+      lastEditedAt: summary?.lastTaskEditedAt,
       recentRank: recentInfo?.rank,
       recentTotal: recentInfo?.total,
     };

@@ -1,0 +1,1 @@
+Sửa src/clamp.mjs để cho phép min bằng max. Giữ từ chối đầu vào không hữu hạn hoặc min lớn hơn max bằng RangeError; không đổi API, không thêm dependency. Chạy node --test acceptance.test.mjs, ghi kết quả thực tế và các file đã sửa vào RESULT.md. Chỉ sửa src/ và RESULT.md.

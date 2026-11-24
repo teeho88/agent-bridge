@@ -22,7 +22,7 @@ const MS_PER_DAY = 86_400_000;
 export function tokenSet(text: string): Set<string> {
   return new Set(
     foldDiacritics(text)
-      .split(/[^a-z0-9]+/i)
+      .split(/[^\p{L}\p{N}]+/u)
       .filter(Boolean)
   );
 }
@@ -32,7 +32,7 @@ export function tokenSet(text: string): Set<string> {
 export function similarity(a: string, b: string): number {
   const sa = tokenSet(a);
   const sb = tokenSet(b);
-  if (sa.size === 0 && sb.size === 0) return 1;
+  if (sa.size === 0 && sb.size === 0) return a.normalize("NFC").trim() === b.normalize("NFC").trim() ? 1 : 0;
   if (sa.size === 0 || sb.size === 0) return 0;
   let intersection = 0;
   for (const token of sa) if (sb.has(token)) intersection += 1;
@@ -88,12 +88,21 @@ export function clusterBySimilarity(
   minClusterSize = DEFAULT_MIN_CLUSTER_SIZE
 ): Memory[][] {
   const used = new Set<string>();
+  const tokens = new Map(memories.map((memory) => [memory.id, tokenSet(memory.content)]));
+  const related = (a: Memory, b: Memory) => {
+    const left = tokens.get(a.id)!;
+    const right = tokens.get(b.id)!;
+    if (!left.size && !right.size) return a.content.normalize("NFC").trim() === b.content.normalize("NFC").trim() ? 1 : 0;
+    let shared = 0;
+    for (const term of left) if (right.has(term)) shared++;
+    return shared / (left.size + right.size - shared || 1);
+  };
   const clusters: Memory[][] = [];
   for (const seed of memories) {
     if (used.has(seed.id)) continue;
     used.add(seed.id);
     const members = memories.filter(
-      (other) => !used.has(other.id) && similarity(seed.content, other.content) >= threshold
+      (other) => !used.has(other.id) && related(seed, other) >= threshold
     );
     if (members.length + 1 < minClusterSize) continue;
     for (const member of members) used.add(member.id);

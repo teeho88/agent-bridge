@@ -1,41 +1,28 @@
-import { orchestratedRunSection, permissionEscalationSection, temporaryArtifactCleanupSection } from "./managed-section.js";
+import { compactWorkflowSection } from "./managed-section.js";
 
-export function codexManagedSection(): string {
+export function codexManagedSection(options: { hooked?: boolean } = {}): string {
   return `<!-- agent-bridge:start -->
 
-# Agent Bridge Context
-
-## Token Rules
-- Keep answers concise.
-- Do not inspect unrelated files.
-- Prefer minimal diffs.
-- Do not paste long logs.
-- Summarize test output.
-
-## Current Task
-See \`.agent-memory/current-task.md\`.
-
-## Agent Startup Rules
-Codex lifecycle hooks already create or restore the task and live session before the first model call. Do not run \`agent-bridge task start\`, \`agent-bridge session start\`, or \`agent-bridge session end\` during ordinary hooked Codex work; doing so can create a second live card for the same terminal.
-At the start of work:
-1. Read \`.agent-memory/current-task.md\`.
-2. Compile fresh context for this agent:
-   \`\`\`bash
-   agent-bridge context compile --agent codex
-   \`\`\`
-3. Read \`.agent-memory/compiled-context.md\` and continue only the current task.
-Do not start a new task just because the user sends a new prompt inside an active task/session; continue the current task unless the user explicitly asks to switch tasks.
+${compactWorkflowSection("codex", options)}
 
 ## Runtime Goal Rules
-When the first substantive user prompt for a task arrives, decide whether the work
-needs a durable Codex runtime goal:
+Runtime goal creation is disabled by default. Keep the runtime goal as \`none\`
+and do not call \`create_goal\` unless the user explicitly asks to create a goal.
+An implementation, change, build, or sustained action alone is not permission
+to create a runtime goal. Work Board tasks, sessions and checkpoints remain active.
 - If the compiled context contains the task note \`Task intentionally has no runtime goal.\`,
   the Work Board has disabled goal creation for that task. Keep the runtime goal as
   \`none\`, do not call \`create_goal\`, and keep the Work Board task goal empty unless
   the user explicitly asks to create a goal.
-- Create a goal with \`create_goal\` before starting work when the user asks for an
-  implementation, change, build, or other sustained action with a verifiable end
-  state. Before calling the tool, derive a complete goal contract from the user's
+Existing runtime goals remain active; do not clear or cancel them. Only when the user explicitly asks to create a goal, read the contract with \`agent-bridge context goal-guide\`. Do not set a token budget unless the user explicitly gives one.
+
+
+<!-- agent-bridge:end -->`;
+}
+
+export function codexGoalContractSection(): string {
+  return `- Only when the user explicitly asks to create a goal, use \`create_goal\`.
+  Before calling the tool, derive a complete goal contract from the user's
   prompt and the compiled repository context. Pass this exact four-section shape
   as the \`objective\`:
   \`\`\`text
@@ -68,79 +55,5 @@ needs a durable Codex runtime goal:
 - Do not create a second goal when the current task already has an unfinished
   runtime goal. Complete it only after the requested outcome is actually achieved.
 - Handoffs include \`task.goal\` automatically, so keep it identical to the full
-  runtime goal; never shorten the goal for a handoff.
-
-## Compiled Context
-See \`.agent-memory/compiled-context.md\`. The agent-bridge hook recompiles it for
-codex on every user prompt, so it is always current when you open it — but reading
-it costs tokens, so do not re-read it every turn. Read it once at the start of
-work, then again only when:
-- the task changes, or the user asks you to continue work you did not do yourself;
-- the user refers to another agent's work, a handoff, or an earlier decision;
-- you are about to edit and no longer hold this task's constraints and handoff.
-Within one task, keep working from what you already read.
-
-${temporaryArtifactCleanupSection()}
-
-${permissionEscalationSection()}
-
-## Handoff
-The \`## Latest Handoff\` section of \`.agent-memory/compiled-context.md\` carries the
-current handoff of the task you are on, whichever agent wrote it. When a prompt
-continues work someone else started, re-read that section — it is the context to
-work from. Rewrite it with \`agent-bridge handoff create\` when leaving the task;
-the packet is task-scoped and available to whichever agent continues it.
-
-## Work-Git Rules
-- Before editing any source/config/test/doc file for task work, acquire a write lease:
-  \`\`\`bash
-  agent-bridge file lease "<repo-relative-path>" --mode write --agent codex
-  \`\`\`
-- Continue editing only when the lease response has \`"acquired": true\`; if it returns \`false\`, inspect \`blockingLease\`, coordinate through handoff/request, and do not edit that file.
-- Keep the lease id from the response and release it after the edit is recorded:
-  \`\`\`bash
-  agent-bridge file release "<lease-id>"
-  \`\`\`
-- \`agent-bridge graph brief-auto "<repo-relative-path>" --task-edited\` verifies an active write lease for the current task and fails if the file was edited without one.
-- After completing a meaningful repo change and its relevant checks pass, create a Git commit so the change has a recoverable history point. Stage and commit only the files that belong to that change; never include unrelated pre-existing working-tree changes. Use a concise commit message that describes the completed change.
-
-## File Brief Rules
-- After reading any source/config/test/doc file for task work, run:
-  \`\`\`bash
-  agent-bridge graph brief-auto "<repo-relative-path>"
-  \`\`\`
-- After editing any source/config/test/doc file, run:
-  \`\`\`bash
-  agent-bridge graph brief-auto "<repo-relative-path>" --task-edited --agent codex
-  \`\`\`
-  The first \`--task-edited\` brief moves the task from \`todo\` to \`in_progress\`.
-  Always pass \`--agent codex\`; without it the lease check resolves the default agent's task and rejects your own lease.
-- You may pass multiple paths to one \`brief-auto\` call. Skip generated/vendor files and files outside the current task.
-
-## Completion Rules
-Before finishing:
-1. Summarize changed files.
-2. Summarize tests run.
-3. Save durable findings:
-   \`\`\`bash
-   agent-bridge memory add "<important fact or decision>" --type note --agent codex
-   \`\`\`
-   For non-ASCII text (e.g. Vietnamese) or multi-line content, pipe via stdin to avoid shell encoding loss:
-   \`\`\`bash
-   echo "<nội dung>" | agent-bridge memory add --stdin --type note --agent codex
-   \`\`\`
-4. Create or update handoff notes:
-   \`\`\`bash
-   agent-bridge handoff create --from codex --summary "<summary>" --next "<next action>"
-   \`\`\`
-   For non-ASCII summaries, pipe via stdin:
-   \`\`\`bash
-   echo "<tóm tắt>" | agent-bridge handoff create --stdin --from codex
-   \`\`\`
-5. Avoid including unnecessary full file contents.
-
-${orchestratedRunSection()}
-
-<!-- agent-bridge:end -->`;
+  runtime goal; never shorten the goal for a handoff.`;
 }
-

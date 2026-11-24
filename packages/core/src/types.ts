@@ -18,10 +18,14 @@ export type CurrentAssignmentContext = {
 };
 
 export type CompileContextInput = {
+  memoryReuse?: { scope: string[]; revision: string; timestamp?: number };
   taskId: string;
   agent: AgentKind;
   tokenBudget: number;
+  currentRequest?: string;
+  countTokens?: (text: string) => number;
   includeFiles?: boolean;
+  graphEnabled?: boolean;
   includeGit?: boolean;
   // Per-section token budgets, typically sourced from token-policy.yaml. When
   // omitted, the compiler falls back to fractions of tokenBudget.
@@ -35,10 +39,7 @@ export type CompileContextInput = {
   // bound as a task accumulates rules, so it gets its own caps.
   constraintTokenBudget?: number;
   decisionTokenBudget?: number;
-  // Pre-rendered repository knowledge graph map (from the graph index). When
-  // present it is injected as a compact "## Repo Map" section so the agent can
-  // navigate the repo without reading every file. Supplied by the CLI, which
-  // owns graph access; the compiler stays decoupled from the graph store.
+  // Deprecated; accepted for compatibility and never injected.
   repoMap?: string;
   // Optional explicit assignment to inject. When omitted, the compiler picks the
   // first active assignment matching the target agent provider/name.
@@ -47,24 +48,37 @@ export type CompileContextInput = {
   // from raw current-state memory so the next agent gets a compact operating
   // brief before historical notes.
   sharedMemoryTokenBudget?: number;
+  // The publication layer owns this sidecar and writes the selected sources.
+  detailsPath?: string;
 };
 
 // Per-section count of entries dropped by the token budgets. Rendered into the
 // markdown so an agent reading the pack can tell truncated sections from
 // genuinely empty ones.
 export type OmittedCounts = {
+  testResults?: number;
   currentState: number;
   sharedMemory: number;
   relevantFiles: number;
   repoMap: number;
   handoff: number;
+  handoffDone?: number;
+  handoffFilesChanged?: number;
   constraints: number;
   knownDecisions: number;
 };
 
 export type PromptPack = {
+  tokenBudget?: number;
+  tokenCounter?: "configured counter" | "script-aware estimate";
+  detailsPath?: string;
+  budgetDiagnostics?: Array<{ code: string; requiredTokens: number; budget: number }>;
+  testResults?: string[];
   agent: AgentKind;
   task: Pick<Task, "id" | "title" | "goal" | "status">;
+  currentRequest?: string;
+  sectionTokens?: Record<string, number>;
+  graphEnabled?: boolean;
   currentState: string[];
   sharedMemory: string[];
   relevantFiles: string[];

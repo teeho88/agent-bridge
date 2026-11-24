@@ -1,0 +1,10 @@
+{
+  "name": "@bridge-v2/adapter-codex",
+  "version": "2.0.0-dev.0",
+  "type": "module",
+  "files": ["src"],
+  "exports": {".": "./src/index.mjs"},
+  "engines": {"node": ">=22.18.0"},
+  "dependencies": {"@bridge-v2/runtime": "2.0.0-dev.0"}
+}
+

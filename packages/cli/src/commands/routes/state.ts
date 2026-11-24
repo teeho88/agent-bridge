@@ -1,10 +1,13 @@
 import type { RouteContext } from "./types.js";
+import { listNativeSessions, mergeSessionHistory } from "../../native-sessions.js";
+import { sessionProcessLiveness } from "../../session-process.js";
+import { getCodexHookStatus } from "../codex.js";
+import { boundStatePayload } from "./state-payload.js";
+import { createHash } from "node:crypto";
 import {
   ensureDefaultAgentPresetStates,
 } from "../../default-agent-presets.js";
-import {
-  listSkills,
-} from "../../skill-library.js";
+import { dashboardSkills } from "./dashboard-cache.js";
 import {
   cleanupStaleAgentSessions,
   openStore,
@@ -61,19 +64,19 @@ export async function routeGetState(ctx: RouteContext): Promise<void> {
   try {
     const store = openStore(cwd);
     try {
-      cleanupStaleAgentSessions(store);
-      const activeTaskId = resolveActiveTaskId(store, cwd);
+      cleanupStaleAgentSessions(store, cwd);
+      let activeTaskId: string | null;
+      try { activeTaskId = typeof ctx.url.query.task === "string" && ctx.url.query.task ? ctx.url.query.task : resolveActiveTaskId(store, cwd); }
+      catch (error) {
+        if (!(error instanceof Error) || !error.message.startsWith("Ambiguous active task")) throw error;
+        activeTaskId = null;
+      }
       const config = readConfig(cwd);
       const tasks = store.listTasks(30);
       // Handoff History is repository-wide, so it must not inherit either the
       // selected-task filter or the shorter task list used by the main board.
-      const latestTaskHandoffs = store
-        .listTasks(1_000_000)
-        .flatMap((task) => {
-          const handoff = store.getLatestHandoff(task.id);
-          return handoff ? [{ task, handoff }] : [];
-        })
-        .sort((a, b) => b.handoff.createdAt.localeCompare(a.handoff.createdAt));
+      const handoffPage = store.listLatestTaskHandoffs(51);
+      const latestTaskHandoffs = handoffPage.slice(0, 50);
       const currentTask = activeTaskId
         ? store.getTask(activeTaskId)
         : undefined;
@@ -82,12 +85,10 @@ export async function routeGetState(ctx: RouteContext): Promise<void> {
       // dropped before it can be presented as session state.
       const visibleMemories = activeTaskId
         ? store
-            .listMemoriesForTask(activeTaskId, 1000)
+            .listMemoriesForTask(activeTaskId, 50)
             .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
         : [];
-      const sessionState = visibleMemories.find((memory) =>
-        memory.tags.includes("latest-response"),
-      );
+      const sessionState = activeTaskId ? store.getLatestResponse(activeTaskId) : undefined;
       const memories = visibleMemories.slice(0, 50);
       const compiledContext = activeTaskId
         ? safeRead(taskContextPath(activeTaskId, cwd)) ||
@@ -102,12 +103,21 @@ export async function routeGetState(ctx: RouteContext): Promise<void> {
       // Work Board is for direct/human agent sessions. Orchestrated tasks
       // already have a dedicated Runs board, so duplicating their sessions
       // here makes one orchestration look like many unrelated live tasks.
-      const activeSessionEvents = store.listActiveSessionEvents(100);
+      const activeSessionEvents = store.listActiveSessionEvents(100).map((event) => ({
+        ...event, liveness: sessionProcessLiveness(config.sessionWindows?.[event.sessionId]),
+      }));
       const orchestratedTaskIds = new Set(
         store.listOrchestrations({ limit: 500 }).map((orchestration) => orchestration.taskId),
       );
+      const bridgeSessionHistory = filterWorkBoardSessionEvents(store.listSessionHistory(), orchestratedTaskIds).map((event) => ({
+        ...event,
+        taskId: event.taskId ?? config.sessionTasks?.[event.sessionId],
+        title: store.getTask(event.taskId ?? config.sessionTasks?.[event.sessionId] ?? "")?.title,
+        liveness: sessionProcessLiveness(config.sessionWindows?.[event.sessionId]),
+      }));
+      const sessionHistory = mergeSessionHistory(bridgeSessionHistory, listNativeSessions(cwd), config);
       const workBoardSessionEvents = filterWorkBoardSessionEvents(
-        activeSessionEvents,
+        activeSessionEvents.filter((event) => event.liveness === "running"),
         orchestratedTaskIds,
       );
       const liveTaskIds = new Set(
@@ -115,6 +125,23 @@ export async function routeGetState(ctx: RouteContext): Promise<void> {
           .map((event) => event.taskId)
           .filter((taskId): taskId is string => Boolean(taskId)),
       );
+      const recentActivityTaskIds = new Set([
+        ...liveTaskIds,
+        ...store.listSessionEvents({ limit: 100 }).map((event) => event.taskId).filter((id): id is string => Boolean(id)),
+      ]);
+      for (const taskId of recentActivityTaskIds) {
+        if (tasks.some((task) => task.id === taskId)) continue;
+        const task = store.getTask(taskId);
+        if (task) tasks.push(task);
+      }
+      const workBoardTasks = tasks.map((task) => {
+        const event = store.listSessionEvents({ taskId: task.id, limit: 1 })[0];
+        const response = store.getLatestResponse(task.id);
+        const lastActivityAt = [task.updatedAt, task.createdAt, event?.createdAt, response?.updatedAt, response?.createdAt]
+          .filter((time): time is string => Boolean(time) && Number.isFinite(Date.parse(time!)))
+          .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
+        return { ...task, lastActivityAt };
+      });
       const liveTasks = tasks
         .filter(
           (task) =>
@@ -124,11 +151,9 @@ export async function routeGetState(ctx: RouteContext): Promise<void> {
         )
         .map((task) => {
           const taskMemories = store
-            .listMemoriesForTask(task.id, 1000)
+            .listMemoriesForTask(task.id, 50)
             .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-          const taskSessionState = taskMemories.find((memory) =>
-            memory.tags.includes("latest-response"),
-          );
+          const taskSessionState = store.getLatestResponse(task.id);
           const taskVisibleMemories = taskMemories.slice(0, 50);
           const taskHandoff = store.getLatestHandoff(task.id);
           const taskCompiledContext = safeRead(taskContextPath(task.id, cwd));
@@ -208,10 +233,10 @@ export async function routeGetState(ctx: RouteContext): Promise<void> {
         handoff,
       });
       const defaultAgentPresets = ensureDefaultAgentPresetStates(store);
-      sendJson(res, 200, {
+      sendDashboardState(ctx, {
         workspace: cwd,
         config,
-        tasks,
+        tasks: workBoardTasks,
         currentTask,
         liveTasks,
         repoMemories,
@@ -241,21 +266,21 @@ export async function routeGetState(ctx: RouteContext): Promise<void> {
           ? store.listDispatchRuns({ taskId: activeTaskId, limit: 100 })
           : [],
         activeSessionEvents,
+        sessionHistory,
         sessionState,
         memories,
         compiledContext,
         handoff,
         latestTaskHandoffs,
+        handoffHistoryPage: { nextOffset: handoffPage.length > 50 ? 50 : null },
         portableHandoff,
         claudeHookInstalled,
         claudeHookStatus,
+        codexHookStatus: getCodexHookStatus(cwd),
         antigravityHookStatus,
         watcherRunning: isWatcherRunning(),
         optionalTools: optionalToolsStatus(),
-        skills: [
-          ...listSkills("repo", cwd),
-          ...listSkills("global", cwd),
-        ],
+        skills: dashboardSkills(cwd),
         tokenStack: tokenStackStatus(),
         tokenStats,
         graphStats: store.getGraphStats(),
@@ -267,7 +292,7 @@ export async function routeGetState(ctx: RouteContext): Promise<void> {
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    sendJson(res, 200, {
+    sendDashboardState(ctx, {
       workspace: cwd,
       config: readConfig(cwd),
       tasks: [],
@@ -294,6 +319,7 @@ export async function routeGetState(ctx: RouteContext): Promise<void> {
       portableHandoff: emptyPortableHandoffState(),
       claudeHookInstalled: getClaudeHookStatus(cwd).installed,
       claudeHookStatus: getClaudeHookStatus(cwd),
+      codexHookStatus: getCodexHookStatus(cwd),
       antigravityHookStatus: getAntigravityHookStatus(cwd),
       watcherRunning: isWatcherRunning(),
       optionalTools: optionalToolsStatus(),
@@ -308,4 +334,31 @@ export async function routeGetState(ctx: RouteContext): Promise<void> {
     });
   }
   return;
+}
+
+export function routeGetHandoffHistory(ctx: RouteContext): void {
+  const limit = Number(ctx.url.query.limit ?? 50);
+  const offset = Number(ctx.url.query.offset ?? 0);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 99 || !Number.isInteger(offset) || offset < 0) {
+    sendJson(ctx.res, 400, { error: "Invalid handoff pagination" });
+    return;
+  }
+  const store = openStore(ctx.cwd);
+  try {
+    const page = store.listLatestTaskHandoffs(limit + 1, offset);
+    sendJson(ctx.res, 200, { items: page.slice(0, limit), nextOffset: page.length > limit ? offset + limit : null });
+  } finally { store.close(); }
+}
+
+function sendDashboardState(ctx: RouteContext, data: Record<string, unknown>): void {
+  data = ctx.url.pathname === "/api/state/details" ? data : boundStatePayload(data);
+  const revision = createHash("sha256").update(JSON.stringify({ ...data, serverTime: undefined })).digest("hex");
+  const etag = `"${revision}"`;
+  if (ctx.req.headers["if-none-match"] === etag) {
+    ctx.res.writeHead(304, { etag, "cache-control": "no-cache" });
+    ctx.res.end();
+    return;
+  }
+  ctx.res.writeHead(200, { "content-type": "application/json; charset=utf-8", etag, "cache-control": "no-cache" });
+  ctx.res.end(JSON.stringify({ ...data, stateRevision: revision }));
 }

@@ -1,5 +1,16 @@
 import type Database from "better-sqlite3";
 import {
+  managedDispatchSchemaStatements,
+  taskPlanningSchemaStatements,
+  taskQualitySchemaStatements,
+  taskRetrySchemaStatements,
+  ftsRowIdentityStatements,
+  maintenanceSchemaStatements,
+  vectorCandidateSchemaStatements,
+  embeddingProgressSchemaStatements,
+  runtimeMemorySchemaStatements,
+  managedTaskSchemaStatements,
+  managedTaskCheckProofSchemaStatements,
   agentDescriptionColumnStatements,
   agentPresetColumnStatements,
   agentPresetHiddenColumnStatements,
@@ -9,6 +20,8 @@ import {
   agentRunSchemaStatements,
   autoHandoffColumnStatements,
   embeddingColumnStatements,
+  embeddingProvenanceStatements,
+  retrievalIndexStatements,
   fileBriefColumnStatements,
   ftsFoldStatements,
   ftsStatements,
@@ -69,8 +82,23 @@ const migrations: Migration[] = [
   { version: 26, statements: orchestrationMaxQuestionRoundsColumnStatements },
   { version: 27, statements: leaderCapabilityBackfillStatements },
   { version: 28, statements: removeHandoffTargetColumnStatements },
-  { version: 29, statements: subtaskStatusReasonColumnStatements }
+  { version: 29, statements: subtaskStatusReasonColumnStatements },
+  { version: 30, statements: runtimeMemorySchemaStatements },
+  { version: 31, statements: embeddingProvenanceStatements },
+  { version: 32, statements: retrievalIndexStatements },
+  { version: 33, statements: maintenanceSchemaStatements },
+  { version: 34, statements: vectorCandidateSchemaStatements },
+  { version: 35, statements: embeddingProgressSchemaStatements },
+  { version: 36, statements: ftsRowIdentityStatements },
+  { version: 37, statements: managedTaskSchemaStatements },
+  { version: 38, statements: managedTaskCheckProofSchemaStatements },
+  { version: 39, statements: taskQualitySchemaStatements },
+  { version: 40, statements: taskRetrySchemaStatements },
+  { version: 41, statements: taskPlanningSchemaStatements },
+  { version: 42, statements: managedDispatchSchemaStatements }
 ];
+
+export const LATEST_SCHEMA_VERSION = migrations[migrations.length - 1].version;
 
 // Register custom SQL functions on a connection. The `fold` function is called
 // by the FTS triggers and the v3 backfill, so EVERY connection that may write

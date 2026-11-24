@@ -1,4 +1,4 @@
-import { CACHE_BREAKPOINT_MARKER } from "./prompt-cache.js";
+import { CACHE_BREAKPOINT_MARKER, SHARED_PROMPT_INSTRUCTIONS } from "./prompt-cache.js";
 import { toSingleLine } from "./token-optimizer.js";
 import type { PromptPack } from "./types.js";
 
@@ -13,15 +13,8 @@ function bullets(items: string[], omitted = 0): string {
   const flattened = items.map(toSingleLine).filter(Boolean);
   const rendered = flattened.length
     ? flattened.map((item) => `- ${item}`).join("\n")
-    : "- None recorded.";
-  return omitted > 0 ? `${rendered}\n${omissionNote(omitted)}` : rendered;
-}
-
-function numbers(items: string[]): string {
-  const flattened = items.map(toSingleLine).filter(Boolean);
-  return flattened.length
-    ? flattened.map((item, index) => `${index + 1}. ${item}`).join("\n")
-    : "1. Continue from current task state.";
+    : omitted > 0 ? "" : "- None recorded.";
+  return omitted > 0 ? [rendered, omissionNote(omitted)].filter(Boolean).join("\n") : rendered;
 }
 
 function assignmentBullets(pack: Omit<PromptPack, "renderedMarkdown" | "tokenEstimate">): string[] {
@@ -47,108 +40,59 @@ function assignmentBullets(pack: Omit<PromptPack, "renderedMarkdown" | "tokenEst
   if (current.assignment.riskSummary) items.push(`Risks: ${current.assignment.riskSummary}`);
   return items;
 }
-// Layout is ordered for prompt caching: a STABLE prefix comes first, then a
-// cache breakpoint marker, then the DYNAMIC suffix. Caching is positional — a
-// changed byte invalidates everything after it — so sections are ordered by how
-// often they change, cheapest first, and anything that moves per turn stays out
-// of the prefix entirely:
-//
-//   never      # Agent Task Brief, ## Expected Output (both literal)
-//   per task   ## Task title, ## Goal
-//   sometimes  ## Constraints, ## Known Decisions (a new memory/decision)
-//   on rebuild ## Repo Map — last, because it is the largest block and must not
-//              sit behind anything more volatile than itself
-//
-// Two sections look stable but are not, and belong below the marker. Task
-// STATUS flips todo -> in_progress on the first recorded edit. Shared Memory is
-// distilled from the handoff summary, done list, files changed, and current
-// state (see context-compiler), so it is rewritten on every handoff; parking it
-// above Repo Map would drop ~1.6k cached tokens each time. See prompt-cache.ts.
+// Stable task instructions precede the cache breakpoint; runtime state follows it.
 export function renderPromptPack(
   pack: Omit<PromptPack, "renderedMarkdown" | "tokenEstimate">,
 ): string {
-  const prefix = [
-    "# Agent Task Brief",
-    "",
-    "## Task",
-    `- Title: ${toSingleLine(pack.task.title)}`,
-    "",
-    "## Goal",
-    toSingleLine(pack.task.goal ?? "") || "No explicit goal recorded.",
-    "",
-    "## Expected Output",
-    "- Minimal diff.",
-    "- Test result summary.",
-    "- Updated handoff note.",
-    "",
-    "## Constraints",
-    bullets(pack.constraints, pack.omitted.constraints),
-    "",
-    "## Known Decisions",
-    bullets(pack.knownDecisions, pack.omitted.knownDecisions),
-  ];
-
-  if (pack.repoMap) {
-    prefix.push("", "## Repo Map", pack.repoMap);
-    if (pack.omitted.repoMap > 0) {
-      prefix.push(omissionNote(pack.omitted.repoMap));
-    }
+  const seen = new Set<string>();
+  const unique = (items: string[]) => items.map(toSingleLine).filter((item) => {
+    const key = item.toLowerCase().replace(/\s+/g, " ");
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const lines = ["# Agent Task Brief", "", SHARED_PROMPT_INSTRUCTIONS, "", "## Task", `- ID: ${pack.task.id}`, `- Title: ${toSingleLine(pack.task.title)}`];
+  const normalize = (text: string) => toSingleLine(text).toLowerCase().replace(/\s+/g, " ");
+  const request = pack.currentRequest?.trim();
+  if (pack.task.goal && (!request || normalize(pack.task.goal) !== normalize(request))) {
+    lines.push("", "## Goal", toSingleLine(pack.task.goal));
+    seen.add(normalize(pack.task.goal));
   }
-
-  const suffix = [
-    "## Status",
-    `- Task: ${pack.task.status}`,
-    "",
-    "## Current Assignment",
-    bullets(assignmentBullets(pack)),
-    "",
-    "## Shared Memory",
-    bullets(pack.sharedMemory, pack.omitted.sharedMemory),
-    "",
-    "## Current State",
-    bullets(pack.currentState, pack.omitted.currentState),
-    "",
-    "## Relevant Files",
-    bullets(pack.relevantFiles, pack.omitted.relevantFiles),
-  ];
-
+  seen.add(normalize(pack.task.title));
+  const section = (title: string, items: string[], omitted = 0, protectedContent = false) => {
+    const values = protectedContent ? [...new Set(items.map(toSingleLine).filter(Boolean))] : unique(items);
+    if (protectedContent) for (const value of values) seen.add(normalize(value));
+    if (values.length || omitted) lines.push("", title, bullets(values, omitted));
+  };
+  section("## Graph Navigation", [pack.graphEnabled === false
+    ? "Graph navigation is disabled for this repository (graph.enabled=false). Use scoped rg searches to find files to read or edit."
+    : "When you need to locate files to read or edit, query `agent-bridge graph search <query> --limit 10`; inspect `graph neighbors <path>` for imports/callers and `graph symbols <path>` for definitions. Use `graph map --focus <path> --limit 10` only when a local overview helps. Read only relevant source ranges and direct dependencies; verify graph hints against source before editing. If the index is empty, missing or stale, fall back to scoped rg searches. Do not load the global graph or all briefs into context."], 0, true);
+  section("## Constraints", pack.constraints, 0, true);
+  section("## Known Decisions", pack.knownDecisions, pack.omitted.knownDecisions, true);
+  lines.push("", CACHE_BREAKPOINT_MARKER, "", "## Status", `- Task: ${pack.task.status}`);
+  if (request) {
+    lines.push("", "## Current Request", toSingleLine(request));
+    seen.add(normalize(request));
+  }
+  if (pack.tokenBudget !== undefined) {
+    lines.push("", "## Context Budget", `- Limit: ${pack.tokenBudget} tokens; counting: ${pack.tokenCounter ?? "script-aware estimate"}`);
+    if (pack.detailsPath && Object.values(pack.omitted).some((total) => total > 0))
+      lines.push(`- Full selected source snapshot: ${pack.detailsPath}`);
+  }
+  section("## Current Assignment", assignmentBullets(pack));
+  section("## Test Evidence", pack.testResults ?? [], pack.omitted.testResults ?? 0);
   if (pack.handoff) {
-    suffix.push(
-      "",
-      "## Latest Handoff",
-      `- From: ${pack.handoff.fromAgent ?? "unknown"}`,
-      `- Summary: ${toSingleLine(pack.handoff.summary)}`,
-      "",
-      "### Done",
-      bullets(pack.handoff.done),
-      "",
-      "### Next",
-      bullets(pack.handoff.next),
-      "",
-      "### Risks",
-      bullets(pack.handoff.risks),
-      "",
-      "### Files Changed",
-      bullets(pack.handoff.filesChanged),
-    );
-    if (pack.omitted.handoff > 0) {
-      suffix.push(omissionNote(pack.omitted.handoff));
-    }
+    section("## Latest Handoff", [pack.handoff.summary]);
+    section("### Next", pack.handoff.next);
+    section("### Risks", pack.handoff.risks);
+    section("### Done", pack.handoff.done, pack.omitted.handoffDone ?? 0);
+    section("### Files Changed", pack.handoff.filesChanged,
+      pack.omitted.handoffFilesChanged ?? (pack.omitted.handoffDone === undefined ? pack.omitted.handoff : 0));
   }
-
-  const risksOutsideHandoff = pack.handoff
-    ? pack.risks.filter((risk) => !pack.handoff?.risks.includes(risk))
-    : pack.risks;
-
-  suffix.push(
-    "",
-    "## Next Actions",
-    numbers(pack.nextActions),
-    "",
-    "## Risks / Do Not Touch",
-    bullets(risksOutsideHandoff),
-  );
-
-  return [...prefix, "", CACHE_BREAKPOINT_MARKER, "", ...suffix].join("\n");
+  section("## Current State", pack.currentState, pack.omitted.currentState);
+  section("## Relevant Files", pack.relevantFiles, pack.omitted.relevantFiles);
+  section("## Next Actions", pack.nextActions);
+  section("## Risks / Do Not Touch", pack.risks);
+  section("## Shared Memory", pack.sharedMemory.map((item) => item.replace(/^(Objective|Invariant|Decision|Latest handoff|Current fact|Next|Risk|Done|Touched file|Current assignment):\s*/i, "")), pack.omitted.sharedMemory);
+  return lines.join("\n");
 }
-

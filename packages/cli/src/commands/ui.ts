@@ -1,24 +1,10 @@
-import {
-  createServer,
-  type IncomingMessage,
-  type Server,
-  type ServerResponse,
-} from "node:http";
-import {
-  existsSync,
-  readFileSync,
-  statSync,
-} from "node:fs";
-import {
-  execFile,
-  execFileSync,
-} from "node:child_process";
-import { dirname, join, resolve } from "node:path";
-import { promisify } from "node:util";
-import { fileURLToPath, parse as parseUrl } from "node:url";
-import type { RouteContext, RouteTable } from "./routes/types.js";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { resolve } from "node:path";
+import { parse as parseUrl } from "node:url";
+import type { RouteTable } from "./routes/types.js";
 import {
   routeGetState,
+  routeGetHandoffHistory,
 } from "./routes/state.js";
 import {
   routeGetApplicationUpdateProgress,
@@ -29,6 +15,7 @@ import {
   routeGetCacheReport,
   routePostAntigravityInstallHooks,
   routePostClaudeInstallHooks,
+  routePostCodexInstallHooks,
   routePostConfigCliApprovals,
   routePostConfigGraph,
   routePostHandoffSave,
@@ -68,14 +55,12 @@ import {
 import {
   routePostContextCompile,
   routePostContextSave,
-  routePostTaskDelete,
   routePostTaskPrompt,
   routePostTaskStart,
-  routePostTaskStop,
-  routePostTaskUpdate,
 } from "./routes/task.js";
 import {
   routePostSessionEnd,
+  routePostSessionDelete,
   routePostSessionFocus,
   routePostSessionStart,
   routePostSessionSummary,
@@ -95,6 +80,7 @@ import {
   routePostWorkforceDefaultAgentDelete,
   routePostWorkforceDefaultAgentRestore,
   routePostWorkforceDefaultAgentToggle,
+  routePostWorkforceDefaultAgentUpdate,
   routePostWorkforceRunAdopt,
   routePostWorkforceRunSetModel,
   routePostWorkforceRunStop,
@@ -115,347 +101,28 @@ import {
   routePostWorkforceOrchestrationStep,
   routePostWorkforceOrchestrationStop,
 } from "./routes/orchestration-runs.js";
-import {
-  resumeAutoRuns,
-} from "./routes/auto-run.js";
-import { stopWatcher } from "./routes/watcher.js";
-import { buildGraphView } from "./routes/graph-view.js";
-import {
-  renderUiHtml,
-} from "./routes/lookups.js";
-import {
-  defaultUiPort,
-  sendClientModule,
-  sendHtml,
-  sendJson,
-} from "./routes/http.js";
+import { sendJson } from "./routes/http.js";
 import type { Command } from "commander";
-import { loadRuntimeProviderCatalogs } from "../provider-catalog.js";
-import { executeSpawnRequest } from "./request.js";
-import { makeOrchestratorDeps } from "./workforce.js";
-import { generateReport } from "./report.js";
-import { writeHandoffArtifacts } from "./handoff.js";
-import {
-  ensureWorkspace,
-} from "../workspace.js";
-import { renderDashboardHtml } from "../ui-page.js";
-import { applyTaskLabelSuggestion } from "../task-suggestions.js";
-import { refreshBriefs } from "../graph-brief.js";
+import { routePostRepositoryEnabled } from "./routes/repository.js";
+import { repositoryEnabled } from "../repository.js";
 
-type JsonBody = Record<string, unknown>;
-type BrowserLauncher = (
-  command: string,
-  args: string[],
-  options: { windowsHide: boolean },
-  callback: (error: Error | null) => void,
-) => unknown;
-
-
-
-
-
-
-// The watcher runs as a child of the UI server so the dashboard can start/stop it.
-// Tracked at module scope; killed when the UI process exits to avoid orphans.
-let uiWorkspace = process.cwd();
-let uiPort = defaultUiPort;
-
-
-
-
-/**
- * Rebuilds the CLI package in place. Returns false when this is not a real
- * checkout (no package.json with a build script) so the caller can fall back
- * to telling the user what to run.
- */
-function rebuildCliPackage(packageRoot: string): boolean {
-  const manifestPath = join(packageRoot, "package.json");
-  if (!existsSync(manifestPath)) return false;
-  try {
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
-      scripts?: Record<string, string>;
-    };
-    if (!manifest.scripts?.build) return false;
-  } catch {
-    return false;
-  }
-
-  console.log("Dashboard build is stale; rebuilding @agent-bridge/cli…");
-  // Not every machine has a standalone `pnpm` on PATH — a Corepack-managed
-  // Node install exposes only `corepack` and `npm`. Try each runner rather
-  // than failing the rebuild on the first one that is missing.
-  const runners: [string, string[]][] = [
-    ["pnpm", ["run", "build"]],
-    ["corepack", ["pnpm", "run", "build"]],
-    ["npm", ["run", "build"]],
-  ];
-  for (const [command, args] of runners) {
-    try {
-      execFileSync(command, args, {
-        cwd: packageRoot,
-        stdio: "inherit",
-        // These are shell shims (.cmd/.ps1) on Windows; without a shell,
-        // spawning them fails outright with EINVAL.
-        shell: process.platform === "win32",
-      });
-      return true;
-    } catch {
-      continue;
-    }
-  }
-  return false;
-}
-
-/**
- * The published CLI serves the statically imported `dist/ui-page.js` plus the
- * compiled client in `dist/ui-client`. In a checkout, editing either source
- * leaves the build stale, so the dashboard
- * would silently serve an outdated page. Rebuild it automatically instead of
- * making every UI edit cost a manual build step, and only refuse to launch
- * when the rebuild is impossible or did not take.
- */
-export function assertUiPageFreshness(
-  packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..", ".."),
-): void {
-  const sourcePath = join(packageRoot, "src", "ui-page.ts");
-  if (!existsSync(sourcePath)) return;
-
-  // The page shell and the client module are built by two tsc projects, so
-  // both have to be checked - a stale client is just as invisible as a stale
-  // page was before the script moved out of the template literal.
-  const pairs: Array<[string, string]> = [
-    [sourcePath, join(packageRoot, "dist", "ui-page.js")],
-    [
-      join(packageRoot, "src", "ui-client", "main.ts"),
-      join(packageRoot, "dist", "ui-client", "main.js"),
-    ],
-  ];
-  const isStale = (): boolean =>
-    pairs.some(
-      ([source, built]) =>
-        existsSync(source) &&
-        (!existsSync(built) ||
-          statSync(source).mtimeMs > statSync(built).mtimeMs),
-    );
-  if (!isStale()) return;
-
-  if (rebuildCliPackage(packageRoot) && !isStale()) return;
-
-  throw new Error(
-    "UI source is newer than the compiled dashboard and the automatic rebuild failed. Run `pnpm --filter @agent-bridge/cli build` and start `agent-bridge ui` again.",
-  );
-}
 
 export function registerUi(program: Command): void {
-  program
-    .command("ui")
-    .description("Start the local agent-bridge management UI")
-    .option("--port <port>", "port to listen on", String(defaultUiPort))
+  program.command("tui", { isDefault: true }).alias("ui")
+    .description("Open the interactive terminal dashboard")
     .option("--project <path>", "project path", process.cwd())
-    .action((options: { port: string; project: string }, command: Command) => {
-      assertUiPageFreshness();
-      const project = prepareUiWorkspace(options.project);
-      const port = parseUiPort(options.port);
-      const allowPortFallback =
-        command.getOptionValueSource("port") === "default";
-      const server = createServer((req, res) => {
-        void serveRequest(req, res);
-      });
-
-      listenUiServer(server, port, project, allowPortFallback);
-      resumeAutoRuns(project);
-
-      // Don't leave the watcher running after the UI server is gone.
-      const cleanup = (): void => stopWatcher();
-      process.on("exit", cleanup);
-      process.on("SIGINT", () => {
-        cleanup();
-        process.exit(0);
-      });
-      process.on("SIGTERM", () => {
-        cleanup();
-        process.exit(0);
-      });
+    .option("--snapshot", "print dashboard once without an interactive terminal")
+    .action(async (options: { project: string; snapshot?: boolean }) => {
+      const { startTui } = await import("../tui/app.js");
+      await startTui(resolve(options.project), { snapshot: options.snapshot });
     });
 }
 
-function listenUiServer(
-  server: Server,
-  port: number,
-  project: string,
-  allowPortFallback: boolean,
-): void {
-  const onListening = (): void => {
-    server.off("error", onError);
-    const address = server.address();
-    const boundPort =
-      typeof address === "object" && address ? address.port : port;
-    uiPort = boundPort;
-    const url = `http://127.0.0.1:${boundPort}`;
-    console.log(`agent-bridge UI running at ${url}`);
-    console.log(`Workspace: ${project}`);
-    openUiInBrowser(url);
-  };
-  const onError = (error: NodeJS.ErrnoException): void => {
-    server.off("listening", onListening);
-    if (error.code === "EADDRINUSE" && allowPortFallback && port < 65535) {
-      const nextPort = port + 1;
-      console.warn(`Port ${port} is in use; trying ${nextPort}.`);
-      listenUiServer(server, nextPort, project, true);
-      return;
-    }
-    console.error(
-      error.code === "EADDRINUSE"
-        ? `Port ${port} is already in use. Choose another port with --port.`
-        : `Failed to start UI: ${error.message}`,
-    );
-    process.exitCode = 1;
-  };
-
-  server.once("listening", onListening);
-  server.once("error", onError);
-  server.listen(port, "127.0.0.1");
-}
-
-export function browserOpenCommand(
-  url: string,
-  platform = process.platform,
-): { command: string; args: string[] } {
-  if (platform === "win32") {
-    return { command: "cmd.exe", args: ["/d", "/c", "start", "", url] };
-  }
-  return platform === "darwin"
-    ? { command: "open", args: [url] }
-    : { command: "xdg-open", args: [url] };
-}
-
-export function openUiInBrowser(
-  url: string,
-  launcher: BrowserLauncher = execFile as BrowserLauncher,
-): void {
-  const { command, args } = browserOpenCommand(url);
-  launcher(command, args, { windowsHide: true }, (error) => {
-    if (error) console.warn(`Could not open the UI in a browser: ${error.message}`);
-  });
-}
-
-export function parseUiPort(value: string): number {
-  const port = Number(value);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error("UI port must be an integer from 1 to 65535.");
-  }
-  return port;
-}
-export function prepareUiWorkspace(projectPath: string): string {
-  const project = resolve(projectPath);
-  ensureWorkspace(project);
-  uiWorkspace = project;
-  return project;
-}
-
-/**
- * The route bodies signal failure by throwing; turning that into a 500 is the
- * server's job. Named so tests drive the same path a browser does - calling
- * `handleRequest` directly would let a rejection escape instead of answering.
- */
-export async function serveRequest(
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<void> {
-  try {
-    await handleRequest(req, res);
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    sendJson(res, 500, { error: message });
-  }
-}
-
-async function routeGetRoot(ctx: RouteContext): Promise<void> {
-  const { res, cwd } = ctx;
-  sendHtml(res, renderUiHtml(cwd));
-  return;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/**
- * Exact-match table for every route the dashboard serves. Keeping it as data
- * rather than a 2,300-line if-chain is what makes the set enumerable: the
- * manifest test asserts against `uiRouteManifest()`, so a route that is
- * dropped or renamed during a refactor fails a test instead of 404-ing in the
- * browser.
- */
 const ROUTES: RouteTable = {
-  "GET /": routeGetRoot,
+  "POST /api/repo/enabled": routePostRepositoryEnabled,
   "GET /api/state": routeGetState,
+  "GET /api/state/details": routeGetState,
+  "GET /api/handoff/history": routeGetHandoffHistory,
   "GET /api/update/status": routeGetApplicationUpdateStatus,
   "POST /api/update/apply": routePostApplicationUpdateApply,
   "GET /api/update/progress": routeGetApplicationUpdateProgress,
@@ -464,6 +131,7 @@ const ROUTES: RouteTable = {
   "POST /api/workforce/agent/toggle": routePostWorkforceAgentToggle,
   "POST /api/workforce/default-agent/toggle": routePostWorkforceDefaultAgentToggle,
   "POST /api/workforce/default-agent/create": routePostWorkforceDefaultAgentCreate,
+  "POST /api/workforce/default-agent/update": routePostWorkforceDefaultAgentUpdate,
   "POST /api/workforce/default-agent/delete": routePostWorkforceDefaultAgentDelete,
   "POST /api/workforce/default-agent/restore": routePostWorkforceDefaultAgentRestore,
   "POST /api/workforce/agent/update": routePostWorkforceAgentUpdate,
@@ -474,9 +142,7 @@ const ROUTES: RouteTable = {
   "POST /api/session/focus": routePostSessionFocus,
   "POST /api/session/summary": routePostSessionSummary,
   "POST /api/session/end": routePostSessionEnd,
-  "POST /api/task/update": routePostTaskUpdate,
-  "POST /api/task/delete": routePostTaskDelete,
-  "POST /api/task/stop": routePostTaskStop,
+  "POST /api/session/delete": routePostSessionDelete,
   "POST /api/task/prompt": routePostTaskPrompt,
   "POST /api/orchestration/lane": routePostOrchestrationLane,
   "POST /api/orchestration/lease/acquire": routePostOrchestrationLeaseAcquire,
@@ -497,6 +163,7 @@ const ROUTES: RouteTable = {
   "POST /api/tools/install": routePostToolsInstall,
   "POST /api/antigravity/install-hooks": routePostAntigravityInstallHooks,
   "POST /api/claude/install-hooks": routePostClaudeInstallHooks,
+  "POST /api/codex/install-hooks": routePostCodexInstallHooks,
   "POST /api/context/compile": routePostContextCompile,
   "POST /api/context/save": routePostContextSave,
   "POST /api/handoff/save": routePostHandoffSave,
@@ -533,123 +200,37 @@ const ROUTES: RouteTable = {
   "POST /api/workforce/run/adopt": routePostWorkforceRunAdopt,
 };
 
-/** Sorted `"<METHOD> <path>"` keys, for tests and diagnostics. */
+
 export function uiRouteManifest(): string[] {
   return Object.keys(ROUTES).sort();
 }
 
-export async function handleRequest(
+export async function dispatchUiRequest(
+  cwd: string,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
-  const url = parseUrl(req.url ?? "/", true);
-  const method = req.method ?? "GET";
-  const cwd = uiWorkspace;
-
-  // The only prefix route: everything else is an exact match.
-  if (method === "GET" && url.pathname?.startsWith("/ui-client/")) {
-    sendClientModule(res, url.pathname);
-    return;
+  try {
+    const url = parseUrl(req.url ?? "/", true);
+    const method = req.method ?? "GET";
+    if (method === "POST" && url.pathname !== "/api/repo/enabled" && !url.pathname?.startsWith("/api/update/") && !repositoryEnabled(cwd)) {
+      sendJson(res, 409, { error: "Agent Bridge is disabled for this repository. Enable it in Tools → Repository or run agent-bridge repo enable." });
+      return;
+    }
+    const handler = ROUTES[`${method} ${url.pathname ?? "/"}`];
+    if (!handler) {
+      sendJson(res, 404, { error: "Unknown dashboard action" });
+      return;
+    }
+    await handler({ req, res, url, method, cwd, port: 0 });
+    if (!res.writableEnded) {
+      sendJson(res, 501, { error: "This action is not implemented by the backend." });
+    }
+  } catch (error: unknown) {
+    sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
   }
-
-  const handler = ROUTES[`${method} ${url.pathname ?? "/"}`];
-  if (handler) {
-    await handler({ req, res, url, method, cwd, port: uiPort });
-    return;
-  }
-
-  sendJson(res, 404, { error: "Not found" });
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// Re-exported so `./ui.js` stays the entry point for the command's surface
-// while the implementations live in ./routes.
 export {
   isAutoRunning,
   resumeAutoRuns,

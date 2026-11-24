@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import type { Command } from "commander";
-import { compressLog, loadOptionalTokenizer } from "@agent-bridge/core";
+import { compressLogPreview, loadOptionalTokenizer, calibrateTokenEstimate } from "@agent-bridge/core";
 import { openStore, parseList, paths, readConfig, resolveCurrentTaskId } from "../workspace.js";
 import { computeBaseline, formatBaselineRunSummary, parseBaselineRun } from "../optimize-baseline.js";
 import { daysAgoStamp, readCacheUsage } from "../cache-report.js";
@@ -9,6 +10,16 @@ const fmt = (value: number): string => value.toLocaleString("en-US");
 
 export function registerOptimize(program: Command): void {
   const optimize = program.command("optimize").description("Token saving utilities");
+  optimize.command("calibrate").requiredOption("--corpus <path>", "JSON array of text samples")
+    .requiredOption("--fingerprint <value>", "configured tokenizer/model fingerprint")
+    .option("--output <path>").action(async (options: { corpus: string; fingerprint: string; output?: string }) => {
+      const tokenizer = await loadOptionalTokenizer();
+      if (!tokenizer) throw new Error("Configure AGENT_BRIDGE_TOKENIZER_MODULE before calibration");
+      const result = calibrateTokenEstimate(JSON.parse(readFileSync(options.corpus, "utf8")), tokenizer, options.fingerprint);
+      const text = JSON.stringify(result, null, 2);
+      if (options.output) writeFileSync(options.output, `${text}\n`);
+      console.log(text);
+    });
 
   optimize
     .command("report")
@@ -31,10 +42,10 @@ export function registerOptimize(program: Command): void {
           }
           const pcts = points.map((point) => point.savedPct);
           const avg = pcts.reduce((total, value) => total + value, 0) / pcts.length;
-          console.log(`Baseline runs: ${points.length}`);
-          console.log(`Latest saved: ${points[0].savedPct}% (${fmt(points[0].savedTokens)} tokens, ${points[0].fileCount} files)`);
-          console.log(`Average saved: ${Math.round(avg * 10) / 10}%`);
-          console.log(`Min / Max saved: ${Math.min(...pcts)}% / ${Math.max(...pcts)}%`);
+          console.log(`Estimated context comparison runs: ${points.length}; measured provider savings: unknown`);
+          console.log(`Latest estimated delta: ${points[0].savedPct}% (${fmt(points[0].savedTokens)} tokens, ${points[0].fileCount} files)`);
+          console.log(`Average estimated delta: ${Math.round(avg * 10) / 10}%`);
+          console.log(`Min / Max estimated delta: ${Math.min(...pcts)}% / ${Math.max(...pcts)}%`);
           for (const point of points.slice(0, 10)) {
             console.log(`- ${point.createdAt} [${point.agent ?? "?"}] ${point.savedPct}% (${fmt(point.savedTokens)} tokens)`);
           }
@@ -66,7 +77,7 @@ export function registerOptimize(program: Command): void {
   optimize
     .command("baseline")
     .description(
-      "Measure real token savings: reading the repo-map files' raw source vs. the compact repo map index that lets an agent navigate without reading them"
+      "Compare source tokens with repo-map context size; provider usage savings remain unknown"
     )
     .option("--limit <n>", "max files to compare (default: config graph.repoMapLimit or 40)")
     .option("--focus <paths>", "comma-separated path substrings to focus on")
@@ -116,12 +127,12 @@ export function registerOptimize(program: Command): void {
           }
 
           if (options.json) {
-            console.log(JSON.stringify({ ...summary, precise, skipped, topFiles, limit, focus: focusPaths }, null, 2));
+            console.log(JSON.stringify({ schemaVersion: 2, kind: "context-comparison", measuredSavings: null, counterProvenance: precise ? "configured" : "estimated", ...summary, precise, skipped, topFiles, limit, focus: focusPaths }, null, 2));
             return;
           }
 
-          console.log("Token savings baseline (repo understanding)");
-          console.log("Model: an agent reading these files in full vs. the repo map index that replaces that reading.");
+          console.log("Estimated context comparison (repo understanding)");
+          console.log("Scope: source files vs. repo map only. Later file reads, retries and provider usage are not included.");
           console.log(
             `Files compared: ${summary.fileCount}${skipped.length ? ` (skipped ${skipped.length}: ${skipped.slice(0, 5).join(", ")}${skipped.length > 5 ? ", ..." : ""})` : ""}`
           );
@@ -129,7 +140,7 @@ export function registerOptimize(program: Command): void {
           console.log("");
           console.log(`Baseline    (read raw source):  ${fmt(summary.baselineTokens)} tokens`);
           console.log(`agent-bridge (repo map index):  ${fmt(summary.optimizedTokens)} tokens`);
-          console.log(`Saved:                          ${fmt(summary.savedTokens)} tokens (${summary.savedPct}%)`);
+          console.log(`Estimated context delta:        ${fmt(summary.savedTokens)} tokens (${summary.savedPct}%)`);
           if (topFiles.length) {
             console.log("");
             console.log("Most expensive files if read raw:");
@@ -214,19 +225,36 @@ export function registerOptimize(program: Command): void {
   optimize
     .command("logs")
     .argument("<file>", "log file")
-    .option("--max-lines <lines>", "max output lines", "80")
-    .option("--max-chars <chars>", "max output chars", "8000")
+    .option("--max-lines <lines>", "max preview log lines", "80")
+    .option("--max-chars <chars>", "max preview log characters", "8000")
     .option("--keep-errors", "keep error lines", true)
-    .option("--output <file>", "write compressed output")
+    .option("--output <file>", "write preview with original log reference")
     .action((file: string, options: { maxLines: string; maxChars: string; keepErrors: boolean; output?: string }) => {
-      const compressed = compressLog(readFileSync(file, "utf8"), {
-        maxLines: Number(options.maxLines),
-        maxChars: Number(options.maxChars),
+      const maxLines = Number(options.maxLines);
+      const maxChars = Number(options.maxChars);
+      if (!Number.isSafeInteger(maxLines) || maxLines < 1 || !Number.isSafeInteger(maxChars) || maxChars < 1) {
+        throw new Error("--max-lines and --max-chars must be positive integers");
+      }
+      const source = resolve(file);
+      if (options.output && resolve(options.output) === source) {
+        throw new Error("--output must differ from the original log file");
+      }
+      const preview = compressLogPreview(readFileSync(source, "utf8"), {
+        maxLines,
+        maxChars,
         keepErrors: options.keepErrors
       });
+      const escaped = source.replace(/'/g, "''");
+      const compressed = [
+        preview.text,
+        `Filtered noise/repeats: ${preview.filteredLines}; omitted preview lines: ${preview.omittedLines}; incomplete diagnostic lines: ${preview.omittedDiagnostics}.`,
+        `Full log: ${source}`,
+        `Read full: Get-Content -LiteralPath '${escaped}'`,
+        `Find diagnostics: rg -ni -C 2 'error|failed|exception|fatal|panic|warning|Traceback|Caused by|^\\s*at \\S+|^\\s*File ' -- '${escaped}'`
+      ].filter(Boolean).join("\n");
       if (options.output) {
         writeFileSync(options.output, `${compressed}\n`, "utf8");
-        console.log(`Wrote compressed log: ${options.output}`);
+        console.log(`Wrote log preview: ${resolve(options.output)}; original: ${source}`);
       } else {
         console.log(compressed);
       }

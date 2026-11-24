@@ -38,8 +38,6 @@ export async function routePostApplicationUpdateApply(ctx: RouteContext): Promis
   try {
     const started = await startApplicationUpdate({
       workspace: ctx.cwd,
-      port: ctx.port,
-      uiPid: process.pid,
     });
     sendJson(ctx.res, 202, started);
   } catch (error) {

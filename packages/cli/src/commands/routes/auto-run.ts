@@ -3,6 +3,7 @@ import { generateReport } from "../report.js";
 import { stepOrchestration } from "@agent-bridge/core";
 import { reapAgentRuns } from "@agent-bridge/adapters";
 import { openStore } from "../../workspace.js";
+import { repositoryEnabled } from "../../repository.js";
 
 // The orchestration auto-run loop: one timer per orchestration, stepping it
 // until it halts. The timer map lives here so a route never reaches into
@@ -40,6 +41,7 @@ export function stopAutoRun(orchestrationId: string): void {
 // startup. An approve-each run resumes too: it steps up to its next gate and
 // waits there, which is exactly where the user left it.
 export function resumeAutoRuns(cwd: string): string[] {
+  if (!repositoryEnabled(cwd)) return [];
   const store = openStore(cwd);
   try {
     const resumable = store
@@ -56,9 +58,11 @@ export function resumeAutoRuns(cwd: string): string[] {
 }
 
 export function startAutoRun(cwd: string, orchestrationId: string): void {
+  if (!repositoryEnabled(cwd)) return;
   if (autoRunTimers.has(orchestrationId)) return;
 
   const tick = (): void => {
+    if (!repositoryEnabled(cwd)) { stopAutoRun(orchestrationId); return; }
     const store = openStore(cwd);
     let keepGoing = false;
     try {

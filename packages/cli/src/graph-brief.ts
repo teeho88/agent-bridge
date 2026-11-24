@@ -24,17 +24,12 @@ export function automaticBrief(
   indexedFiles?: ReturnType<Store["listGraphFiles"]>
 ): { summary: string; ranges: string[] } {
   const indexed = (indexedFiles ?? store.listGraphFiles(5000)).find((file) => file.path === path);
-  let symbols = store.getFileSymbols(path);
-  let imports = store.getImports(path);
-
-  if (!indexed && !symbols.length && !imports.internal.length && !imports.external.length) {
-    const extracted = extractGraph(root, { include: [path] });
-    symbols = extracted.nodes.filter((node) => node.kind === "symbol" && node.path === path);
-    imports = {
+  const extracted = extractGraph(root, { include: [path], knownPaths: (indexedFiles ?? store.listGraphFiles(5000)).map((file) => file.path) });
+  const symbols = extracted.nodes.filter((node) => node.kind === "symbol" && node.path === path);
+  const imports = {
       internal: extracted.edges.filter((edge) => edge.src === path && !edge.dst.startsWith("ext:")).map((edge) => edge.dst),
       external: extracted.edges.filter((edge) => edge.src === path && edge.dst.startsWith("ext:")).map((edge) => edge.dst.slice(4))
-    };
-  }
+  };
 
   const dependents = store.getDependents(path);
 
@@ -80,8 +75,6 @@ export type RefreshBriefsOptions = {
 // Regenerate briefs for the given files (or all indexed files). Automatic
 // refreshes preserve an existing manual priority and never create one.
 //
-// Briefs are content-addressed: agents run `graph brief-auto` after every file
-// they read, so the same unchanged file is re-briefed many times per session.
 // When the stored last_seen_hash still matches the file on disk we reuse the
 // stored summary and only touch the task metadata, which skips the symbol and
 // import queries plus the fallback extractGraph parse.
@@ -125,7 +118,7 @@ export function refreshBriefs(
   // "in_progress" once work touches a file, not the moment a prompt creates it.
   if (options.taskEdited && options.taskId && results.length) {
     const task = store.getTask(options.taskId);
-    if (task?.status === "todo") store.updateTaskStatus(options.taskId, "in_progress");
+    if (task?.status === "todo" && !store.getTaskContract(options.taskId)) store.updateTaskStatus(options.taskId, "in_progress");
   }
   return results;
 }

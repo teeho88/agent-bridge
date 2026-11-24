@@ -5,6 +5,9 @@ import type { AgentInvocation } from "@agent-bridge/adapters";
 import { chatOpenAICompatible, resolveOpenAICompatibleConfig } from "@agent-bridge/adapters";
 import type { AgentKind, AgentRequest, AgentRequestStatus, AgentRequestType, Assignment } from "@agent-bridge/memory";
 import { getActiveTaskId, openStore, redactIfEnabled } from "../workspace.js";
+import { checkInvocationBudget } from "@agent-bridge/core";
+import { readConfig } from "../workspace.js";
+import { startUsageAttempt } from "../usage-ledger.js";
 
 export type ExecuteSpawnRequestResult = {
   status: "dry-run" | "approved" | "done" | "failed";
@@ -194,17 +197,24 @@ export async function executeSpawnRequest(
   store.updateAssignment(assignment.id, { status: "running" });
   if (assignment.subtaskId) store.updateSubtask(assignment.subtaskId, { status: "in_progress" });
 
+  const usageAttempt = startUsageAttempt(preview.cwd, assignment.taskId, preview.provider, {
+    sessionId: request.sessionId, model: preview.model, revision: store.getTaskContract(assignment.taskId)?.version,
+  });
   try {
+    const stdin = preview.stdinFilePath ? readFileSync(preview.stdinFilePath, "utf8") : undefined;
+    checkInvocationBudget([...(preview.args ?? []), stdin ?? ""].join("\n"), readConfig(preview.cwd).invocationBudget);
     const output = execFileSync(preview.executable, preview.args ?? [], {
       cwd: preview.cwd || process.cwd(),
       encoding: "utf8",
       maxBuffer: 1024 * 1024,
       timeout: options.timeoutMs ?? 300000,
       windowsHide: true,
-      input: preview.stdinFilePath ? readFileSync(preview.stdinFilePath, "utf8") : undefined,
+      input: stdin,
     });
+    usageAttempt.finish("done");
     return recordSuccessfulExecution(store, request, assignment, preview, summarizeOutput(output) || "Command completed without output.");
   } catch (error) {
+    usageAttempt.finish("failed");
     return recordFailedExecution(store, request, assignment, preview, summarizeExecutionError(error));
   }
 }
@@ -234,6 +244,9 @@ async function executeApiSpawn(
 
   store.updateAssignment(assignment.id, { status: "running" });
   if (assignment.subtaskId) store.updateSubtask(assignment.subtaskId, { status: "in_progress" });
+  const usageAttempt = startUsageAttempt(preview.cwd, assignment.taskId, agent.provider, {
+    sessionId: request.sessionId, model: preview.model, revision: store.getTaskContract(assignment.taskId)?.version,
+  });
   try {
     const prompt = preview.promptArtifactPath && existsSync(preview.promptArtifactPath)
       ? readFileSync(preview.promptArtifactPath, "utf8")
@@ -242,9 +255,12 @@ async function executeApiSpawn(
       credentialLookup,
       fetchImpl: options.fetchImpl,
       json: options.json,
+      tokenBudget: readConfig(preview.cwd).invocationBudget,
     });
+    usageAttempt.finish("done", result.normalizedUsage, [result.usage ?? null]);
     return recordSuccessfulExecution(store, request, assignment, preview, result.content);
   } catch (error) {
+    usageAttempt.finish("failed");
     return recordFailedExecution(store, request, assignment, preview, summarizeExecutionError(error));
   }
 }

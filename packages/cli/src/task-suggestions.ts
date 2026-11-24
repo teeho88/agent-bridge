@@ -11,6 +11,7 @@ type SuggestionStore = {
     dedupe?: boolean;
   }): Memory;
   getTask(id: string): Task | undefined;
+  getTaskContract?(taskId: string): unknown;
   listMemoriesForTask(taskId: string, limit?: number): Memory[];
   updateTask(
     id: string,
@@ -88,6 +89,7 @@ export function markTaskGoalOmitted(
   taskId: string,
   agent: AgentKind,
 ): Task | undefined {
+  if (store.getTaskContract?.(taskId)) return store.getTask(taskId);
   const task = store.updateTask(taskId, { goal: "" });
   if (!task) return undefined;
   const exists = store
@@ -114,6 +116,7 @@ export function applyTaskLabelSuggestion(
 ): Task | undefined {
   const task = store.getTask(taskId);
   if (!task) return undefined;
+  if (store.getTaskContract?.(taskId)) return task;
   const titleText = input.titleText?.trim();
   const goalText = input.goalText?.trim();
   const title = shouldSeedTitle(task, input.replaceAutoTitle === true)
