@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Command } from "commander";
-import { buildSpawnPreview, spawnAgentRun } from "@agent-bridge/adapters";
+import { buildSpawnPreview, spawnAgentRun, readRunLog } from "@agent-bridge/adapters";
 import {
   agentSupportsCapabilities,
   approvedAgentOverride,
@@ -12,12 +12,28 @@ import {
   type SpawnApprovalPayload,
 } from "@agent-bridge/core";
 import type { RegisteredAgent } from "@agent-bridge/memory";
-import { getActiveTaskId, openStore, paths, readCliApprovalPolicy } from "../workspace.js";
+import { getActiveTaskId, openStore, paths, readCliInvocationSettings } from "../workspace.js";
+import { workflowUsage } from "../usage-ledger.js";
 
 type Store = ReturnType<typeof openStore>;
 
 export function registerReport(program: Command): void {
   const report = program.command("report").description("Generate the final project report for a task");
+  report.command("usage").option("--task <taskId>").action((options: { task?: string }) => {
+    const store = openStore();
+    try {
+      const tasks = options.task ? [store.getTask(options.task)].filter((task): task is NonNullable<typeof task> => Boolean(task)) : store.listTasks(Number.MAX_SAFE_INTEGER);
+      if (options.task && !tasks.length) throw new Error(`Task not found: ${options.task}`);
+      const completed = tasks.filter(task => task.status === "done").length;
+      const managed = tasks.filter(task => store.getTaskContract(task.id));
+      console.log(JSON.stringify({ ...workflowUsage(process.cwd(), options.task), lifecycle: {
+        tasks: tasks.length, completed, completionRate: tasks.length ? completed / tasks.length : null,
+        managedTasks: managed.length,
+        retries: managed.length === tasks.length && tasks.length ? tasks.reduce((sum, task) => sum + Math.max(0, store.listTaskAttempts(task.id).length - 1), 0) : null,
+        rework: managed.length === tasks.length && tasks.length ? tasks.reduce((sum, task) => sum + store.listManagedReviews(task.id).filter(review => review.verdict === "rework").length, 0) : null,
+      } }, null, 2));
+    } finally { store.close(); }
+  });
 
   report
     .command("generate")
@@ -87,7 +103,7 @@ export function generateReport(
   // orchestrator uses.
   if (pendingRun && ["done", "failed", "detached", "stopped"].includes(pendingRun.status)) {
     const output = pendingRun.logPath && existsSync(pendingRun.logPath)
-      ? extractFinalAgentMessage(readFileSync(pendingRun.logPath, "utf8"))
+      ? extractFinalAgentMessage(readRunLog(pendingRun.logPath))
       : "";
     if (pendingRun.status !== "failed" && output) {
       return finalizeReport(store, taskId, context, output, "reporter", undefined, projectPaths.memoryDir);
@@ -169,7 +185,7 @@ export function generateReport(
     reporterAgent,
     promptPath,
     projectPaths.cwd,
-    readCliApprovalPolicy(projectPaths.cwd, reporterAgent.provider),
+    readCliInvocationSettings(projectPaths.cwd, reporterAgent.provider),
   );
   if (preview.mode !== "cli" || !preview.executable) {
     return finalizeReport(

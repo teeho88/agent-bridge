@@ -68,6 +68,8 @@ if ($AddToUserPath) {
 Write-Host ""
 Write-Host "Installed agent-bridge wrapper:"
 Write-Host "  $CmdPath"
+& node $CliEntry permissions install-shell
+if ($LASTEXITCODE -ne 0) { throw "CLI permission shell integration failed." }
 Write-Host ""
 Write-Host "Try now:"
 Write-Host "  & `"$PsPath`" --help"

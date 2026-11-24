@@ -1,16 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 
-/**
- * Drives `handleRequest` without a socket.
- *
- * The route bodies only ever read `req.method`, `req.url` and `req.socket`, and
- * only ever answer through `sendJson` / `sendHtml` / `sendClientModule` - so a
- * pair of stubs is enough to exercise them. Before this existed no test called
- * a single route: the dashboard tests assert `/api/...` strings inside the
- * client bundle, which says the browser asks for a path, not that the server
- * answers it.
- */
 export interface RouteResponse {
   status: number;
   headers: Record<string, string>;
@@ -86,10 +76,6 @@ export function makeResponse(): {
   };
 }
 
-/**
- * Call one route and read the reply. `handler` is `handleRequest`; it is passed
- * in so this module stays free of the command's import graph.
- */
 export async function callRoute(
   handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>,
   method: string,

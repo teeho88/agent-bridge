@@ -1,15 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 
 export type JsonBody = Record<string, unknown>;
-
-/** Port the UI binds to unless --port says otherwise. */
-export const defaultUiPort = 4783;
-
-// Transport for every route: read a JSON body, write a JSON/HTML reply, and
-// serve the compiled dashboard client.
 
 export async function readJson(req: IncomingMessage): Promise<JsonBody> {
   const chunks: Buffer[] = [];
@@ -25,47 +16,3 @@ export function sendJson(res: ServerResponse, status: number, data: unknown): vo
   res.end(JSON.stringify(data));
 }
 
-export function sendHtml(res: ServerResponse, html: string): void {
-  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-  res.end(html);
-}
-
-/**
- * The dashboard client lives in `src/ui-client` and is compiled to
- * `dist/ui-client`. Serve it from there rather than inlining it into the page:
- * a real module keeps the code type-checked and splittable.
- */
-export function sendClientModule(res: ServerResponse, pathname: string): void {
-  const file = clientModulePath(pathname);
-  if (!file || !existsSync(file)) {
-    sendJson(res, 404, { error: "Not found" });
-    return;
-  }
-  res.writeHead(200, {
-    "content-type": "text/javascript; charset=utf-8",
-    "cache-control": "no-store",
-  });
-  res.end(readFileSync(file));
-}
-
-export function clientModulePath(pathname: string, clientDir = uiClientDir()): string | undefined {
-  const prefix = "/ui-client/";
-  if (!pathname.startsWith(prefix)) return undefined;
-  const segments = pathname.slice(prefix.length).split("/");
-  if (
-    segments.length === 0 ||
-    !segments.at(-1)?.endsWith(".js") ||
-    segments.some((segment) => segment === "." || segment === ".." || !/^[\w.-]+$/.test(segment))
-  ) {
-    return undefined;
-  }
-  return join(clientDir, ...segments);
-}
-
-export function uiClientDir(packageRoot = cliPackageRoot()): string {
-  return join(packageRoot, "dist", "ui-client");
-}
-
-export function cliPackageRoot(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
-}

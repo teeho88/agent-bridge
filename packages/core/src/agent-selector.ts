@@ -1,7 +1,10 @@
 import type { AgentProvider, AgentRunMode, MemoryStore, RegisteredAgent } from "@agent-bridge/memory";
 import type { LeaderAgentPreference } from "./leader-contract.js";
+import { selectModelRoute } from "./model-routing.js";
 
 export type ResolveAgentDefaults = {
+  routing?: Omit<Parameters<typeof selectModelRoute>[0], "override" | "requiredCapabilities">;
+  userOverride?: LeaderAgentPreference;
   mode?: AgentRunMode;
   command?: string;
   capabilities?: string[];
@@ -24,6 +27,14 @@ export function resolveAgentForPreference(
   preference: LeaderAgentPreference,
   defaults: ResolveAgentDefaults = {},
 ): RegisteredAgent {
+  if (defaults.routing) {
+    const routed = selectModelRoute({
+      ...defaults.routing,
+      requiredCapabilities: defaults.requiredCapabilities,
+      override: defaults.userOverride,
+    });
+    preference = routed.preference;
+  }
   const provider = preference.provider as AgentProvider;
   const mode = preference.mode ?? defaults.mode ?? "cli";
   const requiredCapabilities = normalizeCapabilities(defaults.requiredCapabilities ?? []);
@@ -40,6 +51,7 @@ export function resolveAgentForPreference(
   if (exactMatch) return exactMatch;
 
   if (defaults.allowCreate === false) {
+    if (defaults.routing) throw new Error(`No enabled agent matches routed model "${preference.model}" with required capabilities`);
     // No exact match, and we may not register one. Fall back within the roster
     // rather than failing the whole step over a model/effort detail the leader
     // guessed at: same provider and mode is close enough to do the work, and

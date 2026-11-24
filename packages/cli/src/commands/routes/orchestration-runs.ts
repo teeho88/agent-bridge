@@ -68,7 +68,7 @@ export async function routePostWorkforceOrchestrationStart(ctx: RouteContext): P
   const store = openStore(cwd);
   try {
     const prompt = requiredString(body.prompt, "prompt");
-    const createGoal = optionalBoolean(body.createGoal, true);
+    const createGoal = optionalBoolean(body.createGoal, false);
     // Only the starting position: the Orchestration panel can move this at
     // any point during the run via /api/workforce/orchestration/autonomy.
     const autonomy = optionalString(body.autonomy) ?? "manual";

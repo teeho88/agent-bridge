@@ -10,3 +10,4 @@ export * from "./kimi.js";
 export * from "./managed-section.js";
 export * from "./openai-compatible.js";
 export * from "./process-runner.js";
+export * from "./run-log-reader.js";

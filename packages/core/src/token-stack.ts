@@ -29,6 +29,9 @@ export type TokenSavingsEstimateInput = {
 };
 
 export type TokenSavingsEstimate = {
+  schemaVersion: 2;
+  provenance: "heuristic-context-comparison";
+  measuredSavings: null;
   rawTokens: number;
   cleanedTokens: number;
   compiledTokens: number;
@@ -115,11 +118,14 @@ export function estimateTokenSavings(input: TokenSavingsEstimateInput): TokenSav
   const compiledTokens = estimateTokens(input.compiledContext);
   const cacheableTokens = estimateCacheableTokens(input.compiledContext);
 
-  const effectiveCompiledTokens = Math.max(compiledTokens - cacheableTokens, 0);
-  const savedTokens = Math.max(rawTokens - effectiveCompiledTokens, 0);
+  const effectiveCompiledTokens = compiledTokens;
+  const savedTokens = rawTokens - compiledTokens;
   const savingsPercent = rawTokens > 0 ? Math.round((savedTokens / rawTokens) * 100) : 0;
 
   return {
+    schemaVersion: 2,
+    provenance: "heuristic-context-comparison",
+    measuredSavings: null,
     rawTokens,
     cleanedTokens,
     compiledTokens,
@@ -132,7 +138,7 @@ export function estimateTokenSavings(input: TokenSavingsEstimateInput): TokenSav
         label: "RTK / log cleaning",
         beforeTokens: rawTokens,
         afterTokens: cleanedTokens,
-        savedTokens: Math.max(rawTokens - cleanedTokens, 0),
+        savedTokens: rawTokens - cleanedTokens,
         note: "Removes CLI noise, repeated lines, and compresses logs."
       },
       {
@@ -140,7 +146,7 @@ export function estimateTokenSavings(input: TokenSavingsEstimateInput): TokenSav
         label: "Context compile",
         beforeTokens: cleanedTokens,
         afterTokens: compiledTokens,
-        savedTokens: Math.max(cleanedTokens - compiledTokens, 0),
+        savedTokens: cleanedTokens - compiledTokens,
         note:
           compiledTokens > cleanedTokens
             ? "Adds agent-ready structure and rules; can be larger for small tasks."
@@ -151,7 +157,7 @@ export function estimateTokenSavings(input: TokenSavingsEstimateInput): TokenSav
         label: "Stable prefix (cache candidate)",
         beforeTokens: compiledTokens,
         afterTokens: effectiveCompiledTokens,
-        savedTokens: cacheableTokens,
+        savedTokens: 0,
         note:
           "Potential, not realised: the size of the prefix above the cache breakpoint. It only becomes a saving if the provider caches it and the same prefix is resent within its TTL. Run `optimize cache-report` for measured cache reads."
       },
@@ -161,7 +167,7 @@ export function estimateTokenSavings(input: TokenSavingsEstimateInput): TokenSav
         beforeTokens: rawTokens,
         afterTokens: effectiveCompiledTokens,
         savedTokens,
-        note: "Overall estimated savings. Provider billing can differ."
+        note: "Signed heuristic context comparison; cache candidates are not deducted. Measured provider savings are unknown."
       }
     ]
   };

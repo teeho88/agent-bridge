@@ -145,6 +145,7 @@ export type AddWorkforceMemberInput = {
 export type TaskStatus =
   | "todo"
   | "in_progress"
+  | "review"
   | "blocked"
   | "done"
   | "cancelled";
@@ -201,17 +202,88 @@ export type MemoryType =
   | "artifact"
   | "note";
 
+export type MemoryEvidence = {
+  reuse?: { key: string; scope: string[]; revision: string; expiresAt: string; invalidation: string };
+  source: string;
+  observedAt: string;
+  contentHash?: string;
+  commit?: string;
+};
+
+export type CheckpointInput = {
+  taskId: string;
+  goal?: string;
+  decisions?: Array<{ id: string; decision: string; reason?: string }>;
+  completed?: string[];
+  contractVersion?: number;
+  sessionId?: string;
+  author?: AgentKind;
+  summary: string;
+  tests: { summary: string; status: "passed" | "failed" | "not_run" | "unknown"; command?: string; exitCode?: number; evidencePath?: string; commit?: string };
+  files: Array<{ path: string; hash?: string; symbols?: string[] }>;
+  blockers: string[];
+  next: string[];
+};
+
+export type Checkpoint = CheckpointInput & { id: string; revision: number; createdAt: string };
+
 export type Task = {
+  repositoryId?: string;
+  branch?: string;
+  baseCommit?: string;
+  revision?: number;
   id: string;
   title: string;
   goal?: string;
   status: TaskStatus;
+  statusReason?: string;
   ownerAgent?: AgentKind;
   createdAt: string;
   updatedAt: string;
 };
 
+export type TaskContract = {
+  taskId: string;
+  scope: string[];
+  constraints: string[];
+  acceptance: string[];
+  checks: string[];
+  dependsOn: string[];
+  contextRefs: string[];
+  version: number;
+  updatedAt: string;
+};
+export type TaskContractInput = Omit<TaskContract, "taskId" | "version" | "updatedAt">;
+export type TaskOwnerClaim = { taskId: string; agent: AgentKind; sessionId: string; claimedAt: string };
+export type TaskAcceptanceProof = { taskId: string; criterion: string; checkpointId: string; contractVersion: number; verifiedAt: string };
+export type TaskCheckProof = { taskId: string; command: string; checkpointId: string; contractVersion: number; verifiedAt: string };
+export type ManagedReviewInput = {
+  verdict: "pass" | "rework" | "blocked";
+  reason: string;
+  diffRef: string;
+  limitations: string[];
+  reviewerSession: string;
+  checkpointId: string;
+};
+export type ManagedReview = ManagedReviewInput & {
+  id: string; taskId: string; contractVersion: number; revision: number; createdAt: string;
+};
+export type TaskRetryKind = "small" | "debug" | "multi" | "handoff";
+export type TaskRetryPolicy = { kind: TaskRetryKind; maxAttempts: number; maxRepeatedFailures: number; maxTokens: number; maxElapsedMs: number };
+export type TaskAttempt = {
+  id: string; taskId: string; operation: string; hypothesis: string; sessionId: string;
+  startedAt: string; endedAt?: string; tokens: number | null;
+  outcome?: "progressed" | "failed" | "blocked"; reason?: string; checkpointId?: string;
+  decision?: "continue" | "change_direction" | "escalate" | "blocked";
+};
+export type EndTaskAttemptInput = Pick<TaskAttempt, "tokens"> & {
+  outcome: "progressed" | "failed" | "blocked"; reason: string; checkpointId: string;
+  decision: "continue" | "change_direction" | "escalate" | "blocked";
+};
+
 export type Memory = {
+  evidence?: MemoryEvidence;
+  stale?: boolean;
   id: string;
   taskId?: string;
   type: MemoryType;
@@ -228,6 +300,10 @@ export type Memory = {
 };
 
 export type Decision = {
+  stale?: boolean;
+  scope?: string;
+  evidence?: MemoryEvidence;
+  supersededBy?: string;
   id: string;
   taskId?: string;
   decision: string;
@@ -343,6 +419,7 @@ export type CreateTaskInput = {
 };
 
 export type UpdateTaskInput = {
+  sessionId?: string;
   title?: string;
   goal?: string;
   status?: TaskStatus;
@@ -350,6 +427,7 @@ export type UpdateTaskInput = {
 };
 
 export type AddMemoryInput = {
+  evidence?: MemoryEvidence;
   taskId?: string;
   type: MemoryType;
   content: string;
@@ -357,9 +435,7 @@ export type AddMemoryInput = {
   importance?: number;
   tags?: string[];
   sourceAgent?: AgentKind;
-  // When false, skip near-duplicate detection and always insert a new row.
-  // Defaults to deduping on (merges into a near-identical existing memory of the
-  // same task + type).
+  // Exact content, task, type and source only; false always inserts a new row.
   dedupe?: boolean;
 };
 

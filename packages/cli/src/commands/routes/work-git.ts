@@ -2,6 +2,7 @@ import type { RouteContext } from "./types.js";
 import {
   getActiveTaskId,
   openStore,
+  readConfig,
 } from "../../workspace.js";
 import {
   readJson,
@@ -14,9 +15,12 @@ import {
   parseChangeType,
   parseLaneMode,
   parseLaneStatus,
+  parseLeaseMode,
+  parseAgentKind,
   parseRequestType,
   requiredString,
 } from "./validation.js";
+import { normalizeLeasePath } from "../file.js";
 import {
   type AgentKind,
 } from "@agent-bridge/memory";
@@ -46,11 +50,42 @@ export async function routePostOrchestrationLane(ctx: RouteContext): Promise<voi
 }
 
 export async function routePostOrchestrationLeaseAcquire(ctx: RouteContext): Promise<void> {
-
+  const body = await readJson(ctx.req);
+  const store = openStore(ctx.cwd);
+  try {
+    const owner = leaseOwner(body, ctx.cwd, store);
+    const ttlSeconds = Number(body.ttl ?? 3600);
+    if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) throw new Error("Lease duration must be positive.");
+    const result = store.acquireFileLease({
+      ...owner,
+      path: normalizeLeasePath(requiredString(body.path, "path")),
+      mode: parseLeaseMode(optionalString(body.mode) ?? "write"),
+      ttlSeconds,
+    });
+    sendJson(ctx.res, 200, result);
+  } finally { store.close(); }
 }
 
 export async function routePostOrchestrationLeaseRelease(ctx: RouteContext): Promise<void> {
+  const body = await readJson(ctx.req);
+  const store = openStore(ctx.cwd);
+  try {
+    const owner = leaseOwner(body, ctx.cwd, store);
+    const lease = store.releaseFileLease(requiredString(body.leaseId, "leaseId"), owner);
+    if (!lease) sendJson(ctx.res, 404, { error: "File lease not found" });
+    else sendJson(ctx.res, 200, { lease });
+  } finally { store.close(); }
+}
 
+function leaseOwner(body: Record<string, unknown>, cwd: string, store: ReturnType<typeof openStore>) {
+  const agent = parseAgentKind(optionalString(body.agent) ?? "codex");
+  const config = readConfig(cwd);
+  const sessionId = optionalString(body.sessionId) ?? config.currentSessions?.[agent];
+  const boundTask = sessionId ? config.sessionTasks?.[sessionId] : undefined;
+  if (body.sessionId && !boundTask) throw new Error("Unknown lease session");
+  const requestedTask = optionalString(body.taskId);
+  if (requestedTask && boundTask && requestedTask !== boundTask) throw new Error("Lease session/task mismatch");
+  return { taskId: requestedTask ?? boundTask ?? getActiveTaskId(store, cwd, undefined, agent), agent, sessionId: boundTask ? sessionId : undefined };
 }
 
 export async function routePostOrchestrationChange(ctx: RouteContext): Promise<void> {

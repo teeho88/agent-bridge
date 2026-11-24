@@ -153,12 +153,16 @@ export async function routeGetGraph(ctx: RouteContext): Promise<void> {
   const { res, url, cwd } = ctx;
   const store = openStore(cwd);
   try {
-    const limit = Math.min(Number(url.query.limit ?? 120) || 120, 400);
+    const limit = Math.max(1, Math.min(Math.floor(Number(url.query.limit ?? 120) || 120), 5000));
     const focus = String(url.query.focus ?? "")
       .split(",")
       .map((value) => value.trim())
       .filter(Boolean);
-    const taskId = resolveActiveTaskId(store, cwd);
+    let taskId: string | null = typeof url.query.task === "string" ? url.query.task : null;
+    if (!taskId) {
+      try { taskId = resolveActiveTaskId(store, cwd); }
+      catch (error) { if (!(error instanceof Error) || !error.message.startsWith("Ambiguous active task")) throw error; }
+    }
     const task = taskId ? store.getTask(taskId) : undefined;
     const handoff = taskId ? store.getLatestHandoff(taskId) : undefined;
     sendJson(

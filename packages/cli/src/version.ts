@@ -1,9 +1,14 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export function installationRoot(moduleUrl = import.meta.url): string {
-  return resolve(dirname(fileURLToPath(moduleUrl)), "..", "..", "..");
+  const packageRoot = resolve(dirname(fileURLToPath(moduleUrl)), "..");
+  const workspaceRoot = resolve(packageRoot, "..", "..");
+  return existsSync(join(workspaceRoot, "pnpm-workspace.yaml")) &&
+    existsSync(join(workspaceRoot, "packages", "cli", "package.json"))
+    ? workspaceRoot
+    : packageRoot;
 }
 
 export function readApplicationVersion(root = installationRoot()): string {

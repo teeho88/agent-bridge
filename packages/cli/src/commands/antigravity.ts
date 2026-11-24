@@ -1,3 +1,6 @@
+import { refreshAutoHandoff } from "../auto-handoff.js";
+import { effectiveWorkflowMode } from "../workflow.js";
+import { repositoryEnabled } from "../repository.js";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -18,7 +21,7 @@ import {
   rememberSessionWindowHandle,
   setCurrentTask,
   startAgentSession,
-  writeCompiledContextFor,
+  syncTerminalNativeSession,
   writeConfig,
   writeCurrentTaskArtifact,
   writeNoCurrentTaskArtifact,
@@ -40,18 +43,8 @@ const HOOK_NAME = "agent-bridge";
 // install has to pick one, and `.agents/` is the documented default.
 const CUSTOMIZATION_DIR = ".agents";
 
-// A PreToolUse reply must carry a decision, and every allowed value overrides
-// agy's own permission flow — there is no "no opinion". So the hook is only
-// wired to the tools whose requests belong on the Work Board; every other tool
-// keeps agy's native behaviour because the hook never runs for it. Tool names
-// are the lowercased step type without the CORTEX_STEP_TYPE_ prefix.
 const ANTIGRAVITY_TOOL_MATCHER =
   "^(run_command|shell_exec|send_command_input|propose_code|write_blob|edit_notebook|delete_directory|git_commit|mcp_tool|ask_question)$";
-
-// Tools agy would have run without asking. Everything else the matcher lets
-// through mutates the workspace, so it goes through agy's confirmation — "ask"
-// still honours the Always Allow cache, so a granted command is not re-prompted.
-const ANTIGRAVITY_UNGATED_TOOLS = new Set(["ask_question"]);
 
 // agy exposes PreInvocation, PreToolUse, PostToolUse, and Stop hook events.
 // PreInvocation fires before each model call, PreToolUse before each tool call,
@@ -155,7 +148,7 @@ export function runManagedAntigravity(
     : undefined;
   try {
     taskId = ensureAntigravitySession(store, cwd, sessionId, {}).taskId;
-    store.updateTask(taskId, { status: "in_progress" });
+    if (!store.getTaskContract(taskId)) store.updateTask(taskId, { status: "in_progress" });
     rememberSessionTask(sessionId, taskId, cwd);
     setCurrentTask(taskId, cwd, "antigravity");
   } finally {
@@ -259,11 +252,11 @@ export function installAntigravityHooks(projectPath: string): string[] {
 // agy discovers `.agents/rules/*.md` on its own, so this is the only place we
 // can tell it which agent name to use without touching the codex-facing
 // AGENTS.md. Managed-section patched so a user's own notes in the file survive.
-export function writeAntigravityRules(projectPath: string): string {
+export function writeAntigravityRules(projectPath: string, options: { hooked?: boolean } = {}): string {
   const rulesDir = join(projectPath, CUSTOMIZATION_DIR, "rules");
   mkdirSync(rulesDir, { recursive: true });
   const rulesPath = join(rulesDir, "agent-bridge.md");
-  patchManagedSection(rulesPath, antigravityRulesSection());
+  patchManagedSection(rulesPath, antigravityRulesSection(options));
   const rules = readFileSync(rulesPath, "utf8");
   if (!rules.startsWith("---\n") && !rules.startsWith("---\r\n")) {
     writeFileSync(
@@ -328,11 +321,14 @@ export function handleAntigravityHook(
   if (process.env.AGENT_BRIDGE_SPAWNED_RUN) return undefined;
 
   const cwd = resolveWorkspacePath(input);
+  if (!repositoryEnabled(cwd)) return undefined;
   const event = forcedEvent ?? "PreInvocation";
   ensureWorkspace(cwd);
 
   const store = openStore(cwd);
   try {
+    const terminalSessionId = process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID?.trim();
+    if (terminalSessionId && input.conversationId?.trim()) syncTerminalNativeSession(terminalSessionId, input.conversationId.trim(), cwd);
     const sessionId =
       process.env.AGENT_BRIDGE_TERMINAL_SESSION_ID?.trim() ||
       input.conversationId?.trim() ||
@@ -343,9 +339,8 @@ export function handleAntigravityHook(
     if (!taskId) return undefined;
 
     if (event === "PreToolUse") {
-      const request = createRequestFromAntigravityTool(store, cwd, sessionId, taskId, input);
-      const toolName = input.toolCall?.name ?? readLastToolName(input.transcriptPath);
-      return antigravityToolDecision(toolName, request?.title);
+      createRequestFromAntigravityTool(store, cwd, sessionId, taskId, input);
+      return { decision: "allow" };
     }
 
     if (event === "PostToolUse") {
@@ -356,7 +351,7 @@ export function handleAntigravityHook(
     if (event === "Stop") {
       resolveAcceptedAntigravityToolRequest(store, sessionId, taskId, input);
       const reply = readLastAssistantMessage(input.transcriptPath);
-      if (reply) {
+      if (reply && effectiveWorkflowMode(store, cwd, sessionId) !== "single") {
         const compact =
           reply.length > 1200 ? `${reply.slice(0, 1200).trim()}\n...[truncated]` : reply;
         store.upsertLatestMemory(
@@ -392,11 +387,12 @@ export function handleAntigravityHook(
           ? `Antigravity turn ended with an error: ${oneLine(input.error, 120)}`
           : "Antigravity completed a turn.",
       });
+      refreshAutoHandoff(store, cwd, taskId, "antigravity", sessionId, reply);
       return {};
     }
 
-    // PreInvocation / PostInvocation: the user's prompt is already on disk by
-    // the time the model is called, so the transcript is what names the task.
+    if (firstTaskLabelSource(store, taskId)) return {};
+
     const prompt = readLastUserPrompt(input.transcriptPath);
     // A prompt that continues another agent's unfinished task must land on that
     // task, so its handoff reaches the compile below. A session that was already
@@ -412,12 +408,9 @@ export function handleAntigravityHook(
         }).taskId ?? taskId
       : taskId;
     if (prompt) rememberTaskLabelSource(store, activeTaskId, redactIfEnabled(prompt, cwd), "antigravity");
-    store.updateTask(activeTaskId, { status: "in_progress" });
+    if (!store.getTaskContract(activeTaskId)) store.updateTask(activeTaskId, { status: "in_progress" });
     rememberSessionTask(sessionId, activeTaskId, cwd);
     setCurrentTask(activeTaskId, cwd, "antigravity");
-    // agy gets no injected context either: the file it is told to read has to be
-    // recompiled for this agent on every turn, not once at session start.
-    writeCompiledContextFor(store, cwd, activeTaskId, "antigravity");
     return {};
   } finally {
     store.close();
@@ -525,19 +518,6 @@ function lastTranscriptContent(
     if (content && match(step)) return content;
   }
   return undefined;
-}
-
-// agy requires a decision on every PreToolUse reply — an empty body is read as
-// an empty decision and the tool call is refused with "Tool call denied by
-// pre-tool hook". agent-bridge only mirrors the call onto the Work Board, so
-// the decision has to be the one agy would have reached by itself: "ask" for
-// the tools it gates (cached grants still apply), "allow" for the rest.
-function antigravityToolDecision(
-  toolName: string | undefined,
-  reason?: string,
-): Record<string, unknown> {
-  if (!toolName || ANTIGRAVITY_UNGATED_TOOLS.has(toolName)) return { decision: "allow" };
-  return reason ? { decision: "ask", reason } : { decision: "ask" };
 }
 
 function createRequestFromAntigravityTool(

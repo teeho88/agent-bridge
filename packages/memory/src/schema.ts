@@ -1,3 +1,71 @@
+export const embeddingProgressSchemaStatements = [
+  `CREATE TABLE IF NOT EXISTS embedding_progress (fingerprint TEXT NOT NULL, task_key TEXT NOT NULL, after_id TEXT NOT NULL, PRIMARY KEY(fingerprint, task_key))`,
+];
+
+export const vectorCandidateSchemaStatements = [
+  `CREATE TABLE IF NOT EXISTS embedding_buckets (memory_id TEXT NOT NULL, fingerprint TEXT NOT NULL, table_no INTEGER NOT NULL, bucket INTEGER NOT NULL, PRIMARY KEY(memory_id, table_no), FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE)`,
+  `CREATE INDEX IF NOT EXISTS idx_embedding_bucket_lookup ON embedding_buckets(fingerprint, table_no, bucket, memory_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_embedding_compatible ON memories(embedding_fingerprint, embedding_dimensions, task_id) WHERE embedding IS NOT NULL AND superseded_by IS NULL`,
+  `CREATE TRIGGER IF NOT EXISTS embedding_bucket_invalidation AFTER UPDATE OF embedding ON memories BEGIN DELETE FROM embedding_buckets WHERE memory_id = NEW.id; END`,
+];
+
+export const maintenanceSchemaStatements = [
+  `CREATE TABLE IF NOT EXISTS memory_archive AS SELECT *, CAST(NULL AS TEXT) AS archived_at, CAST(NULL AS TEXT) AS archive_reason FROM memories WHERE 0`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_archive_id ON memory_archive(id)`,
+  `CREATE INDEX IF NOT EXISTS idx_memory_archive_task ON memory_archive(task_id, archived_at)`,
+  `CREATE TABLE IF NOT EXISTS maintenance_schedule (name TEXT PRIMARY KEY, next_at INTEGER NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS consolidation_provenance (representative_id TEXT NOT NULL, member_id TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(representative_id, member_id))`,
+  `CREATE TABLE IF NOT EXISTS consolidation_cursors (task_id TEXT PRIMARY KEY, after_id TEXT NOT NULL)`,
+];
+
+export const runtimeMemorySchemaStatements = [
+  `ALTER TABLE tasks ADD COLUMN repository_id TEXT`,
+  `ALTER TABLE tasks ADD COLUMN branch TEXT`,
+  `ALTER TABLE tasks ADD COLUMN base_commit TEXT`,
+  `ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE memories ADD COLUMN evidence TEXT`,
+  `ALTER TABLE memories ADD COLUMN stale INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE decisions ADD COLUMN scope TEXT`,
+  `ALTER TABLE decisions ADD COLUMN evidence TEXT`,
+  `ALTER TABLE decisions ADD COLUMN superseded_by TEXT`,
+  `ALTER TABLE decisions ADD COLUMN stale INTEGER NOT NULL DEFAULT 0`,
+  `CREATE TABLE IF NOT EXISTS checkpoints (
+    id TEXT PRIMARY KEY, task_id TEXT NOT NULL, revision INTEGER NOT NULL,
+    session_id TEXT, author TEXT, summary TEXT NOT NULL, payload TEXT NOT NULL,
+    fingerprint TEXT NOT NULL, created_at TEXT NOT NULL,
+    UNIQUE(task_id, revision), FOREIGN KEY(task_id) REFERENCES tasks(id)
+  )`,
+];
+
+export const managedTaskSchemaStatements = [
+  `ALTER TABLE tasks ADD COLUMN status_reason TEXT`,
+  `CREATE TABLE IF NOT EXISTS task_contracts (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    scope TEXT NOT NULL, constraints TEXT NOT NULL, acceptance TEXT NOT NULL,
+    checks TEXT NOT NULL, depends_on TEXT NOT NULL, context_refs TEXT NOT NULL,
+    version INTEGER NOT NULL, updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS task_owner_claims (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    agent TEXT NOT NULL, session_id TEXT NOT NULL, claimed_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS task_acceptance_proofs (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    criterion TEXT NOT NULL, checkpoint_id TEXT NOT NULL REFERENCES checkpoints(id),
+    contract_version INTEGER NOT NULL, verified_at TEXT NOT NULL,
+    PRIMARY KEY(task_id, criterion)
+  )`,
+];
+
+export const managedTaskCheckProofSchemaStatements = [
+  `CREATE TABLE IF NOT EXISTS task_check_proofs (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    command TEXT NOT NULL, checkpoint_id TEXT NOT NULL REFERENCES checkpoints(id),
+    contract_version INTEGER NOT NULL, verified_at TEXT NOT NULL,
+    PRIMARY KEY(task_id, command)
+  )`,
+];
+
 export const schemaStatements = [
   `CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
@@ -134,6 +202,25 @@ export const supersededColumnStatements = [`ALTER TABLE memories ADD COLUMN supe
 // nullable). Only populated when an embedding provider is configured (via
 // `memory reindex`); search blends it with bm25 when present, else stays lexical.
 export const embeddingColumnStatements = [`ALTER TABLE memories ADD COLUMN embedding BLOB`];
+
+export const embeddingProvenanceStatements = [
+  `ALTER TABLE memories ADD COLUMN embedding_fingerprint TEXT`,
+  `ALTER TABLE memories ADD COLUMN embedding_dimensions INTEGER`,
+  `ALTER TABLE memories ADD COLUMN embedding_input_hash TEXT`,
+  `CREATE INDEX IF NOT EXISTS memories_exact_dedupe ON memories(type, task_id, source_agent, content) WHERE superseded_by IS NULL`,
+  `CREATE TRIGGER IF NOT EXISTS memories_embedding_invalidate AFTER UPDATE OF content, summary ON memories
+   WHEN COALESCE(NULLIF(NEW.summary, ''), NEW.content) IS NOT COALESCE(NULLIF(OLD.summary, ''), OLD.content)
+   BEGIN
+     UPDATE memories SET embedding = NULL, embedding_fingerprint = NULL,
+       embedding_dimensions = NULL, embedding_input_hash = NULL WHERE id = NEW.id;
+   END`,
+];
+
+export const retrievalIndexStatements = [
+  `CREATE INDEX IF NOT EXISTS idx_memories_active_scope_type ON memories(task_id, type, importance DESC, created_at DESC) WHERE superseded_by IS NULL`,
+  `CREATE INDEX IF NOT EXISTS idx_handoffs_latest ON handoffs(task_id, created_at DESC, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_handoffs_history ON handoffs(created_at DESC, id DESC)`,
+];
 
 // v6: distinguish auto-generated (Stop-hook) handoffs from manually authored
 // ones, so a manual handoff is never clobbered by the auto refresh.
@@ -612,4 +699,67 @@ export const subtaskStatusReasonColumnStatements = [
        WHEN 'cancelled' THEN 'Legacy cancelled task; no reason was recorded.'
      END
      WHERE status IN ('blocked', 'cancelled') AND status_reason IS NULL`
+];
+export const taskQualitySchemaStatements = [
+  `CREATE TABLE IF NOT EXISTS task_quality_reviews (
+    id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    payload TEXT NOT NULL, valid INTEGER NOT NULL DEFAULT 1
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_task_quality_reviews ON task_quality_reviews(task_id)`
+];
+export const taskRetrySchemaStatements = [
+  `CREATE TABLE IF NOT EXISTS task_retry_policies (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, payload TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS task_attempts (
+    id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, payload TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_task_attempts ON task_attempts(task_id)`
+];
+
+export const ftsRowIdentityStatements = [
+  `DROP TRIGGER IF EXISTS memories_fts_ai`,
+  `DROP TRIGGER IF EXISTS memories_fts_ad`,
+  `DROP TRIGGER IF EXISTS memories_fts_au`,
+  `CREATE TABLE IF NOT EXISTS memory_fts_keys (fts_rowid INTEGER PRIMARY KEY AUTOINCREMENT, memory_id TEXT NOT NULL UNIQUE)`,
+  `DELETE FROM memories_fts`,
+  `DELETE FROM memory_fts_keys`,
+  `INSERT INTO memory_fts_keys (memory_id) SELECT id FROM memories ORDER BY rowid`,
+  `INSERT INTO memories_fts (rowid, content, summary, tags, mem_id)
+   SELECT k.fts_rowid, fold(m.content), fold(COALESCE(m.summary, '')), fold(COALESCE(m.tags, '')), m.id
+   FROM memories m JOIN memory_fts_keys k ON k.memory_id = m.id`,
+  `CREATE TRIGGER memories_fts_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memory_fts_keys (memory_id) VALUES (new.id);
+    INSERT INTO memories_fts (rowid, content, summary, tags, mem_id)
+    VALUES ((SELECT fts_rowid FROM memory_fts_keys WHERE memory_id = new.id), fold(new.content), fold(COALESCE(new.summary, '')), fold(COALESCE(new.tags, '')), new.id);
+  END`,
+  `CREATE TRIGGER memories_fts_ad AFTER DELETE ON memories BEGIN
+    DELETE FROM memories_fts WHERE rowid = (SELECT fts_rowid FROM memory_fts_keys WHERE memory_id = old.id);
+    DELETE FROM memory_fts_keys WHERE memory_id = old.id;
+  END`,
+  `CREATE TRIGGER memories_fts_au AFTER UPDATE OF id, content, summary, tags ON memories BEGIN
+    UPDATE memory_fts_keys SET memory_id = new.id WHERE memory_id = old.id;
+    DELETE FROM memories_fts WHERE rowid = (SELECT fts_rowid FROM memory_fts_keys WHERE memory_id = new.id);
+    INSERT INTO memories_fts (rowid, content, summary, tags, mem_id)
+    VALUES ((SELECT fts_rowid FROM memory_fts_keys WHERE memory_id = new.id), fold(new.content), fold(COALESCE(new.summary, '')), fold(COALESCE(new.tags, '')), new.id);
+  END`,
+];
+
+
+export const taskPlanningSchemaStatements = [
+  `CREATE TABLE IF NOT EXISTS task_decompositions (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, payload TEXT NOT NULL
+  )`
+];
+
+export const managedDispatchSchemaStatements = [
+  `CREATE TABLE IF NOT EXISTS managed_dispatch_policies (
+    parent_task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, payload TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS managed_dispatches (
+    request_id TEXT PRIMARY KEY, parent_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL UNIQUE REFERENCES agent_runs(id), payload TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_managed_dispatch_parent ON managed_dispatches(parent_task_id)`
 ];

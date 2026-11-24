@@ -14,23 +14,11 @@ See `.agent-memory/current-task.md`.
 
 ## Agent Startup Rules
 Codex lifecycle hooks already create or restore the task and live session before the first model call. Do not run `agent-bridge task start`, `agent-bridge session start`, or `agent-bridge session end` during ordinary hooked Codex work; doing so can create a second live card for the same terminal.
-At the start of work:
-1. Read `.agent-memory/current-task.md`.
-2. Compile fresh context for this agent:
-   ```bash
-   agent-bridge context compile --agent codex
-   ```
-3. Read `.agent-memory/compiled-context.md` and continue only the current task.
+Use Agent Bridge history only when the request needs it. Start with the prompt, retained conversation, and current source. Do not load compiled context automatically on session start, resume, or compaction.
+
+For a clear repository reference that needs past work, run `agent-bridge context find "<term>" --limit 3`. Inspect only a relevant result with `agent-bridge context query "<term>" --task <id>`, `agent-bridge context expand <memory-id> --task <id>`, or `agent-bridge context handoff --task <id>`. If the repository reference is unclear, ask one focused question before searching history. If several results plausibly match, ask which one before opening details. A lookup does not switch the active task. Verify historical details against current source.
+
 Do not start a new task just because the user sends a new prompt inside an active task/session; continue the current task unless the user explicitly asks to switch tasks.
-
-## Compiled Context
-See `.agent-memory/compiled-context.md`.
-
-## Handoff
-Read `.handoff/CURRENT.md` when resuming the latest work. If the user names a
-topic, use `.handoff/INDEX.md` to locate the matching archived checkpoint
-without scanning all of `.handoff/history/`. Handoffs are task-scoped: any agent
-that continues the task receives the same context.
 
 ## Work-Git Rules
 - Before editing any source/config/test/doc file for task work, acquire a write lease:
@@ -42,20 +30,15 @@ that continues the task receives the same context.
   ```bash
   agent-bridge file release "<lease-id>"
   ```
-- `agent-bridge graph brief-auto "<repo-relative-path>" --task-edited` verifies an active write lease for the current task and fails if the file was edited without one.
+
+## Graph Navigation
+- Follow Graph Navigation in compiled context. Graph use is enabled by default; toggle `graph.enabled` in `.agent-memory/config.json` or Graph → Settings → Enabled.
+- When enabled and you need to find files to read/edit, use `agent-bridge graph search <query> --limit 10`, then `agent-bridge graph neighbors <path>` or `agent-bridge graph symbols <path>` as needed. Verify hints against source and read relevant ranges only. Use scoped `rg` if disabled or the index is missing/stale. Do not load the global graph or all briefs.
 
 ## File Brief Rules
-- After reading any source/config/test/doc file for task work, run:
-  ```bash
-  agent-bridge graph brief-auto "<repo-relative-path>"
-  ```
-- After editing any source/config/test/doc file, run:
-  ```bash
-  agent-bridge graph brief-auto "<repo-relative-path>" --task-edited --agent <agent>
-  ```
-  The first `--task-edited` brief moves the task from `todo` to `in_progress`.
-  Always pass the same `--agent <agent>` you used for the lease; without it the lease check resolves the default agent's task and rejects your own lease.
-- You may pass multiple paths to one `brief-auto` call. Skip generated/vendor files and files outside the current task.
+- Automatic file briefs are maintained exclusively by the watcher when source content changes on disk. Opening the TUI starts it by default when Watch Auto Brief is enabled. Tools → Tools provides manual Start/Stop controls.
+- Reading a file does not refresh its brief or mark it as edited. Do not run brief commands after each Read/Edit/Write tool call.
+- Use an explicit manual brief refresh only when the user requests it. Keep write leases for edits independently of brief updates.
 
 ## Completion Rules
 Before finishing:

@@ -4,6 +4,9 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 
 import type { RouteContext } from "./types.js";
+import { syncCodexPermissions } from "../../cli-permissions.js";
+import { getCodexHookStatus, installCodexHooks } from "../codex.js";
+import { invalidateOptionalToolsStatus } from "./status.js";
 import {
   daysAgoStamp,
   readCacheUsage,
@@ -56,7 +59,9 @@ import {
 
 const cliApprovalPolicyValues = {
   codex: new Set(["default", "auto-review", "never", "bypass"]),
+  codexSandbox: new Set(["read-only", "workspace-write", "danger-full-access"]),
   antigravity: new Set(["default", "accept-edits", "plan", "bypass"]),
+  antigravityMode: new Set(["default", "auto", "accept-edits", "plan"]),
   claude: new Set(["manual", "auto", "accept-edits", "dont-ask", "plan", "bypass"]),
 } as const;
 
@@ -93,6 +98,7 @@ export async function routePostToolsInstall(ctx: RouteContext): Promise<void> {
       stdout: result.stdout.slice(-4000),
       stderr: result.stderr.slice(-4000),
     });
+    invalidateOptionalToolsStatus();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     sendJson(res, 500, { error: message });
@@ -115,6 +121,17 @@ export async function routePostAntigravityInstallHooks(ctx: RouteContext): Promi
     sendJson(res, 500, { error: message });
   }
   return;
+}
+
+export async function routePostCodexInstallHooks(ctx: RouteContext): Promise<void> {
+  const { res, cwd } = ctx;
+  try {
+    const output = installCodexHooks(cwd);
+    const codexHookStatus = getCodexHookStatus(cwd);
+    sendJson(res, 200, { installed: codexHookStatus.installed, codexHookStatus, output });
+  } catch (error) {
+    sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+  }
 }
 
 export async function routePostClaudeInstallHooks(ctx: RouteContext): Promise<void> {
@@ -188,10 +205,8 @@ export async function routePostConfigGraph(ctx: RouteContext): Promise<void> {
   const body = await readJson(req);
   const config = readConfig(cwd);
   const graph = { ...(config.graph ?? {}) };
-  if (typeof body.injectRepoMap === "boolean")
-    graph.injectRepoMap = body.injectRepoMap;
-  if (typeof body.autoBriefOnToolUse === "boolean")
-    graph.autoBriefOnToolUse = body.autoBriefOnToolUse;
+  if (typeof body.enabled === "boolean")
+    graph.enabled = body.enabled;
   if (typeof body.watchAutoBrief === "boolean")
     graph.watchAutoBrief = body.watchAutoBrief;
   if (
@@ -217,7 +232,7 @@ export async function routePostConfigCliApprovals(ctx: RouteContext): Promise<vo
   const body = await readJson(req);
   const config = readConfig(cwd);
   const policies = { ...(config.cliApprovalPolicies ?? {}) };
-  for (const provider of ["codex", "antigravity", "claude"] as const) {
+  for (const provider of ["codex", "codexSandbox", "antigravity", "antigravityMode", "claude"] as const) {
     if (body[provider] === undefined) continue;
     const value = requiredString(body[provider], provider);
     if (!cliApprovalPolicyValues[provider].has(value as never)) {
@@ -226,6 +241,7 @@ export async function routePostConfigCliApprovals(ctx: RouteContext): Promise<vo
     policies[provider] = value as never;
   }
   writeConfig({ ...config, cliApprovalPolicies: policies }, cwd);
+  syncCodexPermissions(cwd, policies);
   sendJson(res, 200, { cliApprovalPolicies: policies });
 }
 

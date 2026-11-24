@@ -1,4 +1,5 @@
 import type { RouteContext } from "./types.js";
+import { invalidateDashboardSkills } from "./dashboard-cache.js";
 import {
   installGitHubSkill,
   searchGitHubSkills,
@@ -36,6 +37,7 @@ export async function routePostSkillsGithubInstall(ctx: RouteContext): Promise<v
     scope: requiredSkillScope(body.scope),
     overwrite: body.overwrite === true,
   }, cwd);
+  invalidateDashboardSkills();
   sendJson(res, 200, { skill });
   return;
 }
@@ -50,6 +52,7 @@ export async function routePostSkillsSave(ctx: RouteContext): Promise<void> {
     description: optionalString(body.description),
     content: requiredString(body.content, "content"),
   }, cwd);
+  invalidateDashboardSkills();
   sendJson(res, 200, { skill });
   return;
 }
@@ -60,6 +63,7 @@ export async function routePostSkillsDelete(ctx: RouteContext): Promise<void> {
   const scope = requiredSkillScope(body.scope);
   const name = requiredString(body.name, "name");
   const deleted = deleteSkill(scope, name, cwd);
+  invalidateDashboardSkills();
   if (!deleted) sendJson(res, 404, { error: "Skill not found." });
   else sendJson(res, 200, { deleted: true });
   return;

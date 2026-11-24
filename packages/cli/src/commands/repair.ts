@@ -58,9 +58,11 @@ export function registerRepair(program: Command): void {
               taskId: config.currentTaskId,
               agent: config.defaultAgent,
               tokenBudget: resolveTokenBudget(),
+              includeFiles: false,
+              graphEnabled: config.graph?.enabled !== false,
               ...policyBudgets()
             });
-            writeFileSync(p.compiledContext, `${pack.renderedMarkdown}\n`, "utf8");
+            writeFileSync(p.compiledContext, pack.renderedMarkdown, "utf8");
             recompiled = true;
           } finally {
             store.close();

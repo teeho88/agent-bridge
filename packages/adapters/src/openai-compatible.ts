@@ -1,4 +1,5 @@
 import type { RegisteredAgent, AgentProvider } from "@agent-bridge/memory";
+import { checkInvocationBudget, normalizeProviderUsage, type ProviderUsage, type InvocationBudget, type TokenCounterDescriptor } from "@agent-bridge/core";
 
 export type OpenAICompatibleProvider = Extract<AgentProvider, "openai-compatible" | "deepseek" | "kimi" | "glm">;
 
@@ -15,6 +16,8 @@ export type OpenAICompatibleMessage = {
 };
 
 export type OpenAICompatibleChatOptions = {
+  tokenBudget?: InvocationBudget;
+  tokenCounter?: TokenCounterDescriptor;
   temperature?: number;
   maxTokens?: number;
   json?: boolean;
@@ -54,6 +57,7 @@ export type OpenAICompatibleRequest = {
 };
 
 export type OpenAICompatibleChatResult = {
+  normalizedUsage: ProviderUsage;
   content: string;
   model?: string;
   usage?: unknown;
@@ -126,15 +130,17 @@ export function resolveOpenAICompatibleConfig(
 export function buildOpenAICompatibleRequest(
   config: OpenAICompatibleConfig,
   messages: OpenAICompatibleMessage[],
-  options: Pick<OpenAICompatibleChatOptions, "temperature" | "maxTokens" | "json"> = {},
+  options: Pick<OpenAICompatibleChatOptions, "temperature" | "maxTokens" | "json" | "tokenBudget" | "tokenCounter"> = {},
 ): OpenAICompatibleRequest {
   const body: Record<string, unknown> = {
     model: config.model,
     messages,
   };
   if (options.temperature !== undefined) body.temperature = options.temperature;
-  if (options.maxTokens !== undefined) body.max_tokens = options.maxTokens;
+  const outputReserve = options.maxTokens ?? options.tokenBudget?.outputReserve ?? 4000;
+  body.max_tokens = outputReserve;
   if (options.json) body.response_format = { type: "json_object" };
+  checkInvocationBudget(JSON.stringify(body), { ...options.tokenBudget, outputReserve }, options.tokenCounter);
   return {
     url: `${stripTrailingSlash(config.baseUrl)}/chat/completions`,
     init: {
@@ -169,6 +175,7 @@ export function parseOpenAICompatibleChatResponse(raw: unknown): OpenAICompatibl
     content,
     model: typeof record.model === "string" ? record.model : undefined,
     usage: record.usage,
+    normalizedUsage: normalizeProviderUsage(record.usage),
     raw,
   };
 }

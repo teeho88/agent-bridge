@@ -3,8 +3,8 @@
 // far more tokens per character than for plain ASCII. We weight each code point
 // by script — ASCII ~1/4 token, CJK ~1 token, other (accented Latin, combining
 // marks, non-Latin scripts) ~3/4 token — then round up. This keeps pure-ASCII
-// estimates identical to the old length/4 behaviour while staying within ~20%
-// of real Claude token counts on Vietnamese samples.
+// estimates identical to the old length/4 behaviour. Model-specific calibration
+// is required before using the estimate as a provider token limit.
 export function estimateTokens(text: string): number {
   const trimmed = text.trim();
   if (!trimmed) return 0;

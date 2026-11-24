@@ -18,6 +18,18 @@ const agents: AgentKind[] = ["claude", "codex", "gemini", "antigravity", "generi
 
 export function registerSession(program: Command): void {
   const session = program.command("session").description("Record lifecycle events for agents without native hooks");
+  session.command("window")
+    .description("Register the native window hosting an active agent session")
+    .requiredOption("--id <sessionId>")
+    .requiredOption("--window <windowId>")
+    .requiredOption("--pid <pid>")
+    .option("--hwnd <handle>")
+    .action(async (options: { id: string; window: string; pid: string; hwnd?: string }) => {
+      const { request } = await import("../tui/service.js");
+      console.log(JSON.stringify(await request(process.cwd(), "POST", "/api/session/window", {
+        sessionId: options.id, windowId: options.window, pid: Number(options.pid), hwnd: options.hwnd,
+      })));
+    });
 
   session
     .command("start")
@@ -79,7 +91,7 @@ export function registerSession(program: Command): void {
 
   session
     .command("end")
-    .description("End a live session")
+    .description("End a session after its provider and all child writers have stopped")
     .option("--agent <agent>", "agent source", "codex")
     .option("--task <taskId>", "task id (defaults to the session task)")
     .option("--id <sessionId>", "session id (defaults to this agent's current session)")
@@ -91,8 +103,9 @@ export function registerSession(program: Command): void {
       const store = openStore();
       try {
         const taskId = options.task ?? config.sessionTasks?.[sessionId];
-        store.recordSessionEvent({ sessionId, taskId, agent, kind: "session_ended", summary: `${agentLabel(agent)} session ended.` });
-        endAgentSession(sessionId);
+        if (!taskId) throw new Error("Unknown session task");
+        endAgentSession(sessionId, process.cwd(), { taskId, agent, writersStopped: true, reason: "Explicit session end after writers stopped" });
+        store.recordSessionEvent({ sessionId, taskId, agent, kind: "session_ended", summary: `${agentLabel(agent)} session ended; owned leases released.` });
         console.log(`Ended ${agent} session ${sessionId}`);
       } finally {
         store.close();
@@ -145,7 +158,8 @@ function agentLabel(agent: AgentKind): string {
   return agent === "antigravity" ? "Antigravity" : agent[0].toUpperCase() + agent.slice(1);
 }
 
-function setTerminalTitle(agent: AgentKind, taskId: string, sessionId: string): void {
+export function setTerminalTitle(agent: AgentKind, taskId: string, sessionId: string): void {
+  if (!process.stdout.isTTY) return;
   const title = `AgentBridge ${agent} ${taskId} ${sessionId}`;
   if (process.platform === "win32") {
     try {
@@ -169,7 +183,7 @@ public class AgentBridgeConsoleTitle {
           "-EncodedCommand",
           Buffer.from(script, "utf16le").toString("base64"),
         ],
-        { stdio: "ignore", windowsHide: true },
+        { stdio: "ignore", windowsHide: true, timeout: 2000 },
       );
       return;
     } catch {

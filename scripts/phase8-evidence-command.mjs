@@ -1,0 +1,16 @@
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { resolve, join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+const [label,script,...args]=process.argv.slice(2);
+if(!label||!script||!/^[A-Za-z0-9_-]+$/.test(label))throw Error('Provide a unique label, script, and arguments');
+const out=resolve('docs/phase8-recovery-20261019/validated');mkdirSync(out,{recursive:true});
+const startedAt=new Date().toISOString();
+const result=spawnSync(process.execPath,[script,...args],{cwd:process.cwd(),encoding:'utf8',windowsHide:true,timeout:900000,maxBuffer:32*1024*1024});
+writeFileSync(join(out,label+'.stdout.log'),result.stdout??'',{flag:'wx'});
+writeFileSync(join(out,label+'.stderr.log'),result.stderr??'',{flag:'wx'});
+const metadata={script,args,startedAt,finishedAt:new Date().toISOString(),exitCode:result.status,error:result.error?.message??null};
+writeFileSync(join(out,label+'.command.json'),JSON.stringify(metadata,null,2)+'\n',{flag:'wx'});
+console.log(JSON.stringify(metadata));
+console.log(result.stdout??'');
+if(result.stderr)process.stderr.write(result.stderr);
+process.exitCode=result.status??2;

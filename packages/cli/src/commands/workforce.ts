@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { repositoryEnabled } from "../repository.js";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Command } from "commander";
@@ -7,6 +8,7 @@ import {
   defaultCommandForProvider,
   listStaffableProviderCatalogs,
   reapAgentRuns,
+  readRunLog,
   spawnAgentRun,
   stopAgentRun,
 } from "@agent-bridge/adapters";
@@ -20,7 +22,7 @@ import {
   type OrchestratorDeps,
 } from "@agent-bridge/core";
 import type { Orchestration, OrchestrationAutonomy } from "@agent-bridge/memory";
-import { openStore, paths, readCliApprovalPolicy } from "../workspace.js";
+import { openStore, paths, readCliInvocationSettings } from "../workspace.js";
 
 type Store = ReturnType<typeof openStore>;
 
@@ -253,6 +255,7 @@ export function makeOrchestratorDeps(store: Store, cwd: string = paths().cwd): O
   const runsDir = join(projectPaths.artifacts, "runs");
   return {
     spawn: (input) => {
+      if (!repositoryEnabled(cwd)) throw new Error("Agent Bridge is disabled for this repository.");
       mkdirSync(runsDir, { recursive: true });
       const promptPath = join(runsDir, `${randomUUID()}-prompt.md`);
       writeFileSync(promptPath, input.prompt, "utf8");
@@ -260,7 +263,7 @@ export function makeOrchestratorDeps(store: Store, cwd: string = paths().cwd): O
         input.agent,
         promptPath,
         projectPaths.cwd,
-        readCliApprovalPolicy(projectPaths.cwd, input.agent.provider),
+        readCliInvocationSettings(projectPaths.cwd, input.agent.provider),
       );
       if (preview.mode !== "cli" || !preview.executable) {
         throw new Error(
@@ -292,7 +295,7 @@ export function makeOrchestratorDeps(store: Store, cwd: string = paths().cwd): O
         models: catalog.models.map((model) => model.value),
       })),
     defaultCommandFor: (provider) => defaultCommandForProvider(provider),
-    readLog: (run) => (run.logPath && existsSync(run.logPath) ? readFileSync(run.logPath, "utf8") : ""),
+    readLog: (run) => (run.logPath && existsSync(run.logPath) ? readRunLog(run.logPath) : ""),
     writePlanFile: (markdown) => {
       const plansDir = join(projectPaths.memoryDir, "plans");
       mkdirSync(plansDir, { recursive: true });

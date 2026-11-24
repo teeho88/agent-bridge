@@ -227,7 +227,12 @@ function syncPresetAgent(
     presetSelected: preset.selected,
     presetHidden: preset.hidden,
   };
-  if (existing) return store.updateRegisteredAgent(existing.id, { ...fields, name: preset.name });
+  if (existing) {
+    const desired = { ...fields, name: preset.name };
+    const normalize = (value: unknown) => value === "" ? undefined : value;
+    if (Object.entries(desired).every(([key, value]) => JSON.stringify(normalize(existing[key as keyof RegisteredAgent])) === JSON.stringify(normalize(value)))) return existing;
+    return store.updateRegisteredAgent(existing.id, desired);
+  }
   if (!preset.selected) return undefined;
   return store.createRegisteredAgent({
     ...fields,
@@ -261,6 +266,32 @@ export function addCustomDefaultAgentPreset(
   const agent = preset ? syncPresetAgent(store, preset, listPresetAgents(store)) : undefined;
   if (!agent) throw new Error(`Failed to create default agent preset: ${presetKey}`);
   return agent;
+}
+
+export function updateDefaultAgentPreset(
+  store: MemoryStore,
+  presetKey: string,
+  input: CustomDefaultAgentPresetInput,
+): DefaultAgentPresetState {
+  const current = listEffectiveDefaultAgentPresets().find((candidate) => candidate.key === presetKey);
+  if (!current) throw new Error(`Unknown default agent preset: ${presetKey}`);
+  const label = input.label.trim();
+  if (!label) throw new Error("Agent label is required.");
+  updateGlobalDefaultAgent(presetKey, {
+    label,
+    name: label,
+    description: input.description ?? "",
+    provider: input.provider,
+    mode: input.mode,
+    command: input.command ?? "",
+    model: input.model ?? "",
+    reasoningEffort: input.reasoningEffort ?? "",
+    capabilities: input.capabilities ?? [],
+  });
+  const preset = listEffectiveDefaultAgentPresets().find((candidate) => candidate.key === presetKey)!;
+  const agents = listPresetAgents(store);
+  const agent = syncPresetAgent(store, preset, agents);
+  return toState(preset, agent ?? agents.find((candidate) => candidate.presetKey === presetKey));
 }
 
 // Deleting a custom preset removes it from the global file outright; a built-in

@@ -1,4 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { repositoryEnabled } from "../../repository.js";
 
 // The background file watcher the dashboard can start and stop.
 
@@ -13,10 +15,11 @@ export function isWatcherRunning(): boolean {
 }
 
 export function startWatcher(cwd: string): boolean {
+  if (!repositoryEnabled(cwd)) return false;
   if (isWatcherRunning()) return true;
   const child = spawn(
     process.execPath,
-    [process.argv[1], "watch", "--project", cwd],
+    [fileURLToPath(new URL("../../index.js", import.meta.url)), "watch", "--project", cwd],
     {
       stdio: "ignore",
       windowsHide: true,

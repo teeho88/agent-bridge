@@ -1,4 +1,11 @@
 import type {
+  AgentKind,
+  ManagedReview,
+  ManagedReviewInput,
+  TaskAttempt,
+  TaskRetryKind,
+  TaskRetryPolicy,
+  EndTaskAttemptInput,
   AddMemoryInput,
   UpdateMemoryInput,
   AgentRun,
@@ -54,6 +61,11 @@ import type {
   Memory,
   RunRecord,
   Task,
+  TaskContract,
+  TaskContractInput,
+  TaskOwnerClaim,
+  TaskAcceptanceProof,
+  TaskCheckProof,
   TaskChange,
   TaskLane,
   UpsertTaskChangeInput,
@@ -63,6 +75,8 @@ import type {
 export type MemorySearchOptions = {
   taskId?: string;
   limit?: number;
+  scope?: "task" | "repo" | "task-and-repo" | "all";
+  excludeTags?: string[];
 };
 
 export interface MemoryStore {
@@ -70,11 +84,29 @@ export interface MemoryStore {
   createTask(input: CreateTaskInput): Task;
   getTask(id: string): Task | undefined;
   updateTaskStatus(id: string, status: Task["status"]): Task | undefined;
+  getTaskContract(taskId: string): TaskContract | undefined;
+  setTaskContract(taskId: string, input: TaskContractInput, agent?: AgentKind, sessionId?: string): TaskContract;
+  getTaskOwnerClaim(taskId: string): TaskOwnerClaim | undefined;
+  claimTask(taskId: string, agent: AgentKind, sessionId: string): TaskOwnerClaim;
+  releaseTaskClaim(taskId: string, agent: AgentKind, sessionId: string): void;
+  listTaskAcceptance(taskId: string): TaskAcceptanceProof[];
+  verifyTaskAcceptance(taskId: string, criterion: string, checkpointId: string, agent: AgentKind, sessionId: string): TaskAcceptanceProof;
+  listTaskChecks(taskId: string): TaskCheckProof[];
+  verifyTaskCheck(taskId: string, checkpointId: string, agent: AgentKind, sessionId: string): TaskCheckProof;
+  transitionManagedTask(taskId: string, target: Task["status"], agent: AgentKind, sessionId: string, reason?: string): Task;
+  listManagedReviews(taskId: string): ManagedReview[];
+  getTaskRetryPolicy(taskId: string): TaskRetryPolicy | undefined;
+  listTaskAttempts(taskId: string): TaskAttempt[];
+  setTaskRetryPolicy(taskId: string, kind: TaskRetryKind, agent: AgentKind, sessionId: string): TaskRetryPolicy;
+  beginTaskAttempt(taskId: string, operation: string, hypothesis: string, agent: AgentKind, sessionId: string): TaskAttempt;
+  endTaskAttempt(taskId: string, attemptId: string, input: EndTaskAttemptInput, agent: AgentKind, sessionId: string): TaskAttempt;
+  recordManagedReview(taskId: string, input: ManagedReviewInput, agent: AgentKind, sessionId: string): ManagedReview;
   listTasks(limit?: number): Task[];
   addMemory(input: AddMemoryInput): Memory;
   updateRepoMemory(id: string, input: UpdateMemoryInput): Memory | undefined;
   deleteRepoMemory(id: string): boolean;
   searchMemories(query: string, options?: MemorySearchOptions): Memory[];
+  getContextMemories?(taskId: string, query: string, excludeTags?: string[]): Memory[];
   listMemoriesForTask(taskId: string, limit?: number): Memory[];
   listRepoMemories(limit?: number): Memory[];
   listDecisions(taskId: string): Decision[];
@@ -115,7 +147,7 @@ export interface MemoryStore {
   getTaskLane(taskId: string): TaskLane | undefined;
   listTaskLanes(status?: TaskLane["status"], limit?: number): TaskLane[];
   acquireFileLease(input: AcquireFileLeaseInput): AcquireFileLeaseResult;
-  releaseFileLease(id: string): FileLease | undefined;
+  releaseFileLease(id: string, owner?: { taskId: string; agent?: string; sessionId?: string }): FileLease | undefined;
   listFileLeases(options?: {
     taskId?: string;
     path?: string;
@@ -143,6 +175,7 @@ export interface MemoryStore {
   upsertTaskHandoff(input: CreateHandoffInput): Handoff;
   getLatestHandoff(taskId: string): Handoff | undefined;
   addRun(record: Omit<RunRecord, "id" | "createdAt">): RunRecord;
+  claimManagedDispatchLaunch?(runId: string, taskId: string, agentId: string, sessionId: string, provider: string): AgentRun;
   createAgentRun(input: CreateAgentRunInput): AgentRun;
   getAgentRun(id: string): AgentRun | undefined;
   updateAgentRun(id: string, input: UpdateAgentRunInput): AgentRun | undefined;

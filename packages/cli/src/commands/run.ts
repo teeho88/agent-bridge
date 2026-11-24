@@ -1,11 +1,11 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Command } from "commander";
-import { buildSpawnPreview, reapAgentRuns, spawnAgentRun, stopAgentRun } from "@agent-bridge/adapters";
+import { buildSpawnPreview, readRunLogTail, reapAgentRuns, spawnAgentRun, stopAgentRun } from "@agent-bridge/adapters";
 import { compressLog } from "@agent-bridge/core";
 import type { AgentRun, Assignment, RegisteredAgent, SessionEvent, Subtask } from "@agent-bridge/memory";
 import type { AgentRunStatus } from "@agent-bridge/memory";
-import { getActiveTaskId, openStore, paths, readCliApprovalPolicy } from "../workspace.js";
+import { getActiveTaskId, openStore, paths, readCliInvocationSettings } from "../workspace.js";
 
 type Store = ReturnType<typeof openStore>;
 
@@ -48,7 +48,7 @@ export function registerRun(program: Command): void {
       try {
         const found = store.getAgentRun(runId);
         if (!found) throw new Error(`Run not found: ${runId}`);
-        const log = found.logPath ? tailLines(readFileSync(found.logPath, "utf8"), Number(options.tail)) : "";
+        const log = found.logPath ? readRunLogTail(found.logPath, Number(options.tail), 1048576) : "";
         console.log(JSON.stringify({ run: found, log }, null, 2));
       } finally {
         store.close();
@@ -307,7 +307,7 @@ export async function respawnRun(
 
   const runsDir = join(paths().artifacts, "runs");
   mkdirSync(runsDir, { recursive: true });
-  const logTail = stopped.logPath && existsSync(stopped.logPath) ? readFileSync(stopped.logPath, "utf8") : "";
+  const logTail = stopped.logPath && existsSync(stopped.logPath) ? readRunLogTail(stopped.logPath, 60, 1048576) : "";
   const resumePath = join(runsDir, `${runId}-resume.md`);
   writeFileSync(
     resumePath,
@@ -320,7 +320,7 @@ export async function respawnRun(
   );
 
   const cwd = paths().cwd;
-  const preview = buildSpawnPreview(targetAgent, resumePath, cwd, readCliApprovalPolicy(cwd, targetAgent.provider));
+  const preview = buildSpawnPreview(targetAgent, resumePath, cwd, readCliInvocationSettings(cwd, targetAgent.provider));
   const newRun = spawnAgentRun(store, {
     orchestrationId: oldRun.orchestrationId,
     taskId: oldRun.taskId,

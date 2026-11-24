@@ -1,6 +1,8 @@
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { AgentKind, Task } from "@agent-bridge/memory";
+import { powershellPermissionIntegration } from "../../cli-permissions.js";
 
 // Opening and focusing the OS terminal windows that agent sessions run in.
 
@@ -174,7 +176,7 @@ export function launchAgentTerminal(
   agent: AgentKind,
   sessionId: string,
   command: string,
-  uiPort: number,
+  options: { nativeSessionId?: string; continuedTaskId?: string } = {},
 ): { launcherPid?: number; title: string; windowId: string } {
   const title = terminalTitle(agent, task.id, sessionId);
   const script = `
@@ -204,15 +206,20 @@ public class AgentBridgeTerminalWindow {
     }, [IntPtr]::Zero) | Out-Null
     if ($script:terminalHwnd -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 50 }
   } while ($script:terminalHwnd -eq [IntPtr]::Zero -and [DateTime]::UtcNow -lt $deadline)
-  $registration = @{ sessionId = ${psString(sessionId)}; windowId = ${psString(sessionId)}; pid = $PID }
-  if ($script:terminalHwnd -ne [IntPtr]::Zero) { $registration.hwnd = $script:terminalHwnd.ToInt64().ToString() }
-  $payload = $registration | ConvertTo-Json -Compress
-  Invoke-RestMethod -Uri ${psString(`http://127.0.0.1:${uiPort}/api/session/window`)} -Method Post -ContentType 'application/json' -Body $payload | Out-Null
 } catch {
-  Write-Warning 'Agent Bridge could not register this terminal window.'
+  Write-Warning 'Agent Bridge could not detect this terminal window handle.'
+}
+try {
+  $registrationArgs = @(${psString(fileURLToPath(new URL("../../index.js", import.meta.url)))}, 'session', 'window', '--id', ${psString(sessionId)}, '--window', ${psString(sessionId)}, '--pid', [string]$PID)
+  if ($script:terminalHwnd -ne [IntPtr]::Zero) { $registrationArgs += @('--hwnd', $script:terminalHwnd.ToInt64().ToString()) }
+  & ${psString(process.execPath)} @registrationArgs | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Window registration failed' }
+} catch {
+  throw 'Agent Bridge could not verify this terminal process; agent launch cancelled.'
 }
 $env:AGENT_BRIDGE_TERMINAL_SESSION_ID = ${psString(sessionId)}
-& ${psString(command)}
+${powershellPermissionIntegration()}
+${agentTerminalInvocation(agent, command, options)}
 `;
   if (!commandExists("wt.exe")) {
     throw new Error("Windows Terminal (wt.exe) is required to open a visible agent terminal.");
@@ -230,7 +237,6 @@ $env:AGENT_BRIDGE_TERMINAL_SESSION_ID = ${psString(sessionId)}
       cwd,
       "powershell.exe",
       "-NoLogo",
-      "-NoExit",
       "-ExecutionPolicy",
       "Bypass",
       "-EncodedCommand",
@@ -241,6 +247,19 @@ $env:AGENT_BRIDGE_TERMINAL_SESSION_ID = ${psString(sessionId)}
   child.on("error", () => undefined);
   child.unref();
   return { launcherPid: child.pid, title, windowId: sessionId };
+}
+
+export function agentTerminalInvocation(agent: AgentKind, command: string,
+  options: { nativeSessionId?: string; continuedTaskId?: string } = {}): string {
+  const args = options.nativeSessionId
+    ? agent === "codex" ? ["resume", options.nativeSessionId]
+      : [agent === "claude" ? "--resume" : "--conversation", options.nativeSessionId]
+    : [];
+  const prompt = options.continuedTaskId && !options.nativeSessionId
+    ? `This session is bound to task ${options.continuedTaskId}. If the next request needs past work on this task, use agent-bridge context query with --task ${options.continuedTaskId} or agent-bridge context handoff --task ${options.continuedTaskId}.`
+    : undefined;
+  if (prompt) args.push(...(agent === "antigravity" ? ["--prompt-interactive", prompt] : [prompt]));
+  return `& ${psString(command)} ${args.map(psString).join(" ")}`.trimEnd();
 }
 
 export function isProcessAlive(pid: number): boolean {

@@ -12,7 +12,6 @@ import type {
   RegisteredAgent,
   SubtaskStatus,
   TaskChangeStatus,
-  TaskStatus,
 } from "@agent-bridge/memory";
 import type { SkillScope } from "../../skill-library.js";
 
@@ -122,23 +121,6 @@ export function assignmentStatusToSubtaskStatus(
   if (status === "cancelled") return "cancelled";
   if (status === "queued" || status === "approved") return "assigned";
   return undefined;
-}
-
-export function parseTaskStatus(value?: string): TaskStatus | undefined {
-  if (!value) return undefined;
-  const allowed: TaskStatus[] = [
-    "todo",
-    "in_progress",
-    "blocked",
-    "done",
-    "cancelled",
-  ];
-  if (!allowed.includes(value as TaskStatus)) {
-    throw new Error(
-      `Invalid status "${value}". Use one of: ${allowed.join(", ")}.`,
-    );
-  }
-  return value as TaskStatus;
 }
 
 export function parseLaneMode(value: string): "patch" | "worktree" {

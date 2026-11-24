@@ -6,6 +6,7 @@ import {
   restoreBuiltInDefaultAgentPresets,
   setDefaultAgentPresetSelection,
   syncDefaultAgentPresetFromAgent,
+  updateDefaultAgentPreset,
 } from "../../default-agent-presets.js";
 import {
   loadRuntimeProviderCatalogs,
@@ -13,7 +14,7 @@ import {
 import {
   openStore,
   paths,
-  readCliApprovalPolicy,
+  readCliInvocationSettings,
 } from "../../workspace.js";
 import {
   listAdoptableSessions,
@@ -163,6 +164,28 @@ export async function routePostWorkforceDefaultAgentCreate(ctx: RouteContext): P
       capabilities: parseItems(body.capabilities),
     });
     sendJson(res, 200, { agent, presets: ensureDefaultAgentPresetStates(store) });
+  } finally {
+    store.close();
+  }
+  return;
+}
+
+export async function routePostWorkforceDefaultAgentUpdate(ctx: RouteContext): Promise<void> {
+  const { req, res, cwd } = ctx;
+  const body = await readJson(req);
+  const store = openStore(cwd);
+  try {
+    const preset = updateDefaultAgentPreset(store, requiredString(body.presetKey, "presetKey"), {
+      label: requiredString(body.label ?? body.name, "label"),
+      description: optionalString(body.description),
+      provider: parseAgentProvider(requiredString(body.provider, "provider")),
+      mode: parseAgentRunMode(optionalString(body.mode) ?? "cli"),
+      command: optionalString(body.command),
+      model: optionalString(body.model),
+      reasoningEffort: optionalString(body.reasoningEffort),
+      capabilities: parseItems(body.capabilities),
+    });
+    sendJson(res, 200, { preset, presets: ensureDefaultAgentPresetStates(store) });
   } finally {
     store.close();
   }
@@ -397,7 +420,8 @@ export async function routeGetWorkforceBoard(ctx: RouteContext): Promise<void> {
 export async function routeGetWorkforceRunLog(ctx: RouteContext): Promise<void> {
   const { res, url, cwd } = ctx;
   const runId = String(url.query.run ?? "");
-  const tail = Number(url.query.tail ?? 200);
+  const requestedTail = Number(url.query.tail ?? 200);
+  const tail = Number.isSafeInteger(requestedTail) && requestedTail > 0 ? Math.min(requestedTail, 5000) : 200;
   const store = openStore(cwd);
   try {
     const run = store.getAgentRun(runId);
@@ -407,7 +431,7 @@ export async function routeGetWorkforceRunLog(ctx: RouteContext): Promise<void> 
     }
     const log =
       run.logPath && existsSync(run.logPath)
-        ? readFileSync(run.logPath, "utf8").split(/\r?\n/).slice(-tail).join("\n")
+        ? readLogTail(run.logPath, tail, 1048576)
         : "";
     sendJson(res, 200, { run, log });
   } finally {
@@ -488,7 +512,7 @@ export async function routePostWorkforceSubtaskAddAndSpawn(ctx: RouteContext): P
     mkdirSync(runsDir, { recursive: true });
     const promptPath = join(runsDir, `${randomUUID()}-prompt.md`);
     writeFileSync(promptPath, prompt, "utf8");
-    const preview = buildSpawnPreview(agent, promptPath, cwd, readCliApprovalPolicy(cwd, agent.provider));
+    const preview = buildSpawnPreview(agent, promptPath, cwd, readCliInvocationSettings(cwd, agent.provider));
     if (preview.mode !== "cli" || !preview.executable) {
       throw new Error(`Agent ${agent.name} is not CLI-spawnable (mode: ${preview.mode}).`);
     }

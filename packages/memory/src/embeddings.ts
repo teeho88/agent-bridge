@@ -11,11 +11,23 @@
 
 export interface EmbeddingProvider {
   readonly id?: string;
-  embed(text: string): Promise<number[]>;
+  readonly model?: string;
+  readonly version?: string;
+  readonly dimensions?: number;
+  embed(text: string, options?: { signal?: AbortSignal }): Promise<number[]>;
+}
+
+export function validateVector(vector: number[], dimensions?: number): void {
+  if (!vector.length || (dimensions !== undefined && vector.length !== dimensions) ||
+      vector.some((value) => !Number.isFinite(value) || !Number.isFinite(Math.fround(value)))) {
+    throw new Error("Invalid embedding vector: expected finite values and matching nonzero dimensions");
+  }
 }
 
 export function cosineSimilarity(a: number[], b: number[]): number {
-  const length = Math.min(a.length, b.length);
+  validateVector(a);
+  validateVector(b, a.length);
+  const length = a.length;
   let dot = 0;
   let normA = 0;
   let normB = 0;
@@ -30,14 +42,18 @@ export function cosineSimilarity(a: number[], b: number[]): number {
 
 // Store a vector compactly as a little-endian float32 BLOB.
 export function encodeVector(vector: number[]): Buffer {
+  validateVector(vector);
   return Buffer.from(Float32Array.from(vector).buffer);
 }
 
 export function decodeVector(buffer: Buffer): number[] {
+  if (!buffer.byteLength || buffer.byteLength % 4 !== 0) throw new Error("Invalid embedding BLOB length");
   // Copy into an aligned buffer; the row Buffer may be a slice of a larger one.
   const floats = new Float32Array(buffer.byteLength / 4);
   for (let i = 0; i < floats.length; i += 1) floats[i] = buffer.readFloatLE(i * 4);
-  return Array.from(floats);
+  const vector = Array.from(floats);
+  validateVector(vector);
+  return vector;
 }
 
 export type HybridCandidate<T> = {

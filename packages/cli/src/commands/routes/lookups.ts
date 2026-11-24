@@ -9,7 +9,6 @@ import type {
 } from "@agent-bridge/memory";
 import { resumeStatusFor } from "@agent-bridge/core";
 import { openStore } from "../../workspace.js";
-import { renderDashboardHtml } from "../../ui-page.js";
 
 // Store lookups that turn an id from a request body into the record a route
 // needs, throwing the message the dashboard shows when it is missing.
@@ -129,6 +128,3 @@ export function recordDirectSubtaskRunOutcome(store: ReturnType<typeof openStore
   }
 }
 
-export function renderUiHtml(cwd: string): string {
-  return renderDashboardHtml(cwd);
-}

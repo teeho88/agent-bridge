@@ -11,7 +11,18 @@ export const installableTools = new Map([
   ["ccusage", "ccusage"],
 ]);
 
-export function optionalToolsStatus(): Array<{
+let optionalToolsCache: { key: string; expires: number; value: ReturnType<typeof probeOptionalTools> } | undefined;
+export function invalidateOptionalToolsStatus(): void { optionalToolsCache = undefined; }
+
+export function optionalToolsStatus(): ReturnType<typeof probeOptionalTools> {
+  const key = `${process.env.PATH ?? ""}\0${process.env.PATHEXT ?? ""}`;
+  if (optionalToolsCache?.key === key && optionalToolsCache.expires > Date.now()) return optionalToolsCache.value;
+  const value = probeOptionalTools();
+  optionalToolsCache = { key, expires: Date.now() + 30000, value };
+  return value;
+}
+
+function probeOptionalTools(): Array<{
   name: string;
   purpose: string;
   usage: string;
